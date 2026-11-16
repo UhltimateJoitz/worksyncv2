@@ -114,6 +114,84 @@
     <button class="om-only" id="omRequestsNav">✎ Requests</button>
   </nav>
 
+  <section id="homeView" class="view active">
+    <div class="heading">
+      <div><h1 id="homeHeading">WFM Home</h1><p id="homeSubheading">Concepcion Carrier workforce management and schedule control center.</p></div>
+      <div class="pill" id="homePill">CCAC · WFM</div>
+    </div>
+    <div class="homegrid">
+      <section class="feature real">
+        <div class="icon">📅</div><h2>Schedule Management</h2>
+        <p>Manage the official scheduler snapshot workflow. Beta 2 currently supports uploading, previewing, and publishing the scheduler schedule.</p>
+        <span class="tag">Functional · Beta 2</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Schedule Upload</strong><span>Upload IDP / scheduler snapshot</span></div>
+          <div class="subcard"><strong>Published Schedules</strong><span>Coming later</span></div>
+          <div class="subcard"><strong>Schedule History</strong><span>Coming later</span></div>
+        </div>
+        <button id="openUpload">Open Schedule Management</button>
+      </section>
+      <section class="feature real">
+        <div class="icon">👥</div><h2>Roster</h2>
+        <p>Manage the authoritative CCAC workforce roster, Employee ID mapping, Team Leader assignment, and workforce status. Login access is separate from roster membership.</p>
+        <span class="tag">Functional · Beta 2</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Master Roster</strong><span>Authoritative workforce records</span></div>
+          <div class="subcard"><strong>TL Mapping</strong><span>Employee → Team Leader</span></div>
+          <div class="subcard"><strong>Access</strong><span>Login linkage is separate</span></div>
+        </div>
+        <button id="openRoster">Open Roster</button>
+      </section>
+      <section class="feature real admin-card-only">
+        <div class="icon">⚙️</div><h2>Settings & Database Environment</h2>
+        <p>Toggle between Supabase Production and Neon Sandbox databases, configure endpoints, and simulate branch perspectives.</p>
+        <span class="tag">System Control</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Database Router</strong><span id="homeDbStatus">Production (Supabase)</span></div>
+          <div class="subcard"><strong>Sandbox DB</strong><span>Neon DB isolated</span></div>
+          <div class="subcard"><strong>Role Simulator</strong><span>Multi-branch testing</span></div>
+        </div>
+        <button id="openSettingsHome">Open Settings & Database</button>
+      </section>
+      <section class="feature real admin-card-only">
+        <div class="icon">▦</div><h2>Command Center</h2>
+        <p>Real-time CCAC intraday operations, agent activity monitoring, interval roster tracking, and attendance status.</p>
+        <span class="tag">Real-Time Ops</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Intraday Tracking</strong><span>15-min intervals</span></div>
+          <div class="subcard"><strong>Agent State</strong><span>Available, Break, Lunch</span></div>
+          <div class="subcard"><strong>Daily Staffing</strong><span>Coverage vs Inflow</span></div>
+        </div>
+        <button id="openCommandCenterHome">Open Command Center</button>
+      </section>
+      <section class="feature real admin-card-only">
+        <div class="icon">📊</div><h2>Briefs Hub</h2>
+        <p>Executive coverage briefs, morning SOD summaries, and agent login timeliness reports.</p>
+        <span class="tag">Reporting</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Coverage Brief</strong><span>Hourly agent dispersion</span></div>
+          <div class="subcard"><strong>Login Brief</strong><span>First activity audit</span></div>
+          <div class="subcard"><strong>Export</strong><span>Excel & CSV</span></div>
+        </div>
+        <button id="openBriefsHome">Open Briefs Hub</button>
+      </section>
+      <section class="feature real admin-card-only">
+        <div class="icon">🧪</div><h2>Break Dispersion Engine</h2>
+        <p>Automated intraday break and lunch dispersion optimizer to eliminate interval staffing deficits.</p>
+        <span class="tag">Optimizer</span>
+        <div class="subgrid">
+          <div class="subcard"><strong>Algorithm</strong><span>Equal distribution</span></div>
+          <div class="subcard"><strong>Safe Apply</strong><span>Atomic transactions</span></div>
+          <div class="subcard"><strong>Sandbox Tested</strong><span>Isolated from prod</span></div>
+        </div>
+        <button id="openBreakDispersionHome">Open Break Dispersion</button>
+      </section>
+      <section class="feature"><div class="icon">📝</div><h2>Requests</h2><p>View and manage employee requests, with approvals included as part of the request workflow.</p><span class="tag">Placeholder</span><button class="placeholder">Coming Soon</button></section>
+      <section class="feature"><div class="icon">🔐</div><h2>Access</h2><p>WFM access directory, team monitoring, and controlled View As tools across all Concepcion Carrier branches.</p><span class="tag">WFM Monitoring</span><button id="openAccessHome">Open Access</button></section>
+    </div>
+    <div class="banner warn" style="margin-top:20px"><strong>Alpha 10:</strong> Schedule Management and the Master Roster are functional. Schedule Management controls published schedule snapshots; Roster controls the authoritative workforce master. They are separate modules.</div>
+  </section>
+  
   <main class="wrap">
 
 <div id="smEditModal" class="sm-modal hidden" aria-hidden="true">
