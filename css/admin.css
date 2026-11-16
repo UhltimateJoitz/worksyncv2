@@ -70,5 +70,165 @@
 .settings-card h3{color:#10233a !important;}
 .settings-card p{color:#5d6d82 !important;}
 .settings-card .field label{color:#64748b !important;}
+
+/* ==========================================================================
+   SETTINGS PAGE SPECIFIC OVERRIDES
+   ========================================================================== */
+
+/* 1. Force white backgrounds on settings cards */
+#settingsView .access-card {
+    background: #fff !important;
+    border: 1px solid var(--line) !important;
+    box-shadow: 0 8px 28px rgba(24,48,80,.05) !important;
+    color: var(--ink) !important;
+}
+
+/* 2. Fix the inputs (override login styles) */
+#settingsView .field label {
+    color: #64748b !important;
+    font-size: 11px !important;
+    font-weight: 800 !important;
+    text-transform: uppercase !important;
+}
+#settingsView .field input,
+#settingsView .field select {
+    background: #fbfcfe !important;
+    color: #142033 !important;
+    border: 1px solid #cbd8e6 !important;
+    padding: 11px 12px !important;
+    font-size: 13px !important;
+    box-shadow: none !important;
+    border-radius: 10px !important;
+}
+#settingsView .field input:focus,
+#settingsView .field select:focus {
+    background: #fff !important;
+    border-color: #119bd7 !important;
+    box-shadow: 0 0 0 3px rgba(17,155,215,.15) !important;
+}
+#settingsView .field input::placeholder {
+    color: #94a3b8 !important;
+}
+
+/* 3. Fix the Feature Flags (Toggles) layout */
+#settingsView .settings-toggle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+#settingsView .toggle-item {
+    display: flex !important;
+    justify-content: space-between;
+    align-items: center;
+    background: #f8fafc !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 10px !important;
+    padding: 14px 16px !important;
+}
+#settingsView .toggle-item strong {
+    display: block;
+    font-size: 13px;
+    color: #0f172a;
+    margin-bottom: 4px;
+}
+#settingsView .toggle-item p {
+    margin: 0;
+    font-size: 11px;
+    color: #64748b;
+}
+
+/* 4. Fix the Diagnostics layout */
+#settingsView .diag-grid {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) !important;
+    gap: 12px;
+}
+#settingsView .diag-item {
+    background: #f8fafc !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 10px !important;
+    padding: 12px 14px !important;
+}
+#settingsView .diag-item span {
+    display: block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: #64748b;
+    font-weight: 900;
+}
+#settingsView .diag-item strong {
+    display: block;
+    margin-top: 4px;
+    font-size: 13px;
+    color: #0f172a;
+}
+
+/* 5. Fix Role Simulator Buttons */
+#settingsView .role-sim-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+#settingsView .role-btn {
+    padding: 10px 14px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #1e293b;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+#settingsView .role-btn:hover {
+    background: #f1f5f9;
+    border-color: #94a3b8;
+}
+#settingsView .role-btn.active {
+    background: #0b2742;
+    color: #fff;
+    border-color: #0b2742;
+}
+
+/* 6. Fix Environment Switcher Hero Card */
+#settingsView .settings-hero-card {
+    background: linear-gradient(135deg, #0d2238, #16375c);
+    color: #fff;
+    border-radius: 18px;
+    padding: 22px 24px;
+    margin-bottom: 20px;
+    border: 1px solid #23466f;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+#settingsView .segmented-control {
+    display: inline-flex;
+    padding: 4px;
+    background: #061423;
+    border: 1px solid #29476b;
+    border-radius: 12px;
+    gap: 4px;
+}
+#settingsView .seg-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 15px;
+    background: transparent;
+    border: 0;
+    color: #94a3b8;
+    border-radius: 9px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+}
+#settingsView .seg-btn.active {
+    background: #1d4ed8;
+    color: #fff;
+}
 .settings-card .field input, .settings-card .field select {width:100%;padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fbfcfe;color:#243b55;font-size:13px;outline:none;}
 .settings-card .field input:focus, .settings-card .field select:focus {border-color:#119bd7;box-shadow:0 0 0 3px rgba(17,155,215,.15);background:#fff;}
