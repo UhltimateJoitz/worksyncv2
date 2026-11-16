@@ -158,6 +158,6 @@ html{scroll-behavior:auto}
 .admin-mode .wfm-only{display:inline-block!important}
 .admin-mode .admin-only{display:inline-block!important}
 .settings-only{display:none}
-.admin-mode .settings-only,.wfm-mode .settings-only{display:inline-block!important}
+.admin-mode .settings-only{display:inline-block!important}
 .admin-card-only{display:none}
 .admin-mode .admin-card-only{display:flex!important}
