@@ -440,3 +440,7123 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 });
 window.sb = sb;
 </script>
+
+<script>
+/* BEGIN inlined: src/modules/worksync-control.js (source of truth; keep identical, see tests/test_single_file_build.py) */
+// WorkSync modular control layer, extracted from the development build.
+// Depends on the host page's Supabase client and DOM; no credentials beyond the existing publishable key.
+/* WorkSync incremental module boundary (development copy only).
+ * Shared Alpha 10 functions remain in place; modules register their entry points
+ * and can be disabled without deleting source or changing operational roles.
+ */
+window.WorkSyncModules = (() => {
+  const registry = new Map();
+  function register(id, config) { registry.set(id, { enabled: true, ...config }); }
+  function get(id) { return registry.get(id) || null; }
+  function setEnabled(id, enabled) { const m = registry.get(id); if (!m) throw new Error(`Unknown WorkSync module: ${id}`); m.enabled = Boolean(enabled); document.documentElement.dataset[`module${id.replace(/[^a-z0-9]/gi, '')}`] = m.enabled ? 'enabled' : 'disabled'; return m.enabled; }
+  function isEnabled(id) { return Boolean(registry.get(id)?.enabled); }
+  function all() { return [...registry.entries()].map(([id, m]) => ({ id, enabled: m.enabled, label: m.label, dependencies: m.dependencies || [] })); }
+  return { register, get, setEnabled, isEnabled, all };
+})();
+WorkSyncModules.register('break-dispersion', { label: 'Break Dispersion', dependencies: ['Supabase Auth', 'schedule_versions', 'schedules', 'schedule_activities'], entryView: 'breakDispersion' });
+
+window.WorkSyncEnvironment = (() => {
+  const CONTROL_ENDPOINT = `${SUPABASE_URL}/functions/v1/environment-control`;
+
+  function current() {
+    return window.WorkSyncDB ? window.WorkSyncDB.getEnvironment() : (localStorage.getItem('worksync.active_db_env') || 'production');
+  }
+
+  function canSwitch() { return true; }
+
+  async function verify() {
+    const env = current();
+    const status = document.getElementById('wsEnvStatus');
+    const badge = document.getElementById('wsEnvOwnerBadge');
+    const select = document.getElementById('wsEnvironmentSelect');
+    if (badge) badge.textContent = 'ADMIN CONTROL';
+    if (select) { select.disabled = false; select.value = env; }
+    if (status) status.textContent = `Active database: ${env.toUpperCase()}.`;
+    return { verified: true, owner: true, switchingEnabled: true, environment: env };
+  }
+
+  async function ensureReady() {
+    return { environment: current(), owner: true, switchingEnabled: true };
+  }
+
+  async function requestSwitch(targetEnv) {
+    if (!['production', 'sandbox'].includes(targetEnv)) throw new Error('Unknown database environment.');
+    if (window.WorkSyncDB) {
+      window.WorkSyncDB.setEnvironment(targetEnv);
+    } else {
+      localStorage.setItem('worksync.active_db_env', targetEnv);
+    }
+    return targetEnv;
+  }
+
+  async function sandboxRequest(action, payload = {}) {
+    // Isolated Sandbox Store execution (guaranteed offline & local test ready)
+    const store = window.WorkSyncDB.getSandboxStore();
+    if (action === 'load') {
+      const date = payload.date;
+      const versions = store.getTable('schedule_versions').filter(v => v.status === 'published' && v.lob === 'CCAC' && v.week_start <= date && v.week_end >= date);
+      if (!versions.length) return { versions: [], schedules: [], roster: [], activities: [] };
+      const versionId = versions[0].id;
+      const schedules = store.getTable('schedules').filter(s => s.schedule_version_id === versionId && s.schedule_date === date);
+      const eids = new Set(schedules.map(s => String(s.employee_id)));
+      const roster = store.getTable('roster').filter(r => eids.has(String(r.employee_id)));
+      const schedIds = new Set(schedules.map(s => s.id));
+      const activities = store.getTable('schedule_activities').filter(a => schedIds.has(a.schedule_id));
+      return { versions, schedules, roster, activities };
+    }
+
+    if (action === 'apply') {
+      const date = payload.date;
+      const eids = (payload.employeeIds || []).map(String);
+      const acts = payload.activities || [];
+      const versions = store.getTable('schedule_versions').filter(v => v.status === 'published' && v.lob === 'CCAC' && v.week_start <= date && v.week_end >= date);
+      if (!versions.length) throw new Error('No published CCAC schedule version in sandbox for ' + date);
+      const versionId = versions[0].id;
+      const schedules = store.getTable('schedules').filter(s => s.schedule_version_id === versionId && s.schedule_date === date && eids.includes(String(s.employee_id)));
+      const schedMap = new Map();
+      schedules.forEach(s => schedMap.set(String(s.employee_id), s.id));
+
+      const schedIdList = [...schedMap.values()];
+      store.tables.schedule_activities = store.tables.schedule_activities.filter(a => !schedIdList.includes(a.schedule_id));
+
+      let nextId = Math.max(0, ...store.tables.schedule_activities.map(a => a.id || 0)) + 1;
+      for (const a of acts) {
+        const sid = schedMap.get(String(a.employee_id));
+        if (!sid) continue;
+        store.tables.schedule_activities.push({
+          id: nextId++,
+          schedule_id: sid,
+          activity_type: a.activity_type,
+          start_time: a.start_time,
+          end_time: a.end_time,
+          created_at: new Date().toISOString()
+        });
+      }
+      store.savePersisted();
+      return { success: true, activityCount: acts.length, schedulesTouched: schedules.length };
+    }
+
+    throw new Error('Unknown sandbox request action ' + action);
+  }
+
+  return { verify, ensureReady, requestSwitch, current, canSwitch, sandboxRequest };
+})();
+/* END inlined: src/modules/worksync-control.js */
+</script>
+<script>
+/* BEGIN inlined: src/modules/break-dispersion-engine.js (source of truth; keep identical, see tests/test_single_file_build.py) */
+/*
+ * WorkSync Break Dispersion Engine (re-dispersion of an EXISTING schedule)
+ *
+ * Scope: Break 1, Lunch 1, Break 2, Lunch 2 only. BOP is owned by the scheduler:
+ * it is never moved, never validated, and is treated as a fixed block that
+ * breaks/lunches may not overlap.
+ *
+ * Guarantees (enforced by construction, verified by tests/test_dispersion_engine.js):
+ *  - Nothing is invented or dropped: same activities, same durations, same order.
+ *  - Anything starting before (now + lead) is frozen (finished or in progress).
+ *  - A terminal activity (ends exactly at end of shift) is anchored and never moved.
+ *  - Moved activities stay inside the shift, never overlap each other or BOP,
+ *    and never get tighter spacing than min(original gap, minGap).
+ *  - Agents with dirty/unusable rows are NOT modified; they are returned in `flagged`.
+ *  - Pure + deterministic: same input -> same output. No DOM, no network, no DB.
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.WorkSyncDispersionEngine = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  const KEYS = ['break1', 'lunch1', 'break2', 'lunch2'];
+  const GRID = 15;
+  const DEFAULTS = {
+    durations: { break1: 15, lunch1: 30, break2: 15, lunch2: 30 },
+    leadMin: 0,          // activities starting before now+lead are frozen
+    maxMoveMin: 60,      // max distance any activity may move from its scheduled start
+    minGapMin: 30,       // spacing floor between consecutive activities (never tighter than original)
+    edgeBufferMin: 15,   // keep moved activities this far from shift start / end (never tighter than original)
+    minAvailable: null,  // optional soft coverage floor: on-shift - pulledOff - off-phone >= minAvailable
+    pulledOff: 0,        // agents pulled off the phone for the whole day (training etc.), subtracted from coverage
+    clashAt: 4,          // a slot with this many break/lunch/BOP off at once counts as a clash; the engine never adds clashes
+    movePenalty: 0.001,  // tiny tie-breaker: prefer staying put
+    maxPasses: 25
+  };
+
+  // ---------- parsing helpers (shared with the UI later) ----------
+  function parseClock(s) {
+    const m = /^\s*(\d{1,2}):(\d{2})\s*(AM|PM)?\s*$/i.exec(String(s == null ? '' : s));
+    if (!m) return null;
+    let h = +m[1]; const mi = +m[2]; const ap = (m[3] || '').toUpperCase();
+    if (mi > 59 || h > 24) return null;
+    if (ap === 'PM' && h < 12) h += 12;
+    if (ap === 'AM' && h === 12) h = 0;
+    return h * 60 + mi;
+  }
+  function parseRange(s) {
+    const t = String(s == null ? '' : s).trim();
+    if (!t) return { empty: true };
+    const parts = t.split(/\s+-\s+|-/).map(x => x.trim()).filter(Boolean);
+    if (parts.length !== 2) return { bad: true, raw: t };
+    const a = parseClock(parts[0]), b = parseClock(parts[1]);
+    if (a == null || b == null) return { bad: true, raw: t };
+    return { start: a, end: b };
+  }
+  function fmt(min) {
+    if (min == null) return '--';
+    const m = ((Math.round(min) % 1440) + 1440) % 1440;
+    return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+  }
+
+  /** Build an engine agent from a raw scheduler row {employee_id,name,shift,cells[5]}. */
+  function agentFromRow(row) {
+    const out = { employee_id: row.employee_id, name: row.name, group: row.group || null,
+                  shiftStart: null, shiftEnd: null, activities: {}, bop: null, fixed: [], rawProblems: [] };
+    const shift = String(row.shift || '').trim();
+    if (/^off$/i.test(shift) || !shift) { out.off = true; }
+    else {
+      const r = parseRange(shift);
+      if (r.start == null) out.rawProblems.push('UNPARSEABLE_SHIFT');
+      else { out.shiftStart = r.start; out.shiftEnd = r.end; }
+    }
+    const cells = row.cells || [];
+    KEYS.forEach((k, i) => {
+      const r = parseRange(cells[i]);
+      if (r.bad) { out.rawProblems.push('UNPARSEABLE_' + k.toUpperCase()); out.activities[k] = null; }
+      else out.activities[k] = r.empty ? null : { start: r.start, end: r.end };
+    });
+    const b = parseRange(cells[4]);
+    out.bop = (b.start != null) ? { start: b.start, end: b.end } : null; // never validated
+    return out;
+  }
+
+  // ---------- validation (core four only) ----------
+  function validateAgent(a, opts) {
+    const problems = a.rawProblems ? a.rawProblems.slice() : [];
+    const anyCore = KEYS.some(k => a.activities[k]);
+    if (a.off) { if (anyCore) problems.push('BREAKS_ON_OFF_DAY'); return problems; }
+    if (a.shiftStart == null || a.shiftEnd == null) return problems.length ? problems : ['NO_SHIFT'];
+    if (a.shiftEnd <= a.shiftStart) { problems.push('OVERNIGHT_OR_INVALID_SHIFT'); return problems; }
+    if (!anyCore) { problems.push('NO_BREAKS_ON_WORKING_DAY'); return problems; }
+    let prevEnd = -Infinity;
+    for (const k of KEYS) {
+      const p = a.activities[k];
+      if (!p) { problems.push('MISSING_' + k.toUpperCase()); continue; }
+      if (p.end - p.start !== opts.durations[k]) problems.push('NONSTANDARD_DURATION_' + k.toUpperCase());
+      if (p.start < a.shiftStart || p.end > a.shiftEnd) problems.push('OUTSIDE_SHIFT_' + k.toUpperCase());
+      if (p.start < prevEnd) problems.push('ORDER_OR_OVERLAP_' + k.toUpperCase());
+      prevEnd = p.end;
+    }
+    return problems;
+  }
+
+  // ---------- occupancy ----------
+  function bucketOf(m) { return Math.floor(m / GRID); }
+  function addOcc(occ, s, e, d) { for (let b = bucketOf(s); b * GRID < e; b++) occ.set(b, (occ.get(b) || 0) + d); }
+
+  function obstaclesOf(a) { // blocks the engine never moves: BOP (scheduler-owned) + training/other off-phone time
+    const o = []; if (a.bop) o.push(a.bop); (a.fixed || []).forEach(f => o.push(f)); return o;
+  }
+  /** Coverage picture for the part of the day still ahead of `now`. */
+  function metrics(agents, now, minAvail, pulled, clashAt) {
+    const occ = new Map(), occB = new Map(), on = new Map();
+    agents.forEach(a => {
+      KEYS.forEach(k => { const p = a.activities[k]; if (p) { addOcc(occ, p.start, p.end, 1); addOcc(occB, p.start, p.end, 1); } });
+      obstaclesOf(a).forEach(o => addOcc(occ, o.start, o.end, 1));
+      if (a.bop) addOcc(occB, a.bop.start, a.bop.end, 1);
+      if (!a.off && a.shiftStart != null && a.shiftEnd > a.shiftStart) addOcc(on, a.shiftStart, a.shiftEnd, 1);
+    });
+    let C = 0; for (const v of on.values()) C = Math.max(C, v);
+    let peakOff = 0, sumCubes = 0, lowest = Infinity, below = 0, clash = 0;
+    for (const [b, cnt] of on) {
+      if (b * GRID + GRID <= now) continue;
+      const n = occ.get(b) || 0, avail = cnt - pulled - n;
+      if ((occB.get(b) || 0) >= clashAt) clash++;
+      peakOff = Math.max(peakOff, n); lowest = Math.min(lowest, avail);
+      const m = (C - cnt) + pulled + n; sumCubes += m * m * m;
+      if (minAvail != null && avail < minAvail) below++;
+    }
+    return { peakOff, lowestAvailable: lowest === Infinity ? null : lowest, sumCubes, bucketsBelowMinAvail: below, clashBuckets: clash };
+  }
+
+  // ---------- core ----------
+  function disperse(inputAgents, nowMin, userOpts) {
+    const opts = Object.assign({}, DEFAULTS, userOpts || {});
+    opts.durations = Object.assign({}, DEFAULTS.durations, (userOpts || {}).durations || {});
+    const agents = inputAgents.map(a => JSON.parse(JSON.stringify(a)));
+    const original = JSON.parse(JSON.stringify(agents));
+    const flagged = [], work = [];
+
+    agents.forEach(a => {
+      const problems = validateAgent(a, opts);
+      if (a.off && !problems.length) return; // genuinely off: ignore silently
+      if (problems.length) { flagged.push({ employee_id: a.employee_id, name: a.name, problems }); return; }
+      work.push(a);
+    });
+
+    // coverage (on-shift) per bucket, from every agent with a usable shift
+    const on = new Map();
+    agents.forEach(a => { if (!a.off && a.shiftStart != null && a.shiftEnd > a.shiftStart) addOcc(on, a.shiftStart, a.shiftEnd, 1); });
+
+    // occupancy from everything that currently exists (flagged agents + BOP still occupy the phone)
+    const occ = new Map(), occB = new Map();   // occB = breaks/lunches/BOP only (what the clash count measures)
+    agents.forEach(a => {
+      KEYS.forEach(k => { const p = a.activities[k]; if (p) { addOcc(occ, p.start, p.end, 1); addOcc(occB, p.start, p.end, 1); } });
+      obstaclesOf(a).forEach(o => addOcc(occ, o.start, o.end, 1));
+      if (a.bop) addOcc(occB, a.bop.start, a.bop.end, 1);
+    });
+
+    const freezeBefore = nowMin + opts.leadMin;
+    // per-agent plan: which activities are movable
+    work.forEach(a => {
+      const list = KEYS.map(k => ({ key: k, p: a.activities[k] }));
+      const last = list[list.length - 1].p;
+      const terminal = last.end === a.shiftEnd;
+      a._movable = list.filter((x, i) => x.p.start >= freezeBefore && !(terminal && i === list.length - 1)).map(x => x.key);
+      a._terminalStart = terminal ? last.start : null;
+    });
+
+        let C = 0; for (const v of on.values()) C = Math.max(C, v);
+    function slotCost(s, dur, orig) {
+      let c = 0;
+      for (let b = bucketOf(s); b * GRID < s + dur; b++) {
+        const o = occ.get(b) || 0, cnt = on.get(b) || 0;
+        const m = (C - cnt) + opts.pulledOff + o;   // agents already missing from the phone in this slot
+        c += 3 * m * m + 3 * m + 1;                 // marginal cost of cubic load: thin slots cost more, stacking costs most
+        if ((occB.get(b) || 0) === opts.clashAt - 1) c += 300;   // would CREATE a new clash slot
+        // heavy penalty only when this placement would CREATE a new below-minimum slot
+        if (opts.minAvailable != null && cnt - opts.pulledOff - o === opts.minAvailable) c += 1000;
+      }
+      return c + opts.movePenalty * Math.abs(s - orig) / GRID;
+    }
+    function overlapsBop(a, s, e) { return obstaclesOf(a).some(o => s < o.end && e > o.start); }
+
+    function optimiseAgent(a) {
+      const mv = a._movable; if (!mv.length) return false;
+      // take own movable activities out of the occupancy
+      mv.forEach(k => { addOcc(occ, a.activities[k].start, a.activities[k].end, -1); addOcc(occB, a.activities[k].start, a.activities[k].end, -1); });
+      const first = KEYS.indexOf(mv[0]);
+      const prevEnd = first > 0 ? a.activities[KEYS[first - 1]].end : a.shiftStart;
+      const orig0 = original.find(x => x.employee_id === a.employee_id && x.shiftStart === a.shiftStart && x.name === a.name);
+      const startBuf = Math.min(opts.edgeBufferMin, orig0.activities[KEYS[0]].start - a.shiftStart);
+      const endBuf = Math.min(opts.edgeBufferMin, a.shiftEnd - orig0.activities[KEYS[KEYS.length - 1]].end);
+      const gapReq = (i) => { // spacing between KEYS[i-1] and KEYS[i]
+        const orig = original.find(o => o.employee_id === a.employee_id && o.shiftStart === a.shiftStart && o.name === a.name);
+        const og = orig.activities[KEYS[i]].start - orig.activities[KEYS[i - 1]].end;
+        return Math.min(opts.minGapMin, og);
+      };
+      const lastIdx = first + mv.length - 1;
+      const endBound = a._terminalStart != null
+        ? a._terminalStart - gapReq(lastIdx + 1)   // keep spacing before the anchored terminal activity
+        : a.shiftEnd - endBuf;                      // a non-terminal activity may not drift onto end of shift
+      // candidates per movable activity
+      const cands = mv.map(k => {
+        const o = original.find(x => x.employee_id === a.employee_id && x.shiftStart === a.shiftStart && x.name === a.name).activities[k];
+        const dur = o.end - o.start, set = new Set([o.start]);
+        const lo = Math.max(freezeBefore, o.start - opts.maxMoveMin, a.shiftStart + (k === KEYS[0] ? startBuf : 0));
+        const hi = Math.min(o.start + opts.maxMoveMin, endBound - dur);
+        for (let t = Math.ceil(lo / GRID) * GRID; t <= hi; t += GRID) set.add(t);
+        return [...set].filter(t => t >= lo && t + dur <= endBound && !overlapsBop(a, t, t + dur)).sort((x, y) => x - y)
+                       .map(t => ({ t, dur, cost: slotCost(t, dur, o.start) }));
+      });
+      // exact DP over the ordered chain
+      const dp = cands.map(c => c.map(() => ({ v: Infinity, from: -1 })));
+      cands[0].forEach((c, j) => { const g = first > 0 ? gapReq(first) : 0; if (c.t >= prevEnd + g) dp[0][j] = { v: c.cost, from: -1 }; });
+      for (let i = 1; i < mv.length; i++) {
+        const g = gapReq(first + i);
+        cands[i].forEach((c, j) => {
+          cands[i - 1].forEach((p, pj) => {
+            if (dp[i - 1][pj].v < Infinity && c.t >= p.t + p.dur + g && dp[i - 1][pj].v + c.cost < dp[i][j].v) dp[i][j] = { v: dp[i - 1][pj].v + c.cost, from: pj };
+          });
+        });
+      }
+      let bj = -1, bv = Infinity; const L = mv.length - 1;
+      dp[L].forEach((d, j) => { if (d.v < bv) { bv = d.v; bj = j; } });
+      let changed = false;
+      if (bj < 0) { // no feasible placement found: keep the original, add it back unchanged
+        mv.forEach(k => { addOcc(occ, a.activities[k].start, a.activities[k].end, 1); addOcc(occB, a.activities[k].start, a.activities[k].end, 1); }); return false;
+      }
+      const chosen = new Array(mv.length);
+      for (let i = L, j = bj; i >= 0; i--) { chosen[i] = cands[i][j]; j = dp[i][j].from; }
+      mv.forEach((k, i) => {
+        const cur = a.activities[k];
+        if (cur.start !== chosen[i].t) changed = true;
+        a.activities[k] = { start: chosen[i].t, end: chosen[i].t + chosen[i].dur };
+        addOcc(occ, a.activities[k].start, a.activities[k].end, 1); addOcc(occB, a.activities[k].start, a.activities[k].end, 1);
+      });
+      return changed;
+    }
+
+    const order = work.slice().sort((x, y) => String(x.employee_id).localeCompare(String(y.employee_id)));
+    // keep original lookups stable (strip helper fields from comparison)
+    let passes = 0;
+    for (; passes < opts.maxPasses; passes++) {
+      let any = false;
+      order.forEach(a => { if (optimiseAgent(a)) any = true; });
+      if (!any) break;
+    }
+
+    const changes = [];
+    work.forEach(a => {
+      const o = original.find(x => x.employee_id === a.employee_id && x.shiftStart === a.shiftStart && x.name === a.name);
+      KEYS.forEach(k => {
+        const f = o.activities[k], t = a.activities[k];
+        if (f.start !== t.start) changes.push({ employee_id: a.employee_id, name: a.name, activity: k, from: f, to: t, movedMin: t.start - f.start });
+      });
+    });
+    work.forEach(a => { delete a._movable; delete a._terminalStart; });
+
+    const before = metrics(original, nowMin, opts.minAvailable, opts.pulledOff, opts.clashAt);
+    let after = metrics(agents, nowMin, opts.minAvailable, opts.pulledOff, opts.clashAt);
+    let reverted = false;
+    // Safety net: never hand back a plan that is worse than what the scheduler gave us.
+    const worseFloor = before.lowestAvailable != null && after.lowestAvailable != null && after.lowestAvailable < before.lowestAvailable;
+    const moreBelowMin = after.bucketsBelowMinAvail > before.bucketsBelowMinAvail;
+    const moreClashes = after.clashBuckets > before.clashBuckets;
+    if (worseFloor || moreBelowMin || moreClashes || after.sumCubes > before.sumCubes) {
+      reverted = true;
+      return { agents: original.map(a => JSON.parse(JSON.stringify(a))), original, flagged, changes: [], reverted,
+               passes: passes + 1, opts, nowMin, before, after: before, rejected: after,
+               summary: { agentsConsidered: work.length, flagged: flagged.length, activitiesMoved: 0, agentsMoved: 0 } };
+    }
+    const movedAgents = new Set(changes.map(c => c.employee_id)).size;
+    return { agents, original, flagged, changes, reverted, passes: passes + 1, opts, nowMin, before, after,
+             summary: { agentsConsidered: work.length, flagged: flagged.length, activitiesMoved: changes.length, agentsMoved: movedAgents } };
+  }
+
+  return { KEYS, GRID, DEFAULTS, parseClock, parseRange, fmt, agentFromRow, validateAgent, disperse };
+});
+/* END inlined: src/modules/break-dispersion-engine.js */
+</script>
+<script>
+
+// Alpha 5: Concepcion Carrier (CCAC) is the parent LOB.
+// The three integrated branches are stored using the existing roster/schedule keys:
+// CCAC CCAC -> CCAC, CCAC CMIP -> CMIP, CCAC CDI -> CDI.
+const WORKSYNC_LOB_KEY = "CCAC";
+const WORKSYNC_BRANCHES = [
+  {key:"CCAC", label:"CCAC CCAC"},
+  {key:"CMIP", label:"CCAC CMIP"},
+  {key:"CDI",  label:"CCAC CDI"}
+];
+function branchLabel(key){
+  const k=String(key||"").trim().toUpperCase();
+  return WORKSYNC_BRANCHES.find(x=>x.key===k)?.label || k || "—";
+}
+function branchKeyFromLabel(value){
+  const raw=String(value||"").trim().toUpperCase();
+  const hit=WORKSYNC_BRANCHES.find(x=>x.key===raw || x.label.toUpperCase()===raw);
+  if(hit)return hit.key;
+  if(raw.endsWith(" CCAC"))return "CCAC";
+  if(raw.endsWith(" CMIP"))return "CMIP";
+  if(raw.endsWith(" CDI"))return "CDI";
+  return raw || null;
+}
+function allBranchKeys(){ return WORKSYNC_BRANCHES.map(x=>x.key); }
+
+// Alpha 5 access scope: Ops OM visibility is branch-restricted by profile.
+// Bienvenido/Bien is CCAC-only; Vic Diamzon is CMIP/CDI-only.
+let currentBranches = [];
+async function loadUserBranches(profileId){
+  try{
+    const {data,error}=await sb.from("user_branches").select("branch").eq("profile_id",profileId);
+    if(error){ console.warn("Branch mapping unavailable:",error); return []; }
+    return (data||[]).map(r=>r.branch);
+  }catch(e){ console.warn("Branch mapping unavailable:",e); return []; }
+}
+function allowedBranchesForProfile(){
+  const role=String(currentProfile?.role||"").toLowerCase();
+  if(role==="wfm" || role==="admin" || role==="tl") return allBranchKeys();
+  if(role==="ops" || role==="ops_om") return Array.isArray(currentBranches) ? currentBranches : [];
+  return allBranchKeys();
+}
+function configureBranchAccessUI(){
+  const allowed=allowedBranchesForProfile();
+  ["rosterBranchFilter","scheduleLob"].forEach(id=>{
+    const select=$(id); if(!select)return;
+    [...select.options].forEach(opt=>{
+      const key=branchKeyFromLabel(opt.value);
+      opt.hidden=!allowed.includes(key);
+      opt.disabled=!allowed.includes(key);
+    });
+    if(!allowed.includes(branchKeyFromLabel(select.value))){
+      select.value=allowed[0]||"CCAC";
+    }
+  });
+  const importerPanel=document.querySelector("#rosterMasterFile")?.closest(".panel");
+  const isOM=(String(currentProfile?.role||"").toLowerCase()==="ops" || String(currentProfile?.role||"").toLowerCase()==="ops_om" || String(currentProfile?.display_name||"").toLowerCase().includes("bienvenido"));
+  if(importerPanel && isOM){
+    importerPanel.classList.add("om-roster-restricted");
+  }
+  const masterSection=document.querySelector("#rosterMasterFile")?.closest(".roster-import") || null;
+  if(isOM){
+    const fileInput=$("rosterMasterFile");
+    const label=fileInput?.closest("label");
+    if(label) label.style.display="none";
+    const drop=$("rosterMasterDrop");
+    if(drop) drop.style.display="none";
+    const preview=$("rosterMasterPreview");
+    if(preview) preview.classList.add("hidden");
+  }
+}
+function isOpsOM(){
+  const role=String(currentProfile?.role||"").toLowerCase();
+  const name=String(currentProfile?.display_name||"").toLowerCase();
+  return role==="ops" || role==="ops_om" || name.includes("bienvenido");
+}
+function omAccessProfile(){
+  if(!isOpsOM()) return {key:"OM", label:"All branches", branches:allBranchKeys()};
+  const branches=allowedBranchesForProfile();
+  const label=branches.length===1 ? `${branchLabel(branches[0])} only` : branches.map(branchLabel).join(" + ");
+  return {key:branches.length===1?branches[0]:"OM", label:label||"No branch access", branches};
+}
+
+let currentUser = null, currentProfile = null, importData = null;
+let importRosterMatch = { matched: false, total: 0, missing: [], inactive: [], directoryWarning: "" };
+
+const $ = id => document.getElementById(id);
+let wsSplashShownAt=Date.now(), wsSplashWatchdog=null, wsSplashHideTimer=null;
+function showWorkSyncSplash(status="Preparing your workspace…"){
+  const overlay=$("workSyncSplash"); if(!overlay)return;
+  clearTimeout(wsSplashWatchdog); clearTimeout(wsSplashHideTimer);
+  wsSplashShownAt=Date.now();
+  const statusEl=$("workSyncSplashStatus"); if(statusEl)statusEl.textContent=status;
+  overlay.classList.remove("ws-splash-hidden");
+  // Safety fallback: startup errors or blocked requests must never trap the user behind the splash.
+  wsSplashWatchdog=setTimeout(()=>hideWorkSyncSplash(0),10000);
+}
+function hideWorkSyncSplash(extraDelay=0){
+  const overlay=$("workSyncSplash"); if(!overlay)return;
+  clearTimeout(wsSplashWatchdog); clearTimeout(wsSplashHideTimer);
+  const minimumVisible=Math.max(0,900-(Date.now()-wsSplashShownAt));
+  wsSplashHideTimer=setTimeout(()=>overlay.classList.add("ws-splash-hidden"),Math.max(minimumVisible,Number(extraDelay)||0));
+}
+function updateLiveClock(){
+  const now = new Date();
+  const time = new Intl.DateTimeFormat("en-PH", {
+    timeZone:"Asia/Manila", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true
+  }).format(now);
+  const el = $("liveClock");
+  if(el) el.textContent = time;
+}
+updateLiveClock();
+setInterval(updateLiveClock,1000);
+function setMessage(text, type="ok"){ $("message").innerHTML = text ? `<div class="banner ${type}">${text}</div>` : ""; }
+function escapeHtml(v){ return String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function getCurrentRosterBranch(){
+  if(currentProfile?.employee_id){
+    const {data,error}=await sb.from("roster").select("lob").eq("employee_id",currentProfile.employee_id).maybeSingle();
+    if(!error && data?.lob) return branchKeyFromLabel(data.lob);
+  }
+  return branchKeyFromLabel(WORKSYNC_LOB_KEY)||"CCAC";
+}
+function selectedScheduleBranch(){
+  return branchKeyFromLabel($("scheduleLob")?.value)||"CCAC";
+}
+
+
+function updateArchiveNav(){
+  const el=$("archiveNav"); if(!el) return;
+  el.style.display=["wfm","om","tl","admin"].includes(effectiveBranch())?"inline-block":"none";
+  const el2=$("scheduleChangesNav"); if(el2) el2.style.display=["om","tl","admin"].includes(effectiveBranch())?"inline-block":"none";
+  const formWrap=$("chgFormWrap"); if(formWrap) formWrap.style.display=["wfm"].includes(effectiveBranch())?"":"none";
+  const isTlView=effectiveBranch()==="tl";
+  ["arBranch","arTl"].forEach(id=>{ const f=$(id)?.closest(".field"); if(f) f.style.display=isTlView?"none":""; });
+  const allVer=$("arAllVersions"); if(allVer){ const lbl=allVer.closest("label")||allVer; lbl.style.display=["wfm"].includes(effectiveBranch())?"":"none"; }
+}
+async function loadTlAttendanceSnapshot(){
+  const date=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);
+  try{
+    const {data:snaps,error}=await sb.from("attendance_snapshots")
+      .select("id,session,cutoff_text,created_at").eq("snapshot_date",date).eq("is_latest",true);
+    if(error) throw error;
+    const pick=["EOS","PM","AM"].find(x=>(snaps||[]).some(q=>q.session===x));
+    const chosen=(snaps||[]).filter(q=>q.session===pick);
+    const recs=pick ? await fetchAllArchiveRecords(chosen.map(q=>q.id)) : [];
+    tlAttByEid=new Map(recs.map(r=>[tlAttKey(r.employee_id),r]));
+    const checkAt=chosen.reduce((m,q)=>Math.max(m,new Date(q.created_at).getTime()),0);
+    const {data:chg}=await sb.from("schedule_change_log").select("employee_id,created_at,new_value").eq("schedule_date",date);
+    tlChangedByEid=new Map((pick ? (chg||[]) : []).filter(c=>new Date(c.created_at).getTime()>checkAt).map(c=>[tlAttKey(c.employee_id),c.new_value||{}]));
+    const changedN=[...tlChangedByEid.keys()].filter(k=>tlAttByEid.has(k)).length;
+    const kinds=recs.filter(r=>!tlChangedByEid.has(tlAttKey(r.employee_id))).map(r=>tlAttLabel(r).kind);
+    $("tlAttIn").textContent=kinds.filter(k=>k==="in").length;
+    $("tlAttTardy").textContent=kinds.filter(k=>k==="tardy").length;
+    $("tlAttAbsent").textContent=kinds.filter(k=>k==="absent").length;
+    $("tlAttDue").textContent=kinds.filter(k=>k==="due").length;
+    const cut=chosen.map(q=>q.cutoff_text).filter(Boolean)[0]||"";
+    const {data:lv}=await sb.from("leave_requests").select("id").eq("status","pending_om");
+    const pending=(lv||[]).length;
+    const basis=pick
+      ? "Based on the "+pick+" check"+(cut?" · cut-off "+cut:"")+" · "+(pick==="EOS"?"final":"provisional until the EOS check")
+      : "No attendance check has been saved for today yet";
+    $("tlAttBasis").textContent=basis
+      +(changedN ? " · "+changedN+" schedule change(s) since this check, re-run the check to refresh" : "")
+      +" · "+pending+" leave request(s) waiting for OM decision";
+  }catch(err){
+    console.error("TL attendance failed:",err);
+    tlAttByEid=new Map(); tlChangedByEid=new Map();
+    $("tlAttBasis").textContent="Attendance could not load: "+(err.message||String(err));
+  }
+  renderTLHomeTeam(tlActiveFilter);
+}
+
+const CHG_STATUSES=["WORKING","OFF","VL","ML","SL"];
+function chgIsWfm(){ const r=String(currentProfile?.role||"").toLowerCase(); return r==="wfm"||r==="admin"; }
+function chgTime(t){ return t ? String(t).slice(0,5) : ""; }
+let chgRosterRows=[];
+async function loadChangeRoster(){
+  if(!chgIsWfm()) return;
+  const {data,error}=await sb.from("roster").select("employee_id,name,lob,team_leader").order("name",{ascending:true});
+  if(error){ console.error("Roster list failed:",error); return; }
+  chgRosterRows=data||[];
+  $("chgRoster").innerHTML=chgRosterRows.map(r=>`<option value="${escapeHtml((r.name||"")+" · "+r.employee_id)}"></option>`).join("");
+}
+function chgResolve(side){
+  const txt=($(`chg${side}Input`).value||"").trim().toLowerCase();
+  const out=$(`chg${side}Name`);
+  if(!txt){ $(`chg${side}Eid`).value=""; out.textContent=""; return; }
+  const hits=chgRosterRows.filter(r=>{
+    const name=(r.name||"").trim().toLowerCase();
+    return name===txt || (name+" · "+String(r.employee_id).toLowerCase())===txt;
+  });
+  if(hits.length===1){
+    const r=hits[0];
+    $(`chg${side}Eid`).value=r.employee_id;
+    out.textContent=r.name+" · "+r.employee_id+" · "+(r.lob||"")+" · TL "+(r.team_leader||"—");
+  }else{
+    $(`chg${side}Eid`).value="";
+    out.textContent = hits.length>1 ? "More than one match. Pick the exact entry from the list." : "No roster match. Pick a name from the list.";
+  }
+}
+async function chgCurrent(eid,date){
+  const {data:vers}=await sb.from("schedule_versions").select("id").eq("status","published");
+  const ids=(vers||[]).map(v=>v.id);
+  if(!ids.length) return null;
+  const {data:rows}=await sb.from("schedules").select("schedule_status,shift_start,shift_end,schedule_version_id")
+    .eq("employee_id",eid).eq("schedule_date",date).in("schedule_version_id",ids).order("id",{ascending:false}).limit(1);
+  return (rows&&rows[0])||null;
+}
+function chgReadSide(p){
+  const eid=($(`chg${p}Eid`)?.value||"").trim();
+  return {
+    employee_id:eid,
+    schedule_date:$(`chg${p}Date`)?.value||"",
+    schedule_status:$(`chg${p}Status`)?.value||"",
+    shift_start:$(`chg${p}Start`)?.value||null,
+    shift_end:$(`chg${p}End`)?.value||null
+  };
+}
+function chgValidate(){
+  const type=$("chgType").value;
+  const sides=[chgReadSide("A")].concat(type==="SWAP"?[chgReadSide("B")]:[]);
+  for(const x of sides){
+    if(!x.employee_id||!x.schedule_date) return "Pick each agent from the list and set a date.";
+    if(x.schedule_status==="WORKING" && (!x.shift_start||!x.shift_end)) return "WORKING needs a start and end time.";
+  }
+  if(!($("chgRef").value||"").trim()) return "Approval reference is required.";
+  if(!($("chgReason").value||"").trim()) return "Reason is required.";
+  if(type==="SWAP" && sides[0].employee_id===sides[1].employee_id) return "A swap needs two different agents.";
+  return "";
+}
+function chgSummaryLine(x,cur){
+  const now=x.schedule_status+(x.shift_start&&x.shift_end?" "+x.shift_start+"–"+x.shift_end:"");
+  const was=cur ? cur.schedule_status+(cur.shift_start&&cur.shift_end?" "+chgTime(cur.shift_start)+"–"+chgTime(cur.shift_end):"") : "no published row";
+  return `<div><strong>${escapeHtml(x.employee_id)}</strong> · ${escapeHtml(x.schedule_date)} — ${escapeHtml(was)} → <strong>${escapeHtml(now)}</strong></div>`;
+}
+async function chgPreview(){
+  const err=chgValidate();
+  if(err){ $("chgPreview").innerHTML='<div class="banner warn">'+escapeHtml(err)+'</div>'; return null; }
+  const type=$("chgType").value;
+  const sides=[chgReadSide("A")].concat(type==="SWAP"?[chgReadSide("B")]:[]);
+  const lines=[];
+  for(const x of sides){ lines.push(chgSummaryLine(x, await chgCurrent(x.employee_id,x.schedule_date))); }
+  $("chgPreview").innerHTML='<div class="chg-preview"><div style="font-weight:800;margin-bottom:6px">'+(type==="SWAP"?"Swap":"Edit")+' preview</div>'+lines.join("")+'<div class="muted" style="margin-top:8px;font-size:12px">Ref: '+escapeHtml($("chgRef").value.trim())+'</div></div>';
+  return sides;
+}
+async function chgApply(){
+  const sides=await chgPreview();
+  if(!sides) return;
+  if(!confirm("Apply this change? It updates the published schedule and is logged.")) return;
+  const type=$("chgType").value;
+  const edits=sides.map(x=>({employee_id:x.employee_id,schedule_date:x.schedule_date,schedule_status:x.schedule_status,shift_start:x.shift_start,shift_end:x.shift_end}));
+  $("chgApplyBtn").disabled=true;
+  try{
+    const {data,error}=await sb.rpc("apply_schedule_change",{p_change_type:type,p_approval_ref:$("chgRef").value.trim(),p_reason:$("chgReason").value.trim(),p_edits:edits});
+    if(error) throw error;
+    const brk=data?.break_lunch_activities_on_changed_rows||0;
+    $("chgResult").innerHTML='<div class="banner ok"><strong>Saved.</strong> '+escapeHtml(String(data?.rows_changed||0))+' row(s) changed and logged.'+
+      (brk?' <strong>'+brk+' break/lunch activit'+(brk===1?'y':'ies')+' on these rows need checking</strong> (they do not move automatically).':'')+'</div>';
+    $("chgPreview").innerHTML="";
+    loadChangeLog();
+  }catch(err){
+    console.error("Schedule change failed:",err);
+    $("chgResult").innerHTML='<div class="banner err">Not saved: '+escapeHtml(err.message||String(err))+'</div>';
+  }finally{ $("chgApplyBtn").disabled=false; }
+}
+async function loadChangeLog(){
+  const body=$("chgLogBody"); if(!body) return;
+  const from=($("chgFrom")?.value||"").slice(0,10), to=($("chgTo")?.value||"").slice(0,10);
+  body.innerHTML='<tr><td colspan="10" class="muted">Loading…</td></tr>';
+  let q=sb.from("schedule_change_log").select("*").order("created_at",{ascending:false}).limit(500);
+  if(from) q=q.gte("schedule_date",from);
+  if(to) q=q.lte("schedule_date",to);
+  const {data,error}=await q;
+  if(error){ body.innerHTML='<tr><td colspan="10" class="banner err">Log could not load: '+escapeHtml(error.message)+'</td></tr>'; return; }
+  if(!data||!data.length){ body.innerHTML='<tr><td colspan="10" class="muted">No changes in this range.</td></tr>'; return; }
+  body.innerHTML=data.map(r=>{
+    const f=v=>v? v.schedule_status+(v.shift_start&&v.shift_end?" "+chgTime(v.shift_start)+"–"+chgTime(v.shift_end):"") : "—";
+    return `<tr>
+      <td>${escapeHtml(r.schedule_date)}</td>
+      <td>${escapeHtml(r.change_type)}</td>
+      <td><strong>${escapeHtml(r.employee_name||r.employee_id)}</strong><div class="muted" style="font-size:11px">${escapeHtml(r.employee_id)}</div></td>
+      <td>${escapeHtml(r.team_leader||"—")}</td>
+      <td>${escapeHtml(f(r.old_value))} → <strong>${escapeHtml(f(r.new_value))}</strong></td>
+      <td>${escapeHtml(r.swap_with_employee_id||"—")}</td>
+      <td>${escapeHtml(r.approval_ref||"—")}</td>
+      <td>${escapeHtml(r.reason||"—")}</td>
+      <td>${escapeHtml(r.created_by_name||"—")}</td>
+      <td>${escapeHtml(new Date(r.created_at).toLocaleString("en-PH",{timeZone:"Asia/Manila"}))}</td>
+    </tr>`;
+  }).join("");
+}
+function chgSetSwapFields(){
+  $("chgBWrap").style.display = $("chgType").value==="SWAP" ? "" : "none";
+}
+document.getElementById("verintWorkspaceNav")?.addEventListener("click",()=>showView("verintWorkspace"));
+function showView(name){
+  const branch=effectiveBranch();
+  // Administrative Roster is not a TL workspace. TLs use the read-only team snapshot.
+  if(name==="rosterAdmin" && branch==="tl") name="tlRoster";
+  if(name==="rosterAdmin" && branch==="agent") name="agentHome";
+  if(name==="breakDispersion" && !WorkSyncModules.isEnabled('break-dispersion')) { toast('Break Dispersion is currently disabled in this development build.'); name = branch === 'wfm' || branch === 'admin' ? 'home' : 'agentHome'; }
+  if(name==="tlRoster" && branch!=="tl") name=branch==="agent"?"agentHome":branch==="om"?"omHome":"home";
+  document.querySelectorAll(".view").forEach(v=>v.classList.remove("active"));
+  document.querySelectorAll(".nav button").forEach(b=>b.classList.remove("active"));
+  const map={
+    verintWorkspace:["verintWorkspaceView","verintWorkspaceNav"],
+    scheduleChanges:["scheduleChangesView","scheduleChangesNav"],
+    attendanceArchive:["attendanceArchiveView","archiveNav"],
+    requestsHub:["requestsHubView","requestsNav"],
+    home:["homeView","homeNav"],
+    wfmCommandCenter:["wfmCommandCenterView","homeNav"],
+    wfmRequests:["wfmRequestsView","requestsNav"],
+    rosterAdmin:["rosterAdminView","rosterNav"],
+    schedule:["scheduleView","scheduleNav"],
+    scheduleEngine:["scheduleEngineView","scheduleNav"],
+    scheduleManage:["scheduleManageView","scheduleNav"],
+    breakDispersion:["breakDispersionView","scheduleNav"],
+    briefsHub:["briefsHubView","briefsNav"],
+    coverageBrief:["coverageBriefView","briefsNav"],
+    loginBrief:["loginBriefView","briefsNav"],
+    access:["accessView","accessNav"],
+    accessEmulation:["accessEmulationView","accessNav"],
+    databaseSettings:["settingsView","settingsNav"],
+    settings:["settingsView","settingsNav"],
+    agentHome:["agentHomeView","homeNav"],
+    agentSchedule:["agentScheduleView","myScheduleNav"],
+    agentRequests:["agentRequestsView","agentRequestsNav"],
+    viewRequests:["viewRequestsView","agentRequestsNav"],
+    tlHome:["tlHomeView","homeNav"],
+    tlSchedule:["tlScheduleView","tlScheduleNav"],
+    tlRoster:["tlRosterView","rosterNav"],
+    myTeam:["myTeamView","myTeamNav"],
+    tlRequests:["tlRequestsView","tlRequestsNav"],
+    tlViewRequests:["tlViewRequestsView","tlRequestsNav"],
+    omHome:["omHomeView","homeNav"],
+    omDailyStaffing:["omDailyStaffingView","omDailyStaffingNav"],
+    omMyTLs:["omMyTLsView","omMyTLsNav"],
+    omRequests:["omRequestsView","omRequestsNav"],
+    omViewRequests:["omViewRequestsView","omRequestsNav"]
+  };
+  const pair=map[name]; if(pair){$(pair[0]).classList.add("active");$(pair[1]).classList.add("active");}
+  updateArchiveNav();
+  sessionStorage.setItem("worksync.activeView",name);
+  if(name==="attendanceArchive"){
+    if($("arDate") && !$("arDate").value) $("arDate").value=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);
+    loadAttendanceArchive();
+  }
+  if(name==="scheduleChanges"){ if($("chgFormWrap")) $("chgFormWrap").style.display=chgIsWfm()?"":"none"; loadChangeLog(); loadChangeRoster(); }
+  if(name==="tlHome") loadTlAttendanceSnapshot();
+  window.scrollTo({top:0,behavior:"smooth"});
+  loadViewData(name);
+}
+async function loadViewData(name){
+  try{
+    if(name==="schedule") await loadScheduleManagement();
+    else if(name==="rosterAdmin") await loadRosterAdmin();
+    else if(name==="tlRoster") await loadTLRoster();
+    else if(name==="agentHome") await loadAgentHome();
+    else if(name==="agentSchedule") await loadAgentSchedule();
+    else if(name==="tlHome") await loadTLHome();
+    else if(name==="tlSchedule") await loadTLTeamSchedule();
+    else if(name==="myTeam") await loadMyTeam();
+    else if(name==="omHome" || name==="omDailyStaffing" || name==="omMyTLs") await loadOMHome();
+    else if(name==="wfmCommandCenter") await loadWFMCommandCenter();
+    else if(name==="access") await loadAccess();
+    else if(name==="requestsHub") { setupRequestsHub(); }
+    else if(name==="breakDispersion") { initBreakDispersion(); }
+    else if(name==="coverageBrief") { initCoverageBrief(); }
+    else if(name==="agentRequests") { initLeaveRequestForm(); }
+    else if(name==="viewRequests") await loadAgentLeaveRequests();
+    else if(name==="tlRequests" || name==="tlViewRequests") await loadTLLeaveRequests();
+    else if(name==="omRequests") await loadOMLeaveRequests(true);
+    else if(name==="omViewRequests") await loadOMLeaveRequests(false);
+    else if(name==="wfmRequests") await loadWFMLeaveRequests();
+    else if(name==="settings" || name==="databaseSettings") await loadSettingsView();
+  }catch(err){ console.error("View load error",name,err); }
+}
+
+function roleTitle(role, displayName){
+  const r=String(role||"").toLowerCase();
+  const n=String(displayName||"").trim().toLowerCase();
+  // Beta 1: permission role and displayed job title are kept separate.
+  // WFM is the workforce role; "workforce" is not a second role.
+  if(r==="user") return "Agent";
+  if(r==="tl") return "OPS TL";
+  if(r==="ops" || r==="ops_om" || n.includes("bienvenido")) return "Ops OM";
+  if(r==="wfm") return "WFM";
+  if(r==="admin") return "Admin";
+  return r.toUpperCase() || "—";
+}
+function effectiveBranch(){
+  const simulated = sessionStorage.getItem("worksync.simulatedBranch");
+  if(simulated) return simulated;
+  const r=String(currentProfile?.role||"").toLowerCase();
+  const n=String(currentProfile?.display_name||"").trim().toLowerCase();
+  if(r==="user") return "agent";
+  if(r==="tl") return "tl";
+  if(r==="ops" || r==="ops_om" || n.includes("bienvenido")) return "om";
+  if(r==="wfm") return "wfm";
+  return "admin";
+}
+function applyRoleUI(){
+  const branch=effectiveBranch();
+  document.body.classList.toggle("agent-mode",branch==="agent");
+  document.body.classList.toggle("admin-mode",branch==="admin");
+  document.body.classList.toggle("tl-mode",branch==="tl");
+  document.body.classList.toggle("om-mode",branch==="om");
+  document.body.classList.toggle("wfm-mode",branch==="wfm");
+  $("headerTitle").textContent=roleTitle(currentProfile?.role,currentProfile?.display_name);
+  if(branch==="wfm"){
+    $("homeHeading").textContent="WFM Home";
+    $("homeSubheading").textContent="Concepcion Carrier workforce management and schedule control center.";
+    $("homePill").textContent="CCAC · WFM";
+    showView("wfmCommandCenter");
+  }else if(branch==="admin"){
+    $("homeHeading").textContent="Admin Console & System Control";
+    $("homeSubheading").textContent="Concepcion Carrier administrative operations, database environment, and system control center.";
+    $("homePill").textContent="CCAC · ADMIN";
+    showView("home");
+  }
+  else if(branch==="agent"){loadAgentHome();showView("agentHome");}
+  else if(branch==="tl"){loadTLHome();showView("tlHome");}
+  else if(branch==="om"){loadOMHome();showView("omHome");}
+  else{showView("home");}
+}
+$("homeNav").onclick=()=>showView(effectiveBranch()==="agent"?"agentHome":effectiveBranch()==="tl"?"tlHome":effectiveBranch()==="om"?"omHome":effectiveBranch()==="wfm"?"wfmCommandCenter":"home");
+$("scheduleNav").onclick=()=>{showView("schedule");};
+$("openUpload").onclick=()=>showView("schedule");
+$("openScheduleIngester")?.addEventListener("click",()=>showView("scheduleEngine"));
+$("openScheduleManager")?.addEventListener("click",()=>{showView("scheduleManage");initScheduleManager();});
+$("rosterNav").onclick=()=>{
+  const branch=effectiveBranch();
+  if(branch==="tl"){loadTLRoster();showView("tlRoster");}
+  else if(["wfm","admin","om"].includes(branch)){loadRosterAdmin();showView("rosterAdmin");}
+};
+$("openRoster").onclick=()=>{
+  const branch=effectiveBranch();
+  if(branch==="tl"){loadTLRoster();showView("tlRoster");}
+  else if(["wfm","admin","om"].includes(branch)){loadRosterAdmin();showView("rosterAdmin");}
+};
+/* ---------- Alpha 9 Access Foundation ---------- */
+let accessState={rows:[],profiles:[],filtered:[],selected:null,scopeBranch:"ALL",scopeTL:"ALL",scopeTeam:"ALL",scopeAgent:"ALL",search:""};
+function accessNorm(v){return cleanText(v).toLowerCase();}
+function accessRoleFromProfile(p){
+  const r=String(p?.role||"").toLowerCase();
+  if(r==="user")return "Agent";
+  if(r==="tl")return "OPS TL";
+  if(r==="ops"||r==="ops_om")return "Ops OM";
+  if(r==="wfm")return "WFM";
+  if(r==="admin")return "Admin";
+  return r.toUpperCase()||"—";
+}
+function accessScopeRows(){
+  const b=accessState.scopeBranch,t=accessState.scopeTL,g=accessState.scopeTeam,a=accessState.scopeAgent,q=accessNorm(accessState.search);
+  return accessState.rows.filter(r=>{
+    const branchOk=b==="ALL"||r.branch===b;
+    const tlOk=t==="ALL"||r.team_leader===t;
+    const teamOk=g==="ALL"||r.team===g;
+    const agentOk=a==="ALL"||r.employee_id===a;
+    const searchOk=!q||accessNorm(r.name).includes(q)||accessNorm(r.employee_id).includes(q);
+    return branchOk&&tlOk&&teamOk&&agentOk&&searchOk;
+  });
+}
+function accessSetOptions(select,items,allLabel){
+  select.innerHTML=`<option value="ALL">${escapeHtml(allLabel)}</option>`+items.map(x=>`<option value="${escapeHtml(x.value)}">${escapeHtml(x.label)}</option>`).join("");
+}
+function accessRebuildFilters(){
+  const branch=accessState.scopeBranch;
+  const base=accessState.rows.filter(r=>branch==="ALL"||r.branch===branch);
+  const tls=[...new Set(base.map(r=>r.team_leader).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  accessSetOptions($("accessTL"),tls.map(x=>({value:x,label:x+(base.find(r=>r.team_leader===x)?.branch?` · ${branchLabel(base.find(r=>r.team_leader===x).branch)}`:"")})),"All Team Leaders");
+  if(!tls.includes(accessState.scopeTL)) accessState.scopeTL="ALL";
+  $("accessTL").value=accessState.scopeTL;
+  const tbase=base.filter(r=>accessState.scopeTL==="ALL"||r.team_leader===accessState.scopeTL);
+  const teams=[...new Set(tbase.map(r=>r.team).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  accessSetOptions($("accessTeam"),teams.map(x=>({value:x,label:x})),"All Teams");
+  if(!teams.includes(accessState.scopeTeam))accessState.scopeTeam="ALL";
+  $("accessTeam").value=accessState.scopeTeam;
+  const abase=tbase.filter(r=>accessState.scopeTeam==="ALL"||r.team===accessState.scopeTeam);
+  const agents=abase.slice().sort((a,b)=>String(a.name||"").localeCompare(String(b.name||"")).localeCompare ? String(a.name||"").localeCompare(String(b.name||"")) : 0);
+  accessSetOptions($("accessAgent"),agents.map(x=>({value:x.employee_id,label:`${x.name} · ${x.employee_id}`})),"All Agents");
+  if(!agents.some(x=>x.employee_id===accessState.scopeAgent))accessState.scopeAgent="ALL";
+  $("accessAgent").value=accessState.scopeAgent;
+}
+function accessRender(){
+  accessState.filtered=accessScopeRows();
+  const linked=new Set(accessState.profiles.map(p=>String(p.employee_id||"").trim().toUpperCase()));
+  const branchCount=new Set(accessState.filtered.map(r=>r.branch)).size;
+  const tlCount=new Set(accessState.filtered.map(r=>r.team_leader).filter(Boolean)).size;
+  $("accessCountTotal").textContent=accessState.filtered.length;
+  $("accessCountTL").textContent=tlCount;
+  $("accessCountLinked").textContent=accessState.filtered.filter(r=>linked.has(String(r.employee_id||"").trim().toUpperCase())).length;
+  $("accessCountBranches").textContent=branchCount;
+  $("accessScopePill").textContent=accessState.scopeBranch==="ALL"?"ALL BRANCHES":branchLabel(accessState.scopeBranch);
+  $("accessTableSummary").textContent=`${accessState.filtered.length} employee${accessState.filtered.length===1?"":"s"} · ${branchCount} branch${branchCount===1?"":"es"} in scope`;
+  const body=$("accessTableBody");
+  if(!accessState.filtered.length){body.innerHTML='<tr><td colspan="7"><div class="access-empty"><strong>No matching employees</strong>Adjust the Branch, TL, Team, Agent, or Search filters.</div></td></tr>';return;}
+  body.innerHTML=accessState.filtered.map(r=>{
+    const hasProfile=linked.has(String(r.employee_id||"").trim().toUpperCase());
+    return `<tr>
+      <td><div class="access-person">${escapeHtml(r.name)}</div><div class="access-id">${escapeHtml(r.employee_id)}</div></td>
+      <td><span class="access-pill">${escapeHtml(r.roleLabel)}</span></td>
+      <td>${escapeHtml(branchLabel(r.branch))}</td>
+      <td>${escapeHtml(r.team||"—")}</td>
+      <td>${escapeHtml(r.team_leader||"—")}</td>
+      <td><span class="access-pill ${hasProfile?"linked":"unlinked"}">${hasProfile?"Linked":"No account"}</span></td>
+      <td><div class="access-actions"><button type="button" data-access-team="${escapeHtml(r.team_leader||"")}">Open Team</button><button type="button" class="primary" data-access-agent="${escapeHtml(r.employee_id)}">Open Dashboard</button></div></td>
+    </tr>`;
+  }).join("");
+  body.querySelectorAll("[data-access-team]").forEach(b=>b.onclick=()=>accessSelectTeam(b.dataset.accessTeam));
+  body.querySelectorAll("[data-access-agent]").forEach(b=>b.onclick=()=>accessSelectAgent(b.dataset.accessAgent));
+}
+async function accessGetTodaySchedule(row){
+  const today=phtDate();
+  const res=await getPublishedVersionForDate(today,row.branch);
+  const version=res?.data;
+  if(!version)return null;
+  const {data:schedule}=await sb.from("schedules").select("schedule_date,schedule_status,shift_start,shift_end").eq("schedule_version_id",version.id).eq("employee_id",row.employee_id).eq("schedule_date",today).maybeSingle();
+  return schedule?{...schedule,version}:null;
+}
+async function accessSelectTeam(tl){
+  const rows=accessState.rows.filter(r=>(!tl||r.team_leader===tl));
+  const branchSet=[...new Set(rows.map(r=>r.branch))];
+  accessState.selected={type:"team",tl,rows};
+  const panel=$("accessMonitorPanel");
+  panel.innerHTML=`<div class="access-monitor-banner"><div class="eyebrow">TEAM MONITORING</div><strong>${escapeHtml(tl||"All Team Leaders")}</strong><span>${rows.length} active roster members · ${branchSet.map(branchLabel).join(" + ")||"No branch mapped"}</span><div class="access-monitor-actions"><button id="accessViewTL" class="access-door">Open TL Dashboard</button><button id="accessClearMonitor">Clear</button></div></div><div class="access-note">Open the Team Leader dashboard in WFM read-only monitoring mode. The target account is not signed into or modified.</div>`;
+  $("accessClearMonitor").onclick=()=>accessClearMonitor();
+  $("accessViewTL").onclick=()=>accessOpenEmulation({type:"tl",teamLeader:tl,branch:branchSet.length===1?branchSet[0]:"ALL",rows});
+}
+async function accessSelectAgent(employeeId){
+  const row=accessState.rows.find(r=>r.employee_id===employeeId); if(!row)return;
+  accessState.selected={type:"agent",row};
+  const panel=$("accessMonitorPanel");
+  panel.innerHTML=`<div class="access-monitor-banner"><div class="eyebrow">AGENT MONITORING</div><strong>${escapeHtml(row.name)} <span class="access-target-role">Agent</span></strong><span>${escapeHtml(row.employee_id)} · ${escapeHtml(branchLabel(row.branch))} · TL ${escapeHtml(row.team_leader||"—")}</span><div class="access-monitor-actions"><button id="accessViewAgent" class="access-door">Open Agent Dashboard</button><button id="accessViewTeamFromAgent">Open Team</button></div><div class="access-note" id="accessAgentScheduleNote">Checking today's published schedule…</div></div>`;
+  $("accessViewAgent").onclick=()=>accessOpenEmulation({type:"agent",row});
+  $("accessViewTeamFromAgent").onclick=()=>accessSelectTeam(row.team_leader);
+  try{
+    const sch=await accessGetTodaySchedule(row);
+    const note=$("accessAgentScheduleNote");
+    if(sch){
+      note.innerHTML=`Today: <strong>${escapeHtml(sch.schedule_status||"—")}</strong>${sch.shift_start?` · ${escapeHtml(fmtTime(sch.shift_start))} – ${escapeHtml(fmtTime(sch.shift_end))}`:""} · Published v${escapeHtml(sch.version.version_number??"—")}`;
+    }else note.textContent="No published schedule is currently effective for this agent today.";
+  }catch(err){
+    $("accessAgentScheduleNote").textContent="Schedule status could not be resolved.";
+  }
+}
+function accessClearMonitor(){
+  accessState.selected=null;
+  $("accessMonitorPanel").innerHTML='<div class="access-empty"><strong>Select a TL or agent</strong>Use the directory\'s Open Team / Open Dashboard controls to enter a monitoring target.</div>';
+}
+function accessFormatDateLabel(date){return new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"short",day:"numeric"}).format(new Date(`${String(date).slice(0,10)}T00:00:00+08:00`));}
+async function accessFetchVersionAndRows(branch,employeeId,weekOnly=false){
+  const target=phtDate();
+  let version=null;
+  if(branch && branch!=="ALL"){
+    const res=await getPublishedVersionForDate(target,branch); version=res?.data||null;
+  }else{
+    const res=await getPublishedVersionForDate(target); version=res?.data||null;
+  }
+  if(!version)return {version:null,rows:[]};
+  let q=sb.from("schedules").select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id").eq("schedule_version_id",version.id).order("schedule_date");
+  if(employeeId)q=q.eq("employee_id",employeeId);
+  const {data:rows,error}=await q;
+  if(error)throw error;
+  return {version,rows:rows||[]};
+}
+function accessRenderAgentDashboard(data,target){
+  const row=target.row;
+  const today=phtDate();
+  const todayRow=(data.rows||[]).find(r=>String(r.schedule_date).slice(0,10)===today);
+  const status=String(todayRow?.schedule_status||"NO SCHEDULE").toUpperCase();
+  const shift=todayRow?.shift_start?`${fmtTime(todayRow.shift_start)} – ${fmtTime(todayRow.shift_end)}`:"—";
+  const details=[
+    ["Employee ID",row.employee_id],
+    ["Team Leader",row.team_leader||"—"],
+    ["Group",row.group_name||"—"],
+    ["Subgroup",row.subgroup||"—"],
+    ["LOB",branchLabel(row.branch||"CCAC")],
+    ["Site",row.site||"—"]
+  ];
+  const activities=data.todayActs||[];
+  const activeNow=(()=>{
+    const now=phtNowSeconds();
+    return activities.find(a=>now>=activitySeconds(a.start_time)&&now<activitySeconds(a.end_time))||null;
+  })();
+  const activityDetail=activeNow
+    ? `${fmtTime(activeNow.start_time)} – ${fmtTime(activeNow.end_time)}`
+    : activities.find(a=>activitySeconds(a.start_time)>phtNowSeconds())
+      ? `Next: ${activities.find(a=>activitySeconds(a.start_time)>phtNowSeconds()).activity_type} · ${fmtTime(activities.find(a=>activitySeconds(a.start_time)>phtNowSeconds()).start_time)}`
+      : (todayRow ? "No active scheduled activity right now." : "No schedule published for today.");
+  const weekRows=(data.rows||[]).slice().sort((a,b)=>String(a.schedule_date).localeCompare(String(b.schedule_date))).map(r=>{
+    const rs=String(r.schedule_status||"NO SCHEDULE").toUpperCase();
+    const cls=rs==="WORKING"?"work":rs==="OFF"?"off":"other";
+    return `<tr><td>${escapeHtml(accessFormatDateLabel(r.schedule_date))}</td><td><span class="badge ${cls}">${escapeHtml(rs)}</span></td><td>${escapeHtml(r.shift_start?`${fmtTime(r.shift_start)} – ${fmtTime(r.shift_end)}`:"—")}</td></tr>`;
+  }).join("") || `<tr><td colspan="3">No schedule rows published for this account.</td></tr>`;
+  const activityHtml=activities.length
+    ? activities.map(a=>`<div class="schedule-activity"><span class="schedule-activity-name">${escapeHtml(a.activity_type)}</span><span class="schedule-activity-time">${escapeHtml(fmtTime(a.start_time))} – ${escapeHtml(fmtTime(a.end_time))}</span></div>`).join("")
+    : `<div class="agent-empty"><strong>No activities or special events today.</strong>This is the same landing-page state shown when the target has no scheduled activities.</div>`;
+
+  $("accessEmuTitle").textContent=`${row.name} · Agent Landing`;
+  $("accessEmuSubtitle").textContent=`${row.employee_id} · ${branchLabel(row.branch)} · TL ${row.team_leader||"—"}`;
+  $("accessEmuBody").innerHTML=`
+    <div class="agent-grid">
+      <section class="agent-hero">
+        <div class="agent-hero-head">
+          <div>
+            <div class="eyebrow">Today's Schedule · PHT · WFM READ-ONLY</div>
+            <h2>Good day, ${escapeHtml(row.name)}</h2>
+          </div>
+          <div class="datepill">${escapeHtml(accessFormatDateLabel(today))} · PHT</div>
+        </div>
+        <div style="color:#b3cbe0;font-size:13px">WFM is viewing this agent's real landing page data in read-only monitoring mode. The authenticated WFM account remains unchanged.</div>
+        <div class="shiftline">
+          <div><div class="shiftlabel">Scheduled Shift</div><div class="shiftbig">${escapeHtml(shift)}</div></div>
+          <div class="state">${escapeHtml(status)}</div>
+        </div>
+        <div class="activitybar"><strong>${escapeHtml(activeNow?.activity_type||"Scheduled Status")}</strong><span>${escapeHtml(activityDetail)}</span></div>
+      </section>
+      <section class="agent-card"><h3>Your Details</h3><div class="detailsgrid">
+        ${details.map(d=>`<div class="detail"><span>${escapeHtml(d[0])}</span><strong>${escapeHtml(d[1])}</strong></div>`).join("")}
+      </div></section>
+    </div>
+    <div class="agent-grid" style="margin-top:18px">
+      <section class="agent-card"><h3>Today's Activities &amp; Special Events <span style="float:right;color:#8291a3;font-size:10px;font-weight:600">Today · Schedule-driven</span></h3>
+        <div class="schedule-activity-list">${activityHtml}</div>
+      </section>
+      <section class="agent-card"><h3>Weekly Schedule</h3>
+        <div class="weekwrap"><table class="weektable"><thead><tr><th>Date</th><th>Status</th><th>Shift</th></tr></thead><tbody>${weekRows}</tbody></table></div>
+      </section>
+    </div>
+    <div class="placeholder-grid">
+      <div class="mini-feature"><strong>📝 Requests</strong><span>Submit leave, day-off, or shift-related requests. WFM monitoring is read-only.</span></div>
+      <div class="mini-feature"><strong>☷ View Requests</strong><span>Track submitted requests and their status. WFM monitoring is read-only.</span></div>
+    </div>`;
+}
+function accessRenderTLDashboard(data,target){
+  const rows=data.rows||[];
+  const counts={WORKING:0,OFF:0,VL:0,ML:0,SL:0,OTHER:0};
+  rows.forEach(r=>{const s=String(r.status||"NO SCHEDULE").toUpperCase();if(counts[s]!==undefined)counts[s]++;else counts.OTHER++;});
+  const branchSet=[...new Set(rows.map(r=>branchKeyFromLabel(r.lob)||"CCAC"))];
+  const teamRows=rows.map(r=>`<tr><td><strong>${escapeHtml(r.name||"—")}</strong></td><td>${escapeHtml(r.employee_id||"—")}</td><td><span class="emu-status ${String(r.status).toUpperCase()==="WORKING"?"working":String(r.status).toUpperCase()==="OFF"?"off":"other"}">${escapeHtml(r.status||"NO SCHEDULE")}</span></td><td>${escapeHtml(r.schedule?.shift_start?`${fmtTime(r.schedule.shift_start)} – ${fmtTime(r.schedule.shift_end)}`:"—")}</td><td>${escapeHtml(r.group_name||"—")}</td></tr>`).join("") || '<tr><td colspan="5">No active roster members found for this Team Leader.</td></tr>';
+  $("accessEmuTitle").textContent=`${target.teamLeader} · TL Dashboard`;
+  $("accessEmuSubtitle").textContent=`OPS TL · ${branchSet.map(branchLabel).join(" + ")||"—"} · WFM read-only monitoring`;
+  $("accessEmuBody").innerHTML=`
+    <div class="emu-hero"><div class="kicker">VIEW AS TEAM LEADER · LIVE WORKSYNC DATA</div><h2>Good day, ${escapeHtml(target.teamLeader)}</h2><p>WFM is viewing this Team Leader workspace in read-only monitoring mode. Team membership and schedule status are read from the current WorkSync roster and published schedules.</p></div>
+    <div class="emu-stats">
+      <div class="emu-stat"><div class="num">${rows.length}</div><div class="label">Team Members</div></div>
+      <div class="emu-stat"><div class="num">${counts.WORKING}</div><div class="label">Scheduled to Work</div></div>
+      <div class="emu-stat"><div class="num">${counts.OFF}</div><div class="label">OFF</div></div>
+      <div class="emu-stat"><div class="num">${counts.VL+counts.ML+counts.SL}</div><div class="label">Leave / Exceptions</div></div>
+      <div class="emu-stat"><div class="num">${branchSet.length}</div><div class="label">Branches</div></div>
+    </div>
+    <section class="emu-card" style="margin-top:13px"><h3>My Team Today</h3><div class="sub" style="margin-bottom:10px">The same schedule-driven team context intended for the TL workspace.</div><div class="emu-table-wrap"><table class="emu-table"><thead><tr><th>Agent</th><th>Employee ID</th><th>Status</th><th>Shift</th><th>Group</th></tr></thead><tbody>${teamRows}</tbody></table></div></section>`;
+}
+async function accessOpenEmulation(target){
+  accessState.selected={type:target.type,target};
+  showView("accessEmulation");
+  $("accessEmuBody").innerHTML='<div class="emu-empty"><strong>Opening dashboard…</strong><div style="margin-top:4px">Reading the target\'s current WorkSync workspace data.</div></div>';
+  try{
+    if(target.type==="agent"){
+      const branch=target.row.branch; const bundle=await accessFetchVersionAndRows(branch,target.row.employee_id,true);
+      let todayActs=[];
+      const todayRow=bundle.rows.find(r=>String(r.schedule_date).slice(0,10)===phtDate());
+      if(todayRow){const {data:acts,error}=await sb.from("schedule_activities").select("activity_type,start_time,end_time").eq("schedule_id",todayRow.id).order("start_time");if(error)throw error;todayActs=acts||[];}
+      accessRenderAgentDashboard({...bundle,todayActs},target);
+    }else if(target.type==="tl"){
+      const branch=target.branch;
+      const rosterRows=(target.rows||[]).filter(r=>!branch||branch==="ALL"||r.branch===branch);
+      const grouped=[];
+      for(const member of rosterRows){
+        const b=member.branch; const bundle=await accessFetchVersionAndRows(b,member.employee_id,true); const schedule=bundle.rows.find(r=>String(r.schedule_date).slice(0,10)===phtDate())||null;
+        grouped.push({...member,status:schedule?.schedule_status||"NO SCHEDULE",schedule,version:bundle.version});
+      }
+      accessRenderTLDashboard({rows:grouped},target);
+    }
+  }catch(err){
+    console.error("WFM monitoring dashboard load failed",err);
+    $("accessEmuBody").innerHTML=`<div class="emu-empty"><strong>Dashboard could not be loaded.</strong><div style="margin-top:5px">${escapeHtml(err.message||String(err))}</div></div>`;
+  }
+}
+async function loadAccess(force=false){
+  if(effectiveBranch()!=="wfm")return;
+  try{
+    const {data:roster,error}=await sb.from("roster").select("employee_id,name,team_leader,lob,active,group_name,subgroup,site").eq("active",true).order("name");
+    if(error)throw error;
+    const {data:profiles}=await sb.from("profiles").select("employee_id,display_name,role");
+    accessState.profiles=profiles||[];
+    const profileById=new Map(accessState.profiles.map(p=>[String(p.employee_id||"").trim().toUpperCase(),p]));
+    accessState.rows=(roster||[]).map(r=>{
+      const branch=branchKeyFromLabel(r.lob)||"CCAC";
+      const profile=profileById.get(String(r.employee_id||"").trim().toUpperCase());
+      const roleLabel=accessRoleFromProfile(profile||null) || "Agent";
+      return {...r,branch,team:r.group_name||r.subgroup||"—",roleLabel};
+    });
+    accessRebuildFilters();
+    accessRender();
+  }catch(err){
+    console.error("Access load failed",err);
+    $("accessTableBody").innerHTML=`<tr><td colspan="7"><div class="access-empty"><strong>Access could not be loaded</strong>${escapeHtml(err.message||String(err))}</div></td></tr>`;
+  }
+}
+$("accessBranch")?.addEventListener("change",e=>{accessState.scopeBranch=e.target.value;accessState.scopeTL="ALL";accessState.scopeTeam="ALL";accessState.scopeAgent="ALL";accessRebuildFilters();accessRender();});
+$("accessTL")?.addEventListener("change",e=>{accessState.scopeTL=e.target.value;accessState.scopeTeam="ALL";accessState.scopeAgent="ALL";accessRebuildFilters();accessRender();});
+$("accessTeam")?.addEventListener("change",e=>{accessState.scopeTeam=e.target.value;accessState.scopeAgent="ALL";accessRebuildFilters();accessRender();});
+$("accessAgent")?.addEventListener("change",e=>{accessState.scopeAgent=e.target.value;accessRender();});
+$("accessSearch")?.addEventListener("input",e=>{accessState.search=e.target.value;accessRender();});
+$("accessRefresh")?.addEventListener("click",async()=>{const b=$("accessRefresh");b.disabled=true;b.textContent="↻ Refreshing…";try{await loadAccess(true);}finally{b.disabled=false;b.textContent="↻ Refresh";}});
+$("requestsNav").onclick=()=>showView("requestsHub");
+$("accessNav").onclick=()=>{if(effectiveBranch()!=="wfm"){toast("Access is a WFM monitoring workspace.");return;}showView("access");};
+$("databaseSettingsNav")?.addEventListener("click",()=>{if(!["wfm","admin"].includes(effectiveBranch())){toast("Database Environment is restricted to WFM Admin.");return;}showView("databaseSettings");WorkSyncEnvironment.verify();});
+$("openAccessHome")?.addEventListener("click",()=>{if(effectiveBranch()!=="wfm"){toast("Access is a WFM monitoring workspace.");return;}showView("access");});
+$("accessEmuBack")?.addEventListener("click",()=>showView("access"));
+$("myScheduleNav").onclick=()=>showView("agentSchedule");$("agentRequestsNav").onclick=()=>showView("requestsHub");
+$("tlMyScheduleNav").onclick=()=>showView("agentSchedule");
+$("tlScheduleNav").onclick=()=>showView("tlSchedule");
+$("myTeamNav").onclick=()=>{loadMyTeam();showView("myTeam");};
+$("tlRequestsNav").onclick=()=>showView("requestsHub");
+$("omDailyStaffingNav").onclick=()=>showView("omDailyStaffing");
+$("omMyTLsNav").onclick=()=>showView("omMyTLs");
+$("omRequestsNav").onclick=()=>showView("requestsHub");
+$("omHomeViewStaffing").onclick=()=>showView("omDailyStaffing");
+$("omHomeViewTLs").onclick=()=>showView("omMyTLs");
+$("omStaffingDate").onchange=()=>{if($("omStaffingDate"))loadOMHome($("omStaffingDate").value);};
+["omStaffingSearch","omStaffingStatusFilter","omStaffingGroupFilter"].forEach(id=>$(id)?.addEventListener(id==="omStaffingSearch"?"input":"change",renderOMStaffingAgents));
+
+document.querySelectorAll(".placeholder").forEach(b=>b.onclick=()=>toast("This WorkSync feature is coming soon."));
+function toast(t){let x=document.getElementById("message");if(x)x.innerHTML=`<div class="banner warn">${t}</div>`;else alert(t);}
+async function loadSession(){
+  const nav=performance.getEntriesByType("navigation")[0];
+  const isReload=nav?.type==="reload";
+  const {data:{session}}=await sb.auth.getSession();
+  if(!isReload || !session){
+    if(session) await sb.auth.signOut({scope:"local"});
+    sessionStorage.removeItem("worksync.activeView");
+    $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden");
+    hideWorkSyncSplash(0);
+    return;
+  }
+  showWorkSyncSplash("Restoring your WorkSync session…");
+  await showApp(session.user);
+  const saved=sessionStorage.getItem("worksync.activeView");
+  if(saved){
+    const branch=effectiveBranch();
+    const allowed=branch==="wfm"||branch==="admin"?["home","wfmCommandCenter","wfmRequests","requestsHub","schedule","breakDispersion","briefsHub","coverageBrief","rosterAdmin","access"]:["home","agentHome","agentSchedule","requestsHub","agentRequests","viewRequests","tlHome","tlSchedule","myTeam","tlRoster","tlRequests","tlViewRequests","omHome","omMyTLs","omRequests","omViewRequests"];
+    if(allowed.includes(saved)) showView(saved);
+  }
+}
+async function showApp(user){
+  currentUser=user;
+  const {data:profile,error}=await sb.from("profiles").select("employee_id,display_name,role").eq("id",user.id).single();
+    if(error||!profile){
+    // Sandbox fallback: if the app is routed to Neon Sandbox and profile lookup
+    // fails (different profile set in sandbox), do NOT force a sign-out loop.
+    // Only applies when an authenticated Supabase session exists and env=sandbox.
+    const env = (window.WorkSyncDB && window.WorkSyncDB.getEnvironment()) || 'production';
+    if (env === 'sandbox' && user && user.id) {
+      currentProfile = {
+        id: user.id,
+        employee_id: "SANDBOX-" + String(user.id).slice(0,6),
+        display_name: user.email || "Sandbox User",
+        role: "admin"
+      };
+      currentBranches = allBranchKeys();
+      configureBranchAccessUI();
+      updateArchiveNav();
+      $("statusWelcome").textContent = `Sandbox session as ${currentProfile.display_name}.`;
+      $("statusUsername").textContent = user.email || "—";
+      $("statusRole").textContent = "Admin (Sandbox)";
+      $("statusEmployee").textContent = currentProfile.employee_id;
+      $("loginStatus").classList.remove("hidden");
+      $("who").textContent = `Sandbox: ${currentProfile.display_name}`;
+      $("headerTitle").textContent = "Admin (Sandbox)";
+      $("brandContext").textContent = "CONCEPCION CARRIER · Sandbox · Alpha 10";
+      $("loginView").classList.add("hidden");
+      $("appView").classList.remove("hidden");
+      applyRoleUI();
+      window.scrollTo(0,0);
+      hideWorkSyncSplash(150);
+      return;
+    }
+    $("loginStatus").classList.remove("show");
+    $("loginMsg").textContent="This account is not linked to a WorkSync profile yet.";
+    await sb.auth.signOut({scope:"local"});
+    hideWorkSyncSplash(0);
+    return;
+  }
+  currentProfile=profile;
+  currentBranches=await loadUserBranches(user.id);
+  configureBranchAccessUI();
+  updateArchiveNav();
+  const friendly=roleTitle(profile.role,profile.display_name);
+  $("statusWelcome").textContent=`Welcome, ${profile.display_name||user.email}.`;
+  $("statusUsername").textContent=user.email||"—";
+  $("statusRole").textContent=friendly;
+  $("statusEmployee").textContent=profile.employee_id||"—";
+  $("loginStatus").classList.remove("hidden");
+  $("who").textContent=`Signed in as ${profile.display_name||user.email}`;
+  $("headerTitle").textContent=friendly;
+  const pr=String(profile.role||"").toLowerCase();
+  $("brandContext").textContent=
+    pr==="user" ? "CONCEPCION CARRIER · Agent Home · Alpha 10" :
+    pr==="tl" ? "CONCEPCION CARRIER · TL Home · Alpha 10" :
+    (pr==="ops" || pr==="ops_om" || String(profile.display_name||"").toLowerCase().includes("bienvenido")) ? "CONCEPCION CARRIER · Ops Home · Alpha 10" :
+    pr==="wfm" ? "CONCEPCION CARRIER · WFM Home · Alpha 10" :
+    "CONCEPCION CARRIER · Admin Home · Alpha 10";
+  // Keep the original simple status-card behavior, then route to the appropriate landing page.
+  setTimeout(()=>{
+    $("loginView").classList.add("hidden");
+    $("appView").classList.remove("hidden");
+    applyRoleUI(); refreshLeaveNotifications().catch(()=>{});
+    window.scrollTo(0,0);
+    hideWorkSyncSplash(150);
+  },700);
+}
+$("loginBtn").onclick = async ()=>{
+  $("loginMsg").textContent = "";
+  const email=$("email").value.trim(), password=$("password").value;
+  if(!email || !password){ $("loginMsg").textContent="Enter your email and password."; return; }
+  $("loginBtn").disabled=true; $("loginBtn").textContent="Signing in…";
+  showWorkSyncSplash("Signing you in securely…");
+  try{
+    const {data,error}=await sb.auth.signInWithPassword({email,password});
+    if(error){ $("loginMsg").textContent=error.message; hideWorkSyncSplash(0); return; }
+    await showApp(data.user);
+  }catch(err){
+    console.error("WorkSync sign-in failed",err);
+    $("loginMsg").textContent=err?.message||"Sign-in could not be completed. Please try again.";
+    hideWorkSyncSplash(0);
+  }finally{
+    $("loginBtn").disabled=false; $("loginBtn").textContent="Sign In";
+  }
+};
+$("password").addEventListener("keydown",e=>{if(e.key==="Enter")$("loginBtn").click()});
+$("logoutBtn").onclick=async()=>{
+  sessionStorage.removeItem("worksync.activeView");
+  sessionStorage.removeItem("worksync.simulatedBranch");
+  await sb.auth.signOut({scope:"local"});
+  location.reload();
+};
+
+
+
+function normalizeTeamStatus(status){
+  const x=String(status||"").toUpperCase();
+  return x||"OTHER";
+}
+let tlTeamRows=[];
+let tlActiveFilter="ALL";
+let tlTeamBranches=[];
+let tlTeamVersions=[];
+
+function teamFilterMatch(status,filter){
+  const s=normalizeTeamStatus(status);
+  if(filter==="ALL") return true;
+  if(filter==="OTHER") return !["WORKING","OFF","VL","ML","SL"].includes(s);
+  return s===filter;
+}
+function teamShiftText(row){
+  return row?.shift_start ? `${fmtTime(row.shift_start)} – ${fmtTime(row.shift_end)}` : "—";
+}
+function renderTLTeam(targetId,filter){
+  const body=$(targetId);
+  if(!body) return;
+  const rows=tlTeamRows.filter(x=>teamFilterMatch(x.status,filter));
+  if(!rows.length){
+    body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#7a899c;padding:18px">No team members match this status.</td></tr>';
+    return;
+  }
+  body.innerHTML=rows.map(x=>`<tr>
+    <td><strong>${escapeHtml(x.name)}</strong></td>
+    <td>${escapeHtml(x.employee_id)}</td>
+    <td><span class="team-status ${escapeHtml(x.status)}">${escapeHtml(x.status)}</span></td>
+    <td>${escapeHtml(teamShiftText(x.schedule))}</td>
+    <td>${escapeHtml(x.agent_group||"Unclassified")}</td>
+    <td>${escapeHtml(x.agent_group==="CIT"?(x.schedule?.channel_allocation||x.channel_allocation||"Not assigned") : "—")}</td>
+  </tr>`).join("");
+}
+const TL_ATT_STYLE={changed:["#fefce8","#fde047","#854d0e"],in:["#ecfdf3","#86efac","#15803d"],tardy:["#fff7ed","#fdba74","#c2410c"],absent:["#fef2f2","#fca5a5","#b91c1c"],due:["#f1f5f9","#cbd5e1","#475569"],other:["#f8fafc","#e2e8f0","#475569"],none:["#ffffff","#e2e8f0","#94a3b8"]};
+let tlAttByEid=new Map();
+let tlChangedByEid=new Map();
+const TL_ATT_FILTERS=["ABSENT","TARDY","IN"];
+function tlAttKey(eid){ return String(eid||"").trim().toUpperCase(); }
+function tlAttLabel(rec){
+  if(!rec) return {text:"—",kind:"none"};
+  const st=rec.status;
+  if(st==="Present - on time") return {text:"In",kind:"in"};
+  if(st==="Early - outside window") return {text:"Early",kind:"in"};
+  if(st==="Tardy") return {text:"Tardy"+(rec.diff_minutes!=null?" +"+rec.diff_minutes+" min":""),kind:"tardy"};
+  if(st==="Absent - no login") return {text:"Absent",kind:"absent"};
+  if(st==="Not yet due") return {text:"Not yet due",kind:"due"};
+  return {text:st||"—",kind:"other"};
+}
+function tlAttPillHtml(rec){
+  const l=tlAttLabel(rec); const [bg,bd,fg]=TL_ATT_STYLE[l.kind];
+  return `<span class="att-pill" style="display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid ${bd};background:${bg};color:${fg}">${escapeHtml(l.text)}</span>`;
+}
+function tlRowMatch(x,filter){
+  if(TL_ATT_FILTERS.includes(filter)){
+    const key=tlAttKey(x.employee_id);
+    if(tlChangedByEid.has(key)) return false;
+    const k=tlAttLabel(tlAttByEid.get(key)).kind;
+    if(filter==="ABSENT") return k==="absent";
+    if(filter==="TARDY") return k==="tardy";
+    return k==="in";
+  }
+  return teamFilterMatch(x.status,filter);
+}
+function tlChangedPillHtml(nv){
+  const [bg,bd,fg]=TL_ATT_STYLE.changed;
+  const txt="Changed · now "+(nv?.schedule_status||"");
+  return `<span class="att-pill" style="display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid ${bd};background:${bg};color:${fg}">${escapeHtml(txt)}</span>`;
+}
+function renderTLHomeTeam(filter){
+  const body=$("tlTeamBody");
+  if(!body) return;
+  const rows=tlTeamRows.filter(x=>tlRowMatch(x,filter));
+  if(!rows.length){
+    body.innerHTML='<tr><td colspan="6" style="text-align:center;color:#7a899c;padding:18px">No team members match this filter.</td></tr>';
+    return;
+  }
+  body.innerHTML=rows.map(x=>{
+    const key=tlAttKey(x.employee_id);
+    const rec=tlAttByEid.get(key);
+    const ch=tlChangedByEid.get(key);
+    const pill=ch ? tlChangedPillHtml(ch) : tlAttPillHtml(rec);
+    return `<tr>
+      <td><strong>${escapeHtml(x.name)}</strong></td>
+      <td>${escapeHtml(x.employee_id)}</td>
+      <td><span class="team-status ${escapeHtml(x.status)}">${escapeHtml(x.status)}</span></td>
+      <td>${pill}</td>
+      <td>${escapeHtml(rec?.first_login||"—")}</td>
+      <td>${escapeHtml(teamShiftText(x.schedule))}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function loadTLHome(){
+  if(!currentProfile?.display_name)return;
+  $("tlNameHeading").textContent=currentProfile.display_name;
+  $("tlDatePill").textContent=new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"long",day:"numeric",year:"numeric"}).format(new Date())+" · PHT";
+
+  // TL membership is roster-driven. A TL may supervise multiple branches,
+  // and the TL does not need a personal roster row for this to work.
+  const {data:allRoster,error:re}=await sb.from("roster")
+    .select("employee_id,name,group_name,subgroup,team_leader,site,lob,active")
+    .eq("active",true).order("name");
+  if(re){
+    tlTeamRows=[];tlTeamBranches=[];tlTeamVersions=[];
+    $("tlTeamTitle").textContent="Unable to load your team";
+    $("tlTeamSummary").textContent="Unable to load the master roster.";
+    $("tlScheduled").textContent="0";$("tlOff").textContent="0";$("tlVL").textContent="0";$("tlML").textContent="0";$("tlSL").textContent="0";$("tlOther").textContent="0";
+    renderTLHomeTeam(tlActiveFilter);renderTLTeam("myTeamBody","ALL");
+    return;
+  }
+
+  const {data:tlProfiles}=await sb.from("profiles").select("display_name").eq("role","tl");
+  const leaders=(tlProfiles||[]).map(x=>({name:cleanText(x.display_name)})).filter(x=>x.name);
+  const currentTL=resolveMasterTL(currentProfile.display_name,leaders).name||currentProfile.display_name;
+  const members=(allRoster||[]).filter(m=>{
+    const source=cleanText(m.team_leader);
+    if(!source)return false;
+    return (resolveMasterTL(source,leaders).name||source)===currentTL;
+  });
+
+  tlTeamBranches=[...new Set(members.map(m=>branchKeyFromLabel(m.lob)).filter(b=>allBranchKeys().includes(b)))]
+    .sort((a,b)=>allBranchKeys().indexOf(a)-allBranchKeys().indexOf(b));
+  const scopeText=tlTeamBranches.length?tlTeamBranches.map(branchLabel).join(" + "):"No mapped branch";
+  $("tlSubheading").textContent=`CCAC · OPS TL · ${scopeText}`;
+
+  const today=phtDate();
+  const {data:versions,error:ve}=await sb.from("schedule_versions")
+    .select("id,version_number,week_start,week_end,published_at,source_file_name,status,lob")
+    .eq("status","published")
+    .lte("week_start",today).gte("week_end",today)
+    .order("week_start",{ascending:false}).order("published_at",{ascending:false});
+  if(ve){
+    tlTeamVersions=[];
+  }else{
+    const latestByBranch=new Map();
+    for(const v of (versions||[])){
+      const b=branchKeyFromLabel(v.lob);
+      if(!tlTeamBranches.includes(b) || latestByBranch.has(b)) continue;
+      latestByBranch.set(b,v);
+    }
+    tlTeamVersions=[...latestByBranch.values()];
+  }
+
+  const ids=members.map(x=>x.employee_id).filter(Boolean);
+  let schedules=[];
+  const versionIds=tlTeamVersions.map(v=>v.id).filter(Boolean);
+  if(versionIds.length && ids.length){
+    const {data:s,error:se}=await sb.from("schedules")
+      .select("employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id")
+      .in("schedule_version_id",versionIds)
+      .eq("schedule_date",today)
+      .in("employee_id",ids);
+    if(!se)schedules=s||[];
+  }
+  const map=new Map(schedules.map(x=>[x.employee_id,x]));
+  tlTeamRows=members.map(m=>({
+    name:m.name,employee_id:m.employee_id,group_name:m.group_name,subgroup:m.subgroup,lob:m.lob,
+    status:normalizeTeamStatus(map.get(m.employee_id)?.schedule_status||"NO SCHEDULE"),
+    schedule:map.get(m.employee_id)||null
+  }));
+
+  $("tlTeamTitle").textContent=members.length?`${currentProfile.display_name}'s Team`:"No team members assigned";
+  const weekText=tlTeamVersions.map(v=>`${branchLabel(v.lob)} ${v.week_start||"—"} to ${v.week_end||"—"}`).join(" · ");
+  $("tlTeamSummary").textContent=tlTeamVersions.length
+    ? `${members.length} active team members · ${weekText}`
+    : `${members.length} active team members · No published schedule for ${scopeText}.`;
+  const count=s=>tlTeamRows.filter(x=>normalizeTeamStatus(x.status)===s).length;
+  $("tlScheduled").textContent=count("WORKING");$("tlOff").textContent=count("OFF");$("tlVL").textContent=count("VL");$("tlML").textContent=count("ML");$("tlSL").textContent=count("SL");
+  $("tlOther").textContent=tlTeamRows.filter(x=>!["WORKING","OFF","VL","ML","SL"].includes(normalizeTeamStatus(x.status))).length;
+  renderTLHomeTeam(tlActiveFilter);renderTLTeam("myTeamBody","ALL");
+}
+async function loadMyTeam(){
+  if(!tlTeamRows.length) await loadTLHome();
+  renderTLTeam("myTeamBody", "ALL");
+}
+let tlScheduleRowsByAgent=new Map();
+let tlSelectedScheduleAgentId=null;
+let tlSelectedScheduleBranch=null;
+
+function tlDateRange(weekStart,weekEnd){
+  const out=[];
+  const start=String(weekStart||"").slice(0,10);
+  const end=String(weekEnd||"").slice(0,10);
+  if(!start||!end)return out;
+  let d=new Date(`${start}T00:00:00+08:00`);
+  const last=new Date(`${end}T00:00:00+08:00`);
+  while(d<=last && out.length<14){
+    const y=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",year:"numeric"}).format(d);
+    const m=String(Number(new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",month:"2-digit"}).format(d))).padStart(2,"0");
+    const day=String(Number(new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",day:"2-digit"}).format(d))).padStart(2,"0");
+    out.push(`${y}-${m}-${day}`);
+    d=new Date(d.getTime()+86400000);
+  }
+  return out;
+}
+function tlFormatDayDate(date){
+  return new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"short",day:"numeric"}).format(new Date(`${String(date).slice(0,10)}T00:00:00+08:00`));
+}
+function tlScheduleStatusClass(status){
+  const s=normalizeTeamStatus(status);
+  return s==="WORKING"?"work":s==="OFF"?"off":"other";
+}
+function phtWeekRange(){
+  const now=new Date();
+  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",year:"numeric",month:"2-digit",day:"2-digit",weekday:"short"}).formatToParts(now);
+  const get=k=>parts.find(x=>x.type===k)?.value||"";
+  const y=Number(get("year")),m=Number(get("month")),d=Number(get("day"));
+  const base=new Date(Date.UTC(y,m-1,d));
+  const dow=base.getUTCDay();
+  const monday=new Date(base.getTime()-((dow+6)%7)*86400000);
+  const sunday=new Date(monday.getTime()+6*86400000);
+  const iso=x=>`${x.getUTCFullYear()}-${String(x.getUTCMonth()+1).padStart(2,"0")}-${String(x.getUTCDate()).padStart(2,"0")}`;
+  return {week_start:iso(monday),week_end:iso(sunday)};
+}
+function renderTLSelectedSchedule(){
+  const box=$("tlTeamScheduleDetail"),select=$("tlScheduleAgentSelect"),ctx=$("tlSelectedAgentContext"),statusEl=$("tlSelectedScheduleStatus");
+  if(!box||!select||!ctx||!statusEl)return;
+  const employeeId=select.value||tlSelectedScheduleAgentId;
+  const entry=tlScheduleRowsByAgent.get(employeeId);
+  if(!entry){
+    ctx.innerHTML="";statusEl.className="tl-schedule-status other";statusEl.textContent="SCHEDULE STATUS · —";
+    box.innerHTML='<div class="agent-empty"><strong>Select an agent</strong>The full published weekly schedule will appear here.</div>';
+    return;
+  }
+  tlSelectedScheduleAgentId=employeeId;
+  const today=phtDate();
+  const todayRow=entry.byDate.get(today)||null;
+  const todayStatus=normalizeTeamStatus(todayRow?.schedule_status||"NO SCHEDULE");
+  statusEl.className=`tl-schedule-status ${tlScheduleStatusClass(todayStatus)}`;
+  statusEl.textContent=`TODAY · ${todayStatus}`;
+  ctx.innerHTML=`
+    <div class="detail"><span>Agent</span><strong>${escapeHtml(entry.member.name)}</strong></div>
+    <div class="detail"><span>Employee ID</span><strong>${escapeHtml(entry.member.employee_id)}</strong></div>
+    <div class="detail"><span>Group · Subgroup</span><strong>${escapeHtml(entry.member.group_name||"—")} · ${escapeHtml(entry.member.subgroup||"—")}</strong></div>
+    <div class="detail"><span>Team Leader</span><strong>${escapeHtml(currentProfile?.display_name||"—")}</strong></div>
+    <div class="detail"><span>Branch</span><strong>${escapeHtml(branchLabel(entry.branch||tlSelectedScheduleBranch))}</strong></div>`;
+
+  const cards=entry.days.map(date=>{
+    const r=entry.byDate.get(date)||null;
+    const status=normalizeTeamStatus(r?.schedule_status||"NO SCHEDULE");
+    const acts=r?(entry.activitiesBySchedule.get(r.id)||[]):[];
+    const activityHtml=acts.length
+      ?acts.map(a=>`<div class="schedule-activity"><span class="schedule-activity-name">${escapeHtml(a.activity_type)}</span><span class="schedule-activity-time">${fmtTime(a.start_time)} – ${fmtTime(a.end_time)}</span></div>`).join("")
+      :'<div class="schedule-no-activity">No scheduled activities</div>';
+    const shift=status==="WORKING"?`${fmtTime(r.shift_start)} – ${fmtTime(r.shift_end)}`:"—";
+    return `<article class="schedule-day-card${date===today?' today':''}">
+      <div class="schedule-day-head">
+        <div><div class="schedule-day-name">${escapeHtml(tlFormatDayDate(date))}${date===today?' · Today':''}</div><div class="schedule-day-date">${escapeHtml(date)}</div></div>
+        <div><div class="schedule-day-shift">${escapeHtml(shift)}</div><div class="schedule-day-status"><span class="badge ${status==='WORKING'?'work':status==='OFF'?'off':'other'}">${escapeHtml(status)}</span></div></div>
+      </div>
+      <div class="schedule-activity-list">${activityHtml}</div>
+    </article>`;
+  }).join("");
+  const noteVersion=entry.version
+    ?`Published Workforce week · Version ${escapeHtml(entry.version.version_number??"—")}${entry.version.source_file_name?` · ${escapeHtml(entry.version.source_file_name)}`:""}`
+    :`Branch ${escapeHtml(branchLabel(entry.branch||tlSelectedScheduleBranch))} · No published schedule for this week.`;
+  box.innerHTML=`<div class="schedule-section-note">${noteVersion}</div><div class="schedule-week-grid">${cards}</div>`;
+}
+
+async function loadTLTeamSchedule(){
+  const select=$("tlScheduleAgentSelect"),branchSelect=$("tlScheduleBranchSelect"),branchField=$("tlScheduleBranchField"),box=$("tlTeamScheduleDetail"),ctx=$("tlSelectedAgentContext");
+  if(!select||!box)return;
+  if(!tlTeamRows.length) await loadTLHome();
+  box.innerHTML='<div class="agent-empty"><strong>Loading team schedule…</strong>Reading your team roster and published schedules.</div>';
+  tlScheduleRowsByAgent=new Map();
+
+  const branches=tlTeamBranches.length?tlTeamBranches:[...new Set(tlTeamRows.map(x=>branchKeyFromLabel(x.lob)).filter(b=>allBranchKeys().includes(b)))]
+    .sort((a,b)=>allBranchKeys().indexOf(a)-allBranchKeys().indexOf(b));
+  if(!branches.length){
+    if(branchSelect)branchSelect.innerHTML='<option>No branch mapped</option>';
+    select.innerHTML='<option>No agents mapped to your team</option>';
+    if(ctx)ctx.innerHTML="";
+    box.innerHTML='<div class="agent-empty"><strong>No team members assigned.</strong>The master roster has no active agents mapped to your Team Leader account.</div>';
+    return;
+  }
+  if(!branches.includes(tlSelectedScheduleBranch)) tlSelectedScheduleBranch=branches[0];
+  if(branchSelect){
+    branchSelect.innerHTML=branches.map(b=>`<option value="${escapeHtml(b)}">${escapeHtml(branchLabel(b))}</option>`).join("");
+    branchSelect.value=tlSelectedScheduleBranch;
+    branchSelect.disabled=branches.length<=1;
+    branchField.style.opacity=branches.length<=1?".72":"1";
+    branchSelect.onchange=async()=>{
+      tlSelectedScheduleBranch=branchSelect.value;
+      tlSelectedScheduleAgentId=null;
+      await loadTLTeamSchedule();
+    };
+  }
+
+  const selectedBranch=tlSelectedScheduleBranch;
+  const members=tlTeamRows
+    .filter(x=>branchKeyFromLabel(x.lob)===selectedBranch)
+    .map(x=>({name:x.name,employee_id:x.employee_id,group_name:x.group_name,subgroup:x.subgroup,branch:selectedBranch}));
+
+  const version=tlTeamVersions
+    .filter(v=>branchKeyFromLabel(v.lob)===selectedBranch)
+    .sort((a,b)=>String(b.published_at||"").localeCompare(String(a.published_at||"")))[0]||null;
+
+  const ids=members.map(x=>x.employee_id).filter(Boolean);
+  const versionIds=version?.id?[version.id]:[];
+  const {data:schedules,error:scheduleError}=ids.length && versionIds.length
+    ?await sb.from("schedules").select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id").in("schedule_version_id",versionIds).in("employee_id",ids).order("schedule_date")
+    :{data:[],error:null};
+  if(scheduleError){
+    select.innerHTML='<option>Unable to load schedule</option>';
+    if(ctx)ctx.innerHTML="";
+    box.innerHTML=`<div class="agent-empty"><strong>Schedule could not be loaded.</strong>${escapeHtml(scheduleError.message||String(scheduleError))}</div>`;
+    return;
+  }
+
+  const scheduleRows=schedules||[];
+  const scheduleIds=scheduleRows.map(r=>r.id).filter(Boolean);
+  let activities=[];
+  if(scheduleIds.length){
+    const {data:acts,error:activityError}=await sb.from("schedule_activities").select("schedule_id,activity_type,start_time,end_time").in("schedule_id",scheduleIds).order("start_time");
+    if(activityError){
+      select.innerHTML='<option>Unable to load activities</option>';
+      if(ctx)ctx.innerHTML="";
+      box.innerHTML=`<div class="agent-empty"><strong>Activities could not be loaded.</strong>${escapeHtml(activityError.message||String(activityError))}</div>`;
+      return;
+    }
+    activities=acts||[];
+  }
+  const activitiesBySchedule=new Map();
+  activities.forEach(a=>{if(!activitiesBySchedule.has(a.schedule_id))activitiesBySchedule.set(a.schedule_id,[]);activitiesBySchedule.get(a.schedule_id).push(a);});
+
+  const fallbackWeek=phtWeekRange();
+  const weekStart=version?.week_start||fallbackWeek.week_start;
+  const weekEnd=version?.week_end||fallbackWeek.week_end;
+  const days=tlDateRange(weekStart,weekEnd);
+  const rosterOrder=members.slice().sort((a,b)=>String(a.name||"").localeCompare(String(b.name||"")));
+  rosterOrder.forEach(member=>{
+    const memberRows=scheduleRows.filter(r=>r.employee_id===member.employee_id);
+    const byDate=new Map(memberRows.map(r=>[String(r.schedule_date).slice(0,10),r]));
+    tlScheduleRowsByAgent.set(member.employee_id,{member,branch:selectedBranch,version,days,byDate,activitiesBySchedule});
+  });
+
+  select.innerHTML=rosterOrder.length
+    ?rosterOrder.map(m=>`<option value="${escapeHtml(m.employee_id)}">${escapeHtml(m.name)} · ${escapeHtml(m.employee_id)}</option>`).join("")
+    :'<option>No agents mapped to this branch</option>';
+  $("tlScheduleWeekPill").textContent=version
+    ?`${branchLabel(selectedBranch)} · ${version.week_start||"—"} → ${version.week_end||"—"}`
+    :`${branchLabel(selectedBranch)} · ${weekStart} → ${weekEnd}`;
+  tlSelectedScheduleAgentId=rosterOrder.some(m=>m.employee_id===tlSelectedScheduleAgentId)?tlSelectedScheduleAgentId:(rosterOrder[0]?.employee_id||null);
+  if(tlSelectedScheduleAgentId)select.value=tlSelectedScheduleAgentId;
+  select.onchange=renderTLSelectedSchedule;
+  renderTLSelectedSchedule();
+}
+
+document.querySelectorAll("[data-teamfilter]").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("[data-teamfilter]").forEach(x=>x.classList.remove("active"));b.classList.add("active");
+  tlActiveFilter=b.dataset.teamfilter;renderTLHomeTeam(tlActiveFilter);
+});
+document.querySelectorAll("[data-teamfilter2]").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("[data-teamfilter2]").forEach(x=>x.classList.remove("active"));b.classList.add("active");
+  renderTLTeam("myTeamBody",b.dataset.teamfilter2);
+});
+
+
+let tlRosterSnapshotRows=[];
+function renderTLRoster(){
+  const body=$("tlRosterBody"); if(!body)return;
+  const q=String($("tlRosterSearch").value||"").trim().toLowerCase();
+  const sf=$("tlRosterStatusFilter").value||"active";
+  const rows=tlRosterSnapshotRows.filter(r=>{
+    const text=`${r.name||""} ${r.employee_id||""} ${r.group_name||""} ${r.subgroup||""} ${r.site||""}`.toLowerCase();
+    const status=r.active===true?"active":"inactive";
+    return (!q||text.includes(q)) && (sf==="all" || status===sf);
+  });
+  if(!rows.length){
+    body.innerHTML='<tr><td colspan="7" style="text-align:center;color:#7a899c;padding:24px">No roster members match the selected filters.</td></tr>';
+    return;
+  }
+  body.innerHTML=rows.map(r=>`<tr>
+    <td><strong>${escapeHtml(r.name||"—")}</strong></td>
+    <td>${escapeHtml(r.employee_id||"—")}</td>
+    <td>${escapeHtml(r.group_name||"—")}</td>
+    <td>${escapeHtml(r.subgroup||"—")}</td>
+    <td>${escapeHtml(r.site||"—")}</td>
+    <td><span class="access-badge ${r.has_profile?"linked":"none"}">${r.has_profile?"Linked":"No Login"}</span></td>
+    <td><span class="team-status ${r.active===true?"WORKING":"OFF"}">${r.active===true?"Active":"Inactive"}</span></td>
+  </tr>`).join("");
+}
+async function loadTLRoster(){
+  if(!currentProfile?.display_name){return;}
+  $("tlRosterTitle").textContent=`${currentProfile.display_name}'s Team Roster`;
+  $("tlRosterSubtitle").textContent="Loading your assigned roster snapshot…";
+  $("tlRosterStatus").textContent="Loading roster designations from Supabase…";
+
+  const {data:allRoster,error:re}=await sb.from("roster")
+    .select("employee_id,name,group_name,subgroup,team_leader,site,lob,active")
+    .order("active",{ascending:false}).order("name");
+  if(re){
+    $("tlRosterSubtitle").textContent="Unable to load your team roster.";
+    $("tlRosterStatus").textContent=re.message||String(re);
+    $("tlRosterBody").innerHTML='<tr><td colspan="7" style="text-align:center;color:#9b3030;padding:24px">Roster could not be loaded.</td></tr>';
+    return;
+  }
+
+  const {data:tlProfiles}=await sb.from("profiles").select("display_name").eq("role","tl");
+  const leaders=(tlProfiles||[]).map(x=>({name:cleanText(x.display_name)})).filter(x=>x.name);
+  const currentTL=resolveMasterTL(currentProfile.display_name,leaders).name||currentProfile.display_name;
+  const members=(allRoster||[]).filter(m=>{
+    const source=cleanText(m.team_leader);
+    if(!source)return false;
+    return (resolveMasterTL(source,leaders).name||source)===currentTL;
+  });
+
+  const ids=members.map(x=>x.employee_id).filter(Boolean);
+  const {data:profiles,error:pe}=ids.length
+    ? await sb.from("profiles").select("employee_id").in("employee_id",ids)
+    : {data:[],error:null};
+  if(pe) console.warn("TL roster profile linkage lookup failed:",pe);
+  const linked=new Set((profiles||[]).map(x=>x.employee_id).filter(Boolean));
+  tlRosterSnapshotRows=members.map(x=>({...x,has_profile:linked.has(x.employee_id)}));
+
+  const activeCount=tlRosterSnapshotRows.filter(x=>x.active===true).length;
+  const inactiveCount=tlRosterSnapshotRows.filter(x=>x.active!==true).length;
+  $("tlRosterCount").textContent=`${activeCount} active${inactiveCount?` · ${inactiveCount} inactive`:""}`;
+  $("tlRosterSubtitle").textContent=`${tlRosterSnapshotRows.length} roster records assigned to ${currentProfile.display_name}.`;
+  $("tlRosterStatus").textContent=`Team-scoped roster snapshot loaded from Supabase. ${activeCount} active · ${inactiveCount} inactive/historical records retained.`;
+  renderTLRoster();
+}
+$("tlRosterSearch").oninput=renderTLRoster;
+$("tlRosterStatusFilter").onchange=renderTLRoster;
+
+let OM_TLS=[];
+let omData={version:null,tlRows:new Map(),selectedTL:null};
+
+function omCount(rows,status){return rows.filter(x=>normalizeTeamStatus(x.status)===status).length;}
+function normalizeStaffGroup(value){
+  const raw=String(value||"").trim().toUpperCase().replace(/\s+/g," ");
+  if(!raw) return null;
+  if(["CET","CAT","CIT"].includes(raw)) return raw;
+  // Roster sometimes stores "CIT Voice" / "CIT Digital" / "CIT - Voice" in group_name
+  if(/\bCET\b/.test(raw) && !/\bCIT\b/.test(raw) && !/\bCAT\b/.test(raw)) return "CET";
+  if(/\bCAT\b/.test(raw) && !/\bCIT\b/.test(raw)) return "CAT";
+  if(/\bCIT\b/.test(raw)) return "CIT";
+  return null;
+}
+function normalizedChannel(value){
+  const raw=String(value||"").trim().toUpperCase().replace(/\s+/g," ");
+  if(!raw) return null;
+  if(raw==="VOICE"||raw==="DIGITAL") return raw;
+  if(/\bDIGITAL\b|\bCHAT\b|\bEMAIL\b|\bMESSAG/.test(raw)) return "DIGITAL";
+  if(/\bVOICE\b|\bPHONE\b|\bINBOUND\b|\bCALL/.test(raw)) return "VOICE";
+  return null;
+}
+/** Derive channel from group_name / subgroup text when channel_allocation column is empty */
+function channelFromGroupText(){
+  for(let i=0;i<arguments.length;i++){
+    const ch=normalizedChannel(arguments[i]);
+    if(ch) return ch;
+  }
+  return null;
+}
+function omUniqueCount(rows){return new Set((rows||[]).map(r=>cleanText(r.employee_id)).filter(Boolean)).size;}
+function omStaffingStats(rows){
+  const scheduled=(rows||[]).filter(r=>r.status==="WORKING");
+  const unique=omUniqueCount(scheduled);
+  const byGroup={CET:[],CAT:[],CIT:[]};
+  const groupKeysByEmployee=new Map();
+  const channelKeysByEmployee=new Map();
+  scheduled.forEach(r=>{
+    if(byGroup[r.agent_group])byGroup[r.agent_group].push(r);
+    const id=cleanText(r.employee_id);
+    if(!id)return;
+    if(!groupKeysByEmployee.has(id))groupKeysByEmployee.set(id,new Set());
+    if(r.agent_group)groupKeysByEmployee.get(id).add(r.agent_group);
+    if(!channelKeysByEmployee.has(id))channelKeysByEmployee.set(id,new Set());
+    // Use resolved channel (schedule snapshot or roster fallback)
+    const ch=normalizedChannel(r.channel_allocation)||normalizedChannel(r.schedule?.channel_allocation)||normalizedChannel(r.current_channel_allocation);
+    if(r.agent_group==="CIT"&&ch)channelKeysByEmployee.get(id).add(ch);
+  });
+  const cet=omUniqueCount(byGroup.CET),cat=omUniqueCount(byGroup.CAT);
+  const citChannel=r=>normalizedChannel(r.channel_allocation)||normalizedChannel(r.schedule?.channel_allocation)||normalizedChannel(r.current_channel_allocation);
+  const citVoice=omUniqueCount(byGroup.CIT.filter(r=>citChannel(r)==="VOICE"));
+  const citDigital=omUniqueCount(byGroup.CIT.filter(r=>citChannel(r)==="DIGITAL"));
+  // Review only when we still cannot classify group/channel, roster link is broken, or multi-group/channel conflict.
+  // Missing team_leader_snapshot alone no longer forces review — roster TL is an acceptable fallback for ops visibility.
+  const reviewIds=new Set(scheduled.filter(r=>{
+    const ch=citChannel(r);
+    if(r.roster_match&&r.roster_match!=="MATCHED"&&r.roster_match!=="INACTIVE NOW") return true;
+    if(!r.agent_group||!["CET","CAT","CIT"].includes(r.agent_group)) return true;
+    if(r.agent_group==="CIT"&&!ch) return true;
+    return false;
+  }).map(r=>cleanText(r.employee_id)).filter(Boolean));
+  for(const [id,groups] of groupKeysByEmployee)if(groups.size>1)reviewIds.add(id);
+  for(const [id,channels] of channelKeysByEmployee)if(channels.size>1)reviewIds.add(id);
+  return {total:unique,cet,cat,citVoice,citDigital,review:reviewIds.size,scheduled,unclassified:scheduled.filter(r=>reviewIds.has(cleanText(r.employee_id)))};
+}
+function omKpiHtml(stats){
+  const items=[
+    {key:"total",title:"All WORKING",value:stats.total,sub:"Distinct agents scheduled today",cls:"total"},
+    {key:"cet",title:"CET",value:stats.cet,sub:"Operating group",cls:"cet"},
+    {key:"cat",title:"CAT",value:stats.cat,sub:"Operating group",cls:"cat"},
+    {key:"voice",title:"CIT Voice",value:stats.citVoice,sub:"CIT · Voice channel",cls:"voice"},
+    {key:"digital",title:"CIT Digital",value:stats.citDigital,sub:"CIT · Digital channel",cls:"digital"},
+    {key:"review",title:"Needs review",value:stats.review,sub:"Missing group or CIT channel",cls:"review"}
+  ];
+  return items.map(x=>`<button type="button" class="om-staffing-kpi ${x.cls}" data-om-kpi="${x.key}" aria-label="${x.title}: ${x.value} agents">
+    <span class="kpi-name">${x.title}</span>
+    <strong>${x.value}</strong>
+    <div class="sub">${x.sub}</div>
+  </button>`).join("");
+}
+function omCitChannel(r){
+  return normalizedChannel(r.channel_allocation)||normalizedChannel(r.schedule?.channel_allocation)||normalizedChannel(r.current_channel_allocation)||null;
+}
+function omAgentsForKpi(key){
+  const rows=(omData.dailyRows||[]).filter(r=>r.status==="WORKING");
+  if(key==="total") return rows;
+  if(key==="cet") return rows.filter(r=>r.agent_group==="CET");
+  if(key==="cat") return rows.filter(r=>r.agent_group==="CAT");
+  if(key==="voice") return rows.filter(r=>r.agent_group==="CIT"&&omCitChannel(r)==="VOICE");
+  if(key==="digital") return rows.filter(r=>r.agent_group==="CIT"&&omCitChannel(r)==="DIGITAL");
+  if(key==="review"){
+    const stats=omStaffingStats(rows);
+    const ids=new Set((stats.unclassified||[]).map(r=>cleanText(r.employee_id)));
+    return rows.filter(r=>ids.has(cleanText(r.employee_id)));
+  }
+  return [];
+}
+function omEnsureAgentListPanels(){
+  [["omHomeStaffingMeta","omHomeAgentList"],["omStaffingMeta","omStaffingAgentList"]].forEach(([metaId,panelId])=>{
+    const meta=$(metaId); if(!meta) return;
+    if($(panelId)) return;
+    const panel=document.createElement("div");
+    panel.id=panelId;
+    panel.className="om-agent-list-panel hidden";
+    panel.innerHTML=`<div class="om-agent-list-head"><strong data-om-list-title>Agents</strong><button type="button" data-om-list-close>Close</button></div><div class="om-agent-list-body"><table><thead><tr><th>Agent</th><th>Employee ID</th><th>Team Leader</th><th>Group</th><th>Channel</th><th>Shift</th></tr></thead><tbody data-om-list-body></tbody></table></div>`;
+    meta.insertAdjacentElement("afterend", panel);
+    panel.querySelector("[data-om-list-close]")?.addEventListener("click",()=>{
+      panel.classList.add("hidden");
+      document.querySelectorAll(".om-staffing-kpi.is-active").forEach(el=>el.classList.remove("is-active"));
+    });
+  });
+}
+function omShowAgentList(key, title){
+  omEnsureAgentListPanels();
+  const rows=omAgentsForKpi(key);
+  const labels={total:"All WORKING",cet:"CET",cat:"CAT",voice:"CIT Voice",digital:"CIT Digital",review:"Needs review"};
+  const label=title||labels[key]||key;
+  ["omHomeAgentList","omStaffingAgentList"].forEach(pid=>{
+    const panel=$(pid); if(!panel) return;
+    panel.classList.remove("hidden");
+    const t=panel.querySelector("[data-om-list-title]");
+    if(t) t.textContent=`${label} · ${rows.length} agent${rows.length===1?"":"s"} on duty (scheduled WORKING)`;
+    const body=panel.querySelector("[data-om-list-body]");
+    if(!body) return;
+    if(!rows.length){
+      body.innerHTML=`<tr><td colspan="6" style="color:#6b7c90;padding:14px">No agents in this bucket for the selected date.</td></tr>`;
+      return;
+    }
+    const sorted=[...rows].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||"")));
+    body.innerHTML=sorted.map(r=>{
+      const ch=omCitChannel(r);
+      const group=r.agent_group||"—";
+      const channel=r.agent_group==="CIT"?(ch||"—"):"—";
+      const shift=(r.schedule?.shift_start&&r.schedule?.shift_end)?`${r.schedule.shift_start} – ${r.schedule.shift_end}`:(r.shift||"—");
+      const tl=r._scheduleTL||r._canonicalTL||r.team_leader||"—";
+      return `<tr>
+        <td>${escapeHtml(r.name||r.employee_id||"—")}</td>
+        <td>${escapeHtml(r.employee_id||"—")}</td>
+        <td>${escapeHtml(tl)}</td>
+        <td>${escapeHtml(group)}</td>
+        <td>${escapeHtml(channel)}</td>
+        <td>${escapeHtml(String(shift))}</td>
+      </tr>`;
+    }).join("");
+  });
+  document.querySelectorAll(".om-staffing-kpi.is-active").forEach(el=>el.classList.remove("is-active"));
+  document.querySelectorAll(`.om-staffing-kpi[data-om-kpi="${key}"]`).forEach(el=>el.classList.add("is-active"));
+}
+function omBindKpiClicks(root){
+  (root||document).querySelectorAll(".om-staffing-kpi[data-om-kpi]").forEach(btn=>{
+    if(btn._omKpiBound) return;
+    btn._omKpiBound=true;
+    btn.addEventListener("click",()=>omShowAgentList(btn.getAttribute("data-om-kpi"), btn.querySelector(".kpi-name")?.textContent));
+  });
+}
+function omTeamGroupCounts(rows){
+  const s=omStaffingStats(rows);
+  return s;
+}
+function renderOMHomeStaffing(){
+  const stats=omStaffingStats(omData.dailyRows||[]);
+  const homeKpis=$("omHomeStaffingKpis"); if(homeKpis)homeKpis.innerHTML=omKpiHtml(stats);
+  const staffingKpis=$("omStaffingKpis"); if(staffingKpis)staffingKpis.innerHTML=omKpiHtml(stats);
+  const versions=omData.version||[];
+  const versionText=versions.length?versions.map(v=>`${branchLabel(v.lob)} v${v.version_number??"—"} · ${v.source_file_name||"published schedule"}`).join(" | "):"No published schedule covers the selected date.";
+  const meta=!versions.length
+    ? `No published schedule covers ${omData.targetDate||phtDate()}. Headcount is not inferred from roster size.`
+    : (!stats.review && stats.total>0)
+      ? `Allocation OK: ${stats.total} WORKING classified (CET ${stats.cet} · CAT ${stats.cat} · CIT Voice ${stats.citVoice} · CIT Digital ${stats.citDigital}). Group/channel use schedule snapshot when present, otherwise roster. ${versionText}`
+      : `Allocation review required for ${stats.review} of ${stats.total} WORKING agent(s). Still missing group (CET/CAT/CIT) and/or CIT channel (Voice/Digital) after checking schedule + roster, or roster link conflicts. ${versionText}`;
+  [$("omHomeStaffingMeta"),$("omStaffingMeta")].filter(Boolean).forEach(el=>{el.textContent=meta;el.classList.toggle("om-staffing-note-err",stats.review>0||!versions.length);});
+  const scopePill=$("omStaffingScopePill");if(scopePill)scopePill.textContent=`${(omAccessProfile().branches||[]).map(branchLabel).join(" + ")} · ${omData.targetDate||phtDate()}`;
+  omBindKpiClicks(document);
+}
+function renderOMCards(){
+  const wrap=$("omTlCards"); if(!wrap)return;
+  wrap.innerHTML=OM_TLS.map(tl=>{
+    const rosterRows=(omData.tlRows.get(tl)||[]).filter(x=>x.active===true);
+    const rows=(omData.dailyRows||[]).filter(x=>x.schedule&&x._scheduleTL===tl);
+    const work=omCount(rows,"WORKING"),off=omCount(rows,"OFF"),vl=omCount(rows,"VL"),ml=omCount(rows,"ML"),sl=omCount(rows,"SL");
+    return `<section class="om-card">
+      <h2>${escapeHtml(tl)}</h2>
+      <div class="muted">Published schedule status · ${escapeHtml(omData.targetDate||phtDate())}</div>
+      <div class="om-statgrid">
+        <div class="om-stat work"><b>${work}</b><span>Scheduled to Work</span></div>
+        <div class="om-stat off"><b>${off}</b><span>OFF</span></div>
+        <div class="om-stat leave"><b>${vl}</b><span>VL</span></div>
+        <div class="om-stat leave"><b>${ml}</b><span>ML</span></div>
+        <div class="om-stat leave"><b>${sl}</b><span>SL</span></div>
+      </div>
+      <div class="om-team-countline">
+        <div><span>Active roster</span><strong>${rosterRows.length}</strong></div>
+        <div><span>Scheduled today</span><strong>${work}</strong></div>
+      </div>
+      <button type="button" class="secondary" data-om-view-tl="${escapeHtml(tl)}">View Team</button>
+    </section>`;
+  }).join("")||`<div class="muted">No Team Leaders in scope.</div>`;
+  wrap.querySelectorAll("[data-om-view-tl]").forEach(btn=>{
+    btn.onclick=()=>{
+      omData.selectedTL=btn.getAttribute("data-om-view-tl");
+      if(typeof showView==="function") showView("omMyTLs");
+      if(typeof renderOMTLDetail==="function") renderOMTLDetail();
+      if(typeof renderOMPicker==="function") renderOMPicker();
+    };
+  });
+}
+function renderOMStaffingView(){
+  const groupRows=OM_TLS.map(tl=>({tl,rosterRows:omData.tlRows.get(tl)||[],scheduleRows:(omData.dailyRows||[]).filter(r=>r.schedule&&r._scheduleTL===tl)}));
+  const tb=$("omStaffingTLBody");
+  if(tb)tb.innerHTML=groupRows.length?groupRows.map(x=>{const st=omStaffingStats(x.scheduleRows);const work=st.scheduled.length;const active=x.rosterRows.filter(r=>r.active===true).length;return `<tr><td><strong>${escapeHtml(x.tl)}</strong></td><td>${active}</td><td><span class="om-staffing-count">${work}</span></td><td>${st.cet}</td><td>${st.cat}</td><td>${st.citVoice}</td><td>${st.citDigital}</td><td>${st.review?`<span class="om-staffing-count" style="background:#fff3df;color:#9b6417">${st.review}</span>`:"0"}</td></tr>`;}).join(""):'<tr><td colspan="8">No Team Leader mappings were found for this scope.</td></tr>';
+  renderOMStaffingAgents();
+}
+function renderOMStaffingAgents(){
+  const body=$("omStaffingAgentBody");if(!body)return;
+  const q=String($("omStaffingSearch")?.value||"").trim().toLowerCase();
+  const sf=String($("omStaffingStatusFilter")?.value||"").toUpperCase();
+  const gf=String($("omStaffingGroupFilter")?.value||"").toUpperCase();
+  const all=omData.dailyRows||[];
+  const rows=all.filter(r=>{
+    const t=`${r.name||""} ${r.employee_id||""} ${r._canonicalTL||r.team_leader||""} ${r._scheduleTL||""} ${r.lob||""} ${r.roster_match||""}`.toLowerCase();
+    const status=String(r.status||"NO SCHEDULE").toUpperCase();
+    const group=r.agent_group||"UNCLASSIFIED";
+    return (!q||t.includes(q))&&(!sf||status===sf)&&(!gf||group===gf);
+  });
+  body.innerHTML=rows.length?rows.map(r=>{
+    const channel=r.agent_group==="CIT"?(r.schedule?.channel_allocation||(r.current_channel_allocation?`Not snapshotted · roster ${r.current_channel_allocation}`:"Not assigned")):"—";
+    const st=String(r.status||"NO SCHEDULE").toUpperCase();
+    const cls=st==="WORKING"?"working":st==="OFF"?"off":"other";
+    return `<tr><td><strong>${escapeHtml(r.name||"—")}</strong></td><td>${escapeHtml(r.employee_id||"—")}</td><td>${escapeHtml(r._scheduleTL||r._canonicalTL||r.team_leader||"Unassigned")}</td><td>${escapeHtml(r.agent_group||"Unclassified")}</td><td>${escapeHtml(channel)}</td><td><span class="emu-status ${cls}">${escapeHtml(st)}</span></td><td>${escapeHtml(r.schedule?.shift_start?`${fmtTime(r.schedule.shift_start)} – ${fmtTime(r.schedule.shift_end)}`:"—")}</td><td>${escapeHtml(r.roster_match||"MATCHED")}</td></tr>`;
+  }).join(""):'<tr><td colspan="8" style="text-align:center;color:#7a899c;padding:24px">No agents match the selected filters.</td></tr>';
+}
+function renderOMPicker(){
+  const wrap=$("omTLPicker"); if(!wrap)return;
+  wrap.innerHTML=OM_TLS.map(t=>`<button class="${t===omData.selectedTL?"active":""}" data-om-picker="${escapeHtml(t)}">${escapeHtml(t)}</button>`).join("");
+  wrap.querySelectorAll("[data-om-picker]").forEach(b=>b.onclick=()=>{
+    omData.selectedTL=b.dataset.omPicker;renderOMPicker();renderOMTLDetail();
+  });
+}
+function renderOMTLDetail(){
+  const tl=omData.selectedTL, rows=omData.tlRows.get(tl)||[];
+  $("omDetailTitle").textContent=tl;
+  $("omDetailSubtitle").textContent=`${rows.length} active agents · today's published scheduler status`;
+  if(!rows.length){
+    $("omTeamDetailBody").innerHTML='<tr><td colspan="6" style="text-align:center;color:#7a899c;padding:18px">No roster members are currently mapped to this Team Leader.</td></tr>';
+    return;
+  }
+  $("omTeamDetailBody").innerHTML=rows.map(x=>{
+    const channel=x.agent_group==="CIT"?(x.schedule?.channel_allocation||(x.current_channel_allocation?`Not snapshotted · roster ${x.current_channel_allocation}`:"Not assigned")):"—";
+    return `<tr>
+      <td><strong>${escapeHtml(x.name)}</strong></td>
+      <td>${escapeHtml(x.employee_id)}</td>
+      <td><span class="team-status ${escapeHtml(x.status)}">${escapeHtml(x.status)}</span></td>
+      <td>${escapeHtml(teamShiftText(x.schedule))}</td>
+      <td>${escapeHtml(x.agent_group||"—")}</td>
+      <td>${escapeHtml(channel)}</td>
+    </tr>`;
+  }).join("");
+}
+async function loadOMHome(targetDateOverride){
+  if(!currentProfile?.display_name)return;
+  const activeView=sessionStorage.getItem("worksync.activeView")||"omHome";
+  const targetDate=String(targetDateOverride||((activeView==="omDailyStaffing")?$("omStaffingDate")?.value:phtDate())||phtDate());
+  const safeDate=/^\d{4}-\d{2}-\d{2}$/.test(targetDate)?targetDate:phtDate();
+  omData.targetDate=safeDate;
+  $("omNameHeading").textContent=currentProfile.display_name;
+  const dateForLabel=new Date(`${safeDate}T12:00:00+08:00`);
+  $("omDatePill").textContent=new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"long",day:"numeric",year:"numeric"}).format(dateForLabel)+" · PHT";
+  if($("omStaffingDate") && activeView==="omDailyStaffing")$("omStaffingDate").value=safeDate;
+  const omScope=omAccessProfile();
+  const allowedBranches=omScope.branches;
+  const {data:versions,error:ve}=await sb.from("schedule_versions")
+    .select("id,version_number,week_start,week_end,published_at,source_file_name,status,lob")
+    .eq("status","published")
+    .lte("week_start",safeDate)
+    .gte("week_end",safeDate)
+    .order("week_start",{ascending:false})
+    .order("published_at",{ascending:false});
+  if(ve){console.error("OM schedule versions load failed",ve);}
+  const effectiveVersions=[];
+  const seenBranches=new Set();
+  for(const v of (versions||[])){
+    const b=branchKeyFromLabel(v.lob);
+    if(!allowedBranches.includes(b)) continue;
+    if(!seenBranches.has(b)){seenBranches.add(b);effectiveVersions.push(v);}
+  }
+  omData.version=effectiveVersions;
+
+  const {data:roster,error:re}=await sb.from("roster")
+    .select("employee_id,name,group_name,subgroup,team_leader,active,lob,channel_allocation").order("name");
+  if(re){
+    const message=`Unable to load the master roster: ${re.message||"unknown error"}`;
+    $("omTlCards").innerHTML=`<div class="om-card"><strong>${escapeHtml(message)}</strong></div>`;
+    [$("omHomeStaffingMeta"),$("omStaffingMeta")].filter(Boolean).forEach(el=>{el.textContent=message;el.classList.add("om-staffing-note-err");});
+    return;
+  }
+
+  const {data:tlProfiles}=await sb.from("profiles").select("display_name").eq("role","tl");
+  const leaders=(tlProfiles||[]).map(x=>({name:cleanText(x.display_name)})).filter(x=>x.name);
+  const canonicalTL = value => {
+    const source=cleanText(value);
+    if(!source || source==="-") return null;
+    return resolveMasterTL(source,leaders).name||source;
+  };
+  const allMembers=(roster||[])
+    .filter(m=>allowedBranches.includes(branchKeyFromLabel(m.lob)))
+    .map(m=>({...m,_canonicalTL:canonicalTL(m.team_leader)}));
+  const members=allMembers.filter(m=>m.active===true);
+  const rosterByKey=new Map(allMembers.map(m=>[`${branchKeyFromLabel(m.lob)||""}|${cleanText(m.employee_id)}`,m]));
+  let schedules=[];
+  const versionIds=effectiveVersions.map(v=>v.id).filter(Boolean);
+  let scheduleLoadError=null;
+  if(versionIds.length){
+    const {data:s,error:se}=await sb.from("schedules")
+      .select("employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id,agent_group,channel_allocation,team_leader_snapshot")
+      .in("schedule_version_id",versionIds)
+      .eq("schedule_date",safeDate);
+    if(!se)schedules=s||[];else{scheduleLoadError=se;console.error("OM daily schedule rows load failed",se);}
+  }
+  const versionBranchMap=new Map(effectiveVersions.map(v=>[v.id,branchKeyFromLabel(v.lob)]));
+  const scheduleMap=new Map(schedules.map(x=>[`${x.employee_id}|${versionBranchMap.get(x.schedule_version_id)||""}`,x]));
+  const makeDailyRow=(m,sch,match="MATCHED")=>{
+    const currentTL=canonicalTL(m.team_leader);
+    const savedTL=canonicalTL(sch?.team_leader_snapshot)||currentTL;
+    const status=normalizeTeamStatus(sch?.schedule_status||"NO SCHEDULE");
+    // Prefer schedule snapshot; fall back to roster group_name / channel when publish did not store allocation fields.
+    const scheduleGroup=sch?normalizeStaffGroup(sch.agent_group):null;
+    const rosterGroup=normalizeStaffGroup(m.group_name)||normalizeStaffGroup(m.subgroup)||normalizeStaffGroup(m.agent_group);
+    const group=scheduleGroup||rosterGroup||null;
+    const rosterChannel=normalizedChannel(m.channel_allocation)||channelFromGroupText(m.group_name,m.subgroup);
+    const scheduleChannel=normalizedChannel(sch?.channel_allocation)||channelFromGroupText(sch?.agent_group);
+    let channel=scheduleChannel||rosterChannel||null;
+    // Known CIT Voice employee IDs default to VOICE when channel was never snapshotted
+    if(!channel && group==="CIT" && typeof isCcacVoiceAgent==="function" && isCcacVoiceAgent(m.employee_id)) channel="VOICE";
+    return {...m,status,schedule:sch,agent_group:group,channel_allocation:channel,current_channel_allocation:rosterChannel,_groupFromSchedule:!!scheduleGroup,_channelFromSchedule:!!scheduleChannel,_canonicalTL:currentTL,_scheduleTL:savedTL,roster_match:match};
+  };
+  const dailyRows=members.map(m=>{
+    const sch=scheduleMap.get(`${m.employee_id}|${branchKeyFromLabel(m.lob)||""}`)||null;
+    return makeDailyRow(m,sch,"MATCHED");
+  });
+  const representedScheduleKeys=new Set(dailyRows.filter(r=>r.schedule).map(r=>`${branchKeyFromLabel(r.schedule_lob||r.lob)||""}|${cleanText(r.employee_id)}`));
+  for(const sch of schedules){
+    const branch=versionBranchMap.get(sch.schedule_version_id)||"";
+    const key=`${branch}|${cleanText(sch.employee_id)}`;
+    if(representedScheduleKeys.has(key))continue;
+    const person=rosterByKey.get(key);
+    if(person){
+      // Retain scheduled historical rows even if the employee has since been deactivated.
+      dailyRows.push(makeDailyRow(person,sch,person.active===true?"MATCHED":"INACTIVE NOW"));
+    }else{
+      // A schedule row without a matching roster record remains visible for reconciliation.
+      const snapshotTL=canonicalTL(sch.team_leader_snapshot);
+      dailyRows.push({employee_id:sch.employee_id,name:sch.name||sch.employee_id,lob:branch,active:false,team_leader:snapshotTL||null,_canonicalTL:null,_scheduleTL:snapshotTL,status:normalizeTeamStatus(sch.schedule_status||"NO SCHEDULE"),schedule:sch,agent_group:normalizeStaffGroup(sch.agent_group),channel_allocation:normalizedChannel(sch.channel_allocation),current_channel_allocation:null,roster_match:"NOT IN ROSTER"});
+    }
+    representedScheduleKeys.add(key);
+  }
+  OM_TLS=[...new Set([
+    ...members.map(x=>x._canonicalTL).filter(Boolean),
+    ...dailyRows.filter(x=>x.schedule).map(x=>x._scheduleTL).filter(Boolean)
+  ])].sort((a,b)=>a.localeCompare(b));
+  omData.selectedTL=omData.selectedTL&&OM_TLS.includes(omData.selectedTL)?omData.selectedTL:(OM_TLS[0]||null);
+  omData.activeRosterRows=members;
+  omData.dailyRows=dailyRows;
+  // Team detail reflects current active roster assignment; schedule summaries use the saved TL snapshot when available.
+  omData.tlRows=new Map(OM_TLS.map(tl=>[tl,dailyRows.filter(m=>m.active===true&&m._canonicalTL===tl)]));
+
+  const scopeText=allowedBranches.map(branchLabel).join(" + ");
+  $("omScopeSummary").textContent=`Daily staffing and Team Leader counts within ${scopeText}. Scheduled counts use the published schedule for ${safeDate}; attendance is tracked separately.`;
+  $("omMyTLPill").textContent=`${scopeText} · MY TLS`;
+  $("omStaffingScopePill").textContent=`${scopeText} · ${safeDate} · PHT`;
+  if(ve || !effectiveVersions.length){
+    $("omSubheading").textContent=`CONCEPCION CARRIER · Ops OM · ${scopeText} · No published schedule available for ${safeDate}`;
+  }else{
+    const weekText=effectiveVersions.map(v=>`${branchLabel(v.lob)} ${v.week_start||"—"} → ${v.week_end||"—"}`).join(" · ");
+    $("omSubheading").textContent=`CONCEPCION CARRIER · Ops OM · ${scopeText} · ${weekText}`;
+  }
+  renderOMHomeStaffing();renderOMCards();renderOMPicker();renderOMTLDetail();renderOMStaffingView();
+  if(scheduleLoadError){
+    const message=`Published schedule rows could not be read: ${scheduleLoadError.message||"unknown error"}`;
+    [$("omHomeStaffingMeta"),$("omStaffingMeta")].filter(Boolean).forEach(el=>{el.textContent=message;el.classList.add("om-staffing-note-err");});
+  }
+}
+
+let rosterAdminRows=[];
+let rosterTLs=[];
+let rosterAdminAllRows=[];
+
+function refreshRosterTLFilter(){
+  const selected=branchKeyFromLabel($("rosterBranchFilter")?.value)||"CCAC";
+  const branchRows=rosterAdminAllRows.filter(r=>branchKeyFromLabel(r.lob)===selected);
+  const names=[...new Set(branchRows.map(r=>cleanText(r.team_leader)).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+  rosterTLs=names;
+  const current=$(`rosterTLFilter`)?.value||"";
+  $("rosterTLFilter").innerHTML='<option value="">All Team Leaders</option><option value="__UNASSIGNED__">Unassigned</option>'+names.map(t=>`<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
+  if(names.includes(current)) $("rosterTLFilter").value=current;
+}
+
+function renderRosterAdmin(){
+  const q=String($("rosterSearch").value||"").trim().toLowerCase();
+  const branch=branchKeyFromLabel($("rosterBranchFilter")?.value)||"CCAC";
+  const tlf=$("rosterTLFilter").value;
+  const af=$("rosterAccessFilter").value;
+
+  const rows=rosterAdminAllRows.filter(r=>{
+    const text=`${r.name} ${r.employee_id} ${r.group_name||""} ${r.subgroup||""} ${r.channel_allocation||""}`.toLowerCase();
+    const team=r.team_leader||"";
+    const access=r.has_profile?"linked":"none";
+    return branchKeyFromLabel(r.lob)===branch
+      && (!q||text.includes(q))
+      && (!tlf||(tlf==="__UNASSIGNED__"?!team:team===tlf))
+      && (!af||access===af);
+  });
+
+  rosterAdminRows=rosterAdminAllRows.filter(r=>branchKeyFromLabel(r.lob)===branch);
+  $("rosterAdminBody").innerHTML=rows.length ? rows.map(r=>`
+    <tr>
+      <td><strong>${escapeHtml(r.name)}</strong></td>
+      <td>${escapeHtml(r.employee_id)}</td>
+      <td><span class="access-badge linked">${escapeHtml(branchLabel(r.lob))}</span></td>
+      <td><select data-roster-group="${escapeHtml(r.employee_id)}" aria-label="Group for ${escapeHtml(r.name)}"><option value="" ${!r.group_name?"selected":""}>—</option><option value="CET" ${r.group_name==="CET"?"selected":""}>CET</option><option value="CAT" ${r.group_name==="CAT"?"selected":""}>CAT</option><option value="CIT" ${r.group_name==="CIT"?"selected":""}>CIT</option></select></td>
+      <td><select data-roster-subgroup="${escapeHtml(r.employee_id)}" aria-label="Subgroup for ${escapeHtml(r.name)}">${rosterSubgroupOptions(r.group_name,r.subgroup)}</select></td>
+      <td>
+        <select data-roster-tl="${escapeHtml(r.employee_id)}">
+          <option value="">Unassigned</option>
+          ${rosterTLs.map(t=>`<option value="${escapeHtml(t)}" ${t===r.team_leader?"selected":""}>${escapeHtml(t)}</option>`).join("")}
+        </select>
+      </td>
+      <td><span class="access-badge ${r.has_profile?"linked":"none"}">${r.has_profile?"Linked":"No Login"}</span></td>
+      <td><button class="roster-save" data-roster-save="${escapeHtml(r.employee_id)}">Save</button></td>
+    </tr>`).join("")
+    : '<tr><td colspan="9" style="text-align:center;color:#7a899c;padding:24px">No roster employees match the selected branch and filters.</td></tr>';
+
+  $("rosterAdminBody").querySelectorAll("[data-roster-group]").forEach(g=>g.onchange=()=>{
+    const sub=g.closest("tr")?.querySelector("[data-roster-subgroup]");
+    if(sub) sub.innerHTML=rosterSubgroupOptions(g.value,"");
+  });
+  $("rosterAdminBody").querySelectorAll("[data-roster-save]").forEach(b=>b.onclick=async()=>{
+    const employeeId=b.dataset.rosterSave;
+    const row=rosterAdminAllRows.find(x=>x.employee_id===employeeId);
+    const allowed=allowedBranchesForProfile();
+    if(!row || !allowed.includes(branchKeyFromLabel(row.lob))){
+      toast("Access denied: this roster record is outside your assigned branch scope.");
+      return;
+    }
+    const rowEl=b.closest("tr");
+    const select=rowEl?.querySelector("select[data-roster-tl]");
+    const groupSelect=rowEl?.querySelector("select[data-roster-group]");
+    const subSelect=rowEl?.querySelector("select[data-roster-subgroup]");
+    if(!select||!groupSelect||!subSelect){toast("Could not read the dropdowns for this row. Nothing was saved.");return;}
+    const value=select.value||null;
+    const group=groupSelect.value||null;
+    const subgroup=group?(subSelect.value||null):null;
+    if(subgroup && !(ROSTER_SUBGROUPS[group]||[]).includes(subgroup)){toast("Pick a valid subgroup for "+group+", or leave it blank.");return;}
+    const channelValue=(group==="CIT" && ["VOICE","DIGITAL"].includes(subgroup))?subgroup:null;
+    b.disabled=true;b.textContent="Saving…";
+    const {data:savedRows,error}=await sb.from("roster")
+      .update({team_leader:value,group_name:group,subgroup:subgroup,channel_allocation:channelValue})
+      .eq("employee_id",employeeId)
+      .select("employee_id,team_leader,group_name,subgroup,channel_allocation");
+    if(error){toast("Could not save roster assignments: "+error.message);b.disabled=false;b.textContent="Save";return;}
+    if(!savedRows||savedRows.length!==1){
+      toast("Not saved: the database did not accept this change for "+(row?.name||employeeId)+". Check roster update permissions for your role.");
+      b.disabled=false;b.textContent="Save";
+      await loadRosterAdmin();
+      return;
+    }
+    if(row){row.team_leader=value;row.group_name=group;row.subgroup=subgroup;row.channel_allocation=channelValue;}
+    b.textContent="Saved";
+    setTimeout(()=>{b.disabled=false;b.textContent="Save"},900);
+    refreshRosterTLFilter(); updateRosterKpis(); renderRosterAdmin();
+  });
+
+  updateRosterKpis();
+}
+const ROSTER_SUBGROUPS={CET:["Ops Support","0.07"],CAT:["L2 Escalation","E2E"],CIT:["VOICE","DIGITAL"]};
+function rosterSubgroupOptions(group,current){
+  const list=ROSTER_SUBGROUPS[group]||[];
+  const label=v=>v==="VOICE"?"Voice":v==="DIGITAL"?"Digital":v;
+  return '<option value="">—</option>'+list.map(v=>`<option value="${escapeHtml(v)}" ${v===current?"selected":""}>${escapeHtml(label(v))}</option>`).join("");
+}
+function updateRosterKpis(){
+  const branch=branchKeyFromLabel($("rosterBranchFilter")?.value)||"CCAC";
+  rosterAdminRows=rosterAdminAllRows.filter(r=>branchKeyFromLabel(r.lob)===branch);
+  $("rosterTotal").textContent=rosterAdminRows.length;
+  $("rosterLinked").textContent=rosterAdminRows.filter(x=>x.has_profile).length;
+  $("rosterUnassigned").textContent=rosterAdminRows.filter(x=>!x.team_leader).length;
+  $("rosterTLs").textContent=rosterTLs.length;
+}
+async function loadRosterAdmin(){
+  const allowedBranches=allowedBranchesForProfile();
+  if($("rosterBranchFilter") && !allowedBranches.includes(branchKeyFromLabel($("rosterBranchFilter").value))){
+    $("rosterBranchFilter").value=allowedBranches[0]||"CCAC";
+  }
+  const branch=branchKeyFromLabel($("rosterBranchFilter")?.value)||allowedBranches[0]||"CCAC";
+  configureBranchAccessUI();
+  const {data:tlProfiles,error:pe}=await sb.from("profiles").select("display_name").eq("role","tl").order("display_name");
+  if(pe){toast("Could not load Team Leaders: "+pe.message);return;}
+
+  const {data:allRoster,error:re}=await sb.from("roster")
+    .select("employee_id,name,group_name,subgroup,team_leader,active,lob,channel_allocation")
+    .order("active",{ascending:false}).order("name");
+  if(re){
+    toast("Could not load roster: "+re.message);
+    $("currentRosterBadge").textContent="LOAD ERROR";
+    $("currentRosterBadge").className="access-badge none";
+    $("currentRosterSummary").textContent="The Concepcion Carrier master roster could not be loaded.";
+    $("currentRosterMeta").textContent=re.message||String(re);
+    return;
+  }
+  const activeRows=(allRoster||[]).filter(x=>x.active===true && allowedBranches.includes(branchKeyFromLabel(x.lob)));
+  const ids=activeRows.map(x=>x.employee_id).filter(Boolean);
+  const {data:profiles,error:profileError}=ids.length ? await sb.from("profiles").select("employee_id").in("employee_id",ids) : {data:[],error:null};
+  if(profileError) console.warn("Profile linkage lookup failed:",profileError);
+  const linked=new Set((profiles||[]).map(x=>x.employee_id).filter(Boolean));
+  rosterAdminAllRows=activeRows.map(x=>({...x,has_profile:linked.has(x.employee_id)}));
+
+  refreshRosterTLFilter();
+  updateRosterKpis();renderRosterAdmin();
+  const branchRows=rosterAdminAllRows.filter(x=>branchKeyFromLabel(x.lob)===branch);
+  const inactiveCount=(allRoster||[]).filter(x=>x.active!==true && branchKeyFromLabel(x.lob)===branch).length;
+  $("currentRosterSummary").textContent = branchRows.length ? `${branchRows.length} active ${branchLabel(branch)} employees are currently in the master roster.` : `No active ${branchLabel(branch)} roster records were returned.`;
+  $("currentRosterBadge").textContent = branchRows.length ? "ACTIVE" : "EMPTY";
+  $("currentRosterBadge").className = `access-badge ${branchRows.length ? "linked" : "none"}`;
+  $("currentRosterMeta").textContent = branchRows.length
+    ? `Authoritative Employee → Team Leader mapping loaded from Supabase. ${branchRows.length} active employees · ${rosterTLs.length} Team Leaders in this branch · ${branchRows.filter(x=>!x.team_leader).length} need TL mapping · ${inactiveCount} inactive/historical records preserved.`
+    : `The ${branchLabel(branch)} roster is currently empty. ${inactiveCount} inactive/historical records were found.`;
+}
+$("rosterSearch").oninput=renderRosterAdmin;
+$("rosterTLFilter").onchange=renderRosterAdmin;
+$("rosterAccessFilter").onchange=renderRosterAdmin;
+$("rosterBranchFilter").onchange=()=>loadRosterAdmin();
+
+
+let masterRosterImportData=null;
+
+function cleanText(v){return String(v==null?"":v).replace(/\u00a0/g," ").replace(/\s+/g," ").trim();}
+function normName(v){
+  return cleanText(v).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9 ]/g," ").replace(/\s+/g," ").trim();
+}
+function nameSimilarity(a,b){
+  a=normName(a);b=normName(b);if(!a||!b)return 0;if(a===b)return 1;
+  const m=a.length,n=b.length,dp=Array.from({length:m+1},()=>Array(n+1).fill(0));
+  for(let i=0;i<=m;i++)dp[i][0]=i;for(let j=0;j<=n;j++)dp[0][j]=j;
+  for(let i=1;i<=m;i++)for(let j=1;j<=n;j++)dp[i][j]=Math.min(dp[i-1][j]+1,dp[i][j-1]+1,dp[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
+  return 1-dp[m][n]/Math.max(m,n);
+}
+function resolveMasterTL(raw,leaders){
+  const source=cleanText(raw);if(!source || source==="-")return {name:null,source,matched:true};
+  const exact=leaders.find(x=>normName(x.name)===normName(source));if(exact)return {name:exact.name,source,matched:true};
+  const ranked=leaders.map(x=>({x,score:nameSimilarity(source,x.name)})).sort((a,b)=>b.score-a.score);
+  if(ranked.length && ranked[0].score>=0.88 && (!ranked[1] || ranked[0].score-ranked[1].score>=0.05)) return {name:ranked[0].x.name,source,matched:true,corrected:true};
+  return {name:source,source,matched:false};
+}
+function parseMasterRosterSource(wb){
+  // September 2026 authoritative source:
+  // workbook sheet: "Agent Roster Billable"
+  // headers: EID, Name, Wave, LOB, Role, Priority, September TL,
+  //          DOJ, Level, Work Location, Status
+  const preferredSheet = wb.SheetNames.find(n => normName(n) === normName("Agent Roster Billable"));
+  const sheetName = preferredSheet || wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+  if(!rows.length) throw new Error("The workbook is empty.");
+
+  let headerRow = -1, cols = {};
+  for(let r=0;r<rows.length;r++){
+    const map = new Map(rows[r].map((v,i)=>[cleanText(v).toLowerCase(),i]));
+    if(map.has("eid") && map.has("name") && map.has("september tl") && map.has("status")){
+      headerRow = r;
+      cols = {
+        employee_id: map.get("eid"),
+        name: map.get("name"),
+        lob: map.get("lob"),
+        role: map.get("role"),
+        wave: map.get("wave"),
+        priority: map.get("priority"),
+        team_leader: map.get("september tl"),
+        doj: map.get("doj"),
+        level: map.get("level"),
+        site: map.get("work location"),
+        status: map.get("status")
+      };
+      break;
+    }
+  }
+
+  if(headerRow < 0){
+    throw new Error(
+      `Could not find the September roster headers. Expected EID / Name / September TL / Status. Sheets found: ${wb.SheetNames.join(", ")}`
+    );
+  }
+
+  const out = [], seen = new Set(), corrections = [];
+  const statusCounts = {};
+
+  for(let r=headerRow+1;r<rows.length;r++){
+    const emp = cleanText(rows[r][cols.employee_id]).toUpperCase();
+    if(!/^M\d+$/.test(emp)) continue;
+    if(seen.has(emp)) continue;
+    seen.add(emp);
+
+    const name = cleanText(rows[r][cols.name]);
+    const rawTL = cleanText(rows[r][cols.team_leader]);
+    const sourceStatus = cleanText(rows[r][cols.status]);
+    const normalizedStatus = sourceStatus.toLowerCase();
+
+    let active = true;
+    if(normalizedStatus === "attrited" || normalizedStatus === "inactive"){
+      active = false;
+    }else if(normalizedStatus === "active"){
+      active = true;
+    }else{
+      active = !/(attrit|inactive|terminated|separated)/i.test(sourceStatus);
+    }
+
+    const rawLob = cleanText(rows[r][cols.lob]) || "CCAC";
+    const lob = branchKeyFromLabel(rawLob);
+    if(!allBranchKeys().includes(lob)) throw new Error(`Unsupported Concepcion Carrier branch/LOB value "${rawLob}" for employee ${emp}. Expected CCAC, CMIP, or CDI (or the full labels CCAC CCAC / CCAC CMIP / CCAC CDI).`);
+    const site = cleanText(rows[r][cols.site]) || null;
+    statusCounts[sourceStatus || "BLANK"] = (statusCounts[sourceStatus || "BLANK"] || 0) + 1;
+
+    out.push({
+      employee_id: emp,
+      name,
+      email: null,
+      lob,
+      group_name: null,
+      subgroup: null,
+      site,
+      team_leader: rawTL || null,
+      active,
+      intalk_id: null,
+      source_status: sourceStatus || null,
+      wave: cleanText(rows[r][cols.wave]) || null,
+      role: cleanText(rows[r][cols.role]) || null,
+      priority: cleanText(rows[r][cols.priority]) || null,
+      doj: cleanText(rows[r][cols.doj]) || null,
+      level: cleanText(rows[r][cols.level]) || null,
+      _tlSource: rawTL,
+      _tlExplicit: true
+    });
+  }
+
+  if(!out.length) throw new Error("No employee IDs were found in the Agent Roster Billable sheet.");
+
+  return {
+    roster: out,
+    leaders: [],
+    corrections,
+    headerRow: headerRow + 1,
+    sheetName,
+    statusCounts,
+    sourceFormat: "September Agent Roster Billable"
+  };
+}
+
+async function parseMasterRosterWorkbook(file){
+  const buf=await file.arrayBuffer();
+  const wb=XLSX.read(buf,{type:"array",cellDates:false});
+  masterRosterImportData=parseMasterRosterSource(wb);
+  renderMasterRosterPreview(file.name);
+}
+function renderMasterRosterPreview(fileName){
+  const d=masterRosterImportData;if(!d)return;
+  const rows=d.roster;
+  const assigned=rows.filter(x=>!!x.team_leader).length;
+  const unassigned=rows.length-assigned;
+  const active=rows.filter(x=>x.active).length;
+  const inactive=rows.length-active;
+
+  $("masterEmployees").textContent=rows.length;
+  $("masterAssigned").textContent=assigned;
+  $("masterUnassigned").textContent=unassigned;
+  $("masterAccounts").textContent="—";
+
+  const statusText=Object.entries(d.statusCounts||{})
+    .map(([k,v])=>`${k}: ${v}`).join(" · ");
+
+  $("rosterImportMeta").textContent=
+    `${fileName} · ${rows.length} employees parsed · source sheet: ${d.sheetName} · ${statusText}`;
+
+  $("rosterMasterMappingNote").textContent=
+    `September roster format detected: Agent Roster Billable. `+
+    `Active: ${active} · Inactive/Attrited: ${inactive}. `+
+    `Employees without a WorkSync profile remain in the master roster and stay visible to their TL and Ops OM.`;
+
+  $("masterRosterPreviewBody").innerHTML=rows.slice(0,250).map(x=>`
+    <tr>
+      <td>${escapeHtml(x.employee_id)}</td>
+      <td>${escapeHtml(x.name)}</td>
+      <td>${escapeHtml(x.email||"—")}</td>
+      <td>${escapeHtml(x.group_name||"—")}</td>
+      <td>${escapeHtml(x.subgroup||"—")}</td>
+      <td>${escapeHtml(x.site||"—")}</td>
+      <td>${escapeHtml(x.team_leader||"—")}</td>
+      <td>${escapeHtml(x.source_status||"—")}</td>
+    </tr>`).join("");
+
+  $("rosterMasterPreview").classList.remove("hidden");
+}
+function clearMasterRosterPreview(){masterRosterImportData=null;$("rosterMasterFile").value="";$("rosterMasterPreview").classList.add("hidden");$("rosterMasterStatus").innerHTML="";}
+
+async function publishMasterRoster(){
+  if(!masterRosterImportData||!currentUser||!currentProfile)return;
+  const role=String(currentProfile.role||"").toLowerCase();
+  if(!["admin","ops","wfm"].includes(role)){
+    toast("Only authorized Workforce/Ops users can publish the master roster.");
+    return;
+  }
+  if(isOpsOM()){
+    toast("Master roster publishing is restricted to WFM/Admin. Ops OM access is branch-scoped read/update only.");
+    return;
+  }
+
+  const btn=$("rosterMasterPublish");
+  btn.disabled=true;
+  btn.textContent="Publishing…";
+  $("rosterMasterStatus").innerHTML=
+    '<div class="banner warn">Updating the authoritative Concepcion Carrier master roster. Records not present in the uploaded source are marked inactive only within the source branch(es) and preserved for history.</div>';
+
+  try{
+    const incoming=masterRosterImportData.roster;
+    const ids=incoming.map(x=>x.employee_id);
+
+    const {data:tlProfiles,error:tp}=await sb.from("profiles")
+      .select("display_name").eq("role","tl").order("display_name");
+    if(tp)throw tp;
+
+    const leaderProfiles=(tlProfiles||[])
+      .map(x=>({name:cleanText(x.display_name)}))
+      .filter(x=>x.name);
+
+    const canonicalLeaderMap=new Map();
+    incoming.forEach(x=>{
+      const raw=cleanText(x._tlSource||x.team_leader);
+      if(!raw)return;
+      const resolved=resolveMasterTL(raw,leaderProfiles);
+      canonicalLeaderMap.set(raw,resolved.name||null);
+    });
+
+    const {data:existing,error:ee}=await sb.from("roster")
+      .select("employee_id,email,group_name,subgroup,site,team_leader,lob,active,intalk_id,channel_allocation")
+      .in("employee_id",ids);
+    if(ee)throw ee;
+
+    const existingMap=new Map((existing||[]).map(x=>[x.employee_id,x]));
+
+    const payload=incoming.map(x=>{
+      const old=existingMap.get(x.employee_id)||{};
+      const rawTL=cleanText(x._tlSource||x.team_leader);
+      const canonicalTL=rawTL ? (canonicalLeaderMap.get(rawTL) ?? rawTL) : null;
+
+      return {
+        employee_id:x.employee_id,
+        name:x.name||old.name,
+        email:old.email||null,
+        lob:branchKeyFromLabel(x.lob)||branchKeyFromLabel(old.lob)||"CCAC",
+        group_name:old.group_name||null,
+        subgroup:old.subgroup||null,
+        site:x.site||old.site||null,
+        team_leader:canonicalTL||null,
+        intalk_id:old.intalk_id||null,
+        channel_allocation:cleanText(old.channel_allocation||"").toUpperCase()||null,
+        active:Boolean(x.active)
+      };
+    });
+
+    const {error:up}=await sb.from("roster").upsert(payload,{onConflict:"employee_id"});
+    if(up)throw up;
+
+    // Deactivate only records within branch(es) actually represented by this upload.
+    // This prevents a CMIP/CDI import from deactivating CCAC employees.
+    const incomingBranches=[...new Set(payload.map(x=>branchKeyFromLabel(x.lob)).filter(x=>allBranchKeys().includes(x)))];
+    const incomingSet=new Set(ids);
+    const obsolete=[];
+    for(const branch of incomingBranches){
+      const {data:current,error:ce}=await sb.from("roster")
+        .select("employee_id")
+        .eq("lob",branch);
+      if(ce)throw ce;
+      (current||[]).map(x=>x.employee_id).filter(id=>id && !incomingSet.has(id)).forEach(id=>obsolete.push({id,branch}));
+    }
+    for(const item of obsolete){
+      const {error:de}=await sb.from("roster")
+        .update({active:false})
+        .eq("lob",item.branch)
+        .eq("employee_id",item.id);
+      if(de)throw de;
+    }
+
+    const corrections=[...new Set(payload.map((p,i)=>{
+      const raw=cleanText(incoming[i]._tlSource||"");
+      return raw && p.team_leader && normName(raw)!==normName(p.team_leader)
+        ? `${raw} → ${p.team_leader}` : null;
+    }).filter(Boolean))];
+
+    const activeCount=payload.filter(x=>x.active).length;
+    const inactiveCount=payload.length-activeCount;
+
+    $("rosterMasterStatus").innerHTML=
+      `<div class="banner ok">September master roster published successfully. `+
+      `${payload.length} source records · ${activeCount} active · ${inactiveCount} inactive/attrited.`+
+      `${obsolete.length ? ` ${obsolete.length} older record(s) across the uploaded branch(es) were preserved and marked inactive.` : ""}`+
+      `${corrections.length ? " TL name normalization: "+corrections.join(" · ")+".":""}`+
+      ` Login access was not required.</div>`;
+
+    await loadRosterAdmin();
+    btn.textContent="Published";
+  }catch(err){
+    console.error(err);
+    $("rosterMasterStatus").innerHTML=
+      `<div class="banner err">Master roster publish stopped: ${escapeHtml(err.message||String(err))}</div>`;
+    btn.disabled=false;
+    btn.textContent="Publish Master Roster";
+  }
+}
+
+$("rosterMasterFile").onchange=async e=>{const f=e.target.files?.[0];if(!f)return;try{$("rosterMasterStatus").innerHTML='<div class="banner warn">Reading master roster…</div>';await parseMasterRosterWorkbook(f);$("rosterMasterStatus").innerHTML='<div class="banner ok">Master roster parsed. Review the preview before publishing.</div>';}catch(err){console.error(err);$("rosterMasterStatus").innerHTML=`<div class="banner err">Master roster read stopped: ${escapeHtml(err.message||String(err))}</div>`;}};
+$("rosterMasterDrop").onclick=()=>$("rosterMasterFile").click();
+$("rosterMasterDrop").ondragover=e=>{e.preventDefault();$("rosterMasterDrop").classList.add("drag")};
+$("rosterMasterDrop").ondragleave=()=>$("rosterMasterDrop").classList.remove("drag");
+$("rosterMasterDrop").ondrop=async e=>{e.preventDefault();$("rosterMasterDrop").classList.remove("drag");const f=e.dataTransfer.files?.[0];if(!f)return;try{$("rosterMasterStatus").innerHTML='<div class="banner warn">Reading master roster…</div>';await parseMasterRosterWorkbook(f);$("rosterMasterStatus").innerHTML='<div class="banner ok">Master roster parsed. Review the preview before publishing.</div>';}catch(err){console.error(err);$("rosterMasterStatus").innerHTML=`<div class="banner err">Master roster read stopped: ${escapeHtml(err.message||String(err))}</div>`;}};
+$("rosterMasterClear").onclick=clearMasterRosterPreview;
+$("rosterMasterPublish").onclick=publishMasterRoster;
+
+
+/* Alpha 5 Increment: WFM Intraday Command Center */
+let wfmCommandState = {
+  selectedBranch: "ALL",
+  rows: [],
+  versions: {},
+  intervals: [],
+  loadedAt: null,
+  timer: null
+};
+let wfmAgentFilter = "ALL";
+let wfmSelectedUpcomingKey = null;
+let wfmUpcomingGroups = [];
+let wfmAgentItemsCache = [];
+
+function wfmBranchLabel(key){
+  if(key==="ALL") return "ALL CCAC";
+  return branchLabel(key)||key;
+}
+function wfmStatusClass(status){
+  const s=String(status||"").toUpperCase();
+  if(s==="CALL") return "call";
+  if(s==="BREAK") return "break";
+  if(s==="LUNCH") return "lunch";
+  if(s==="OFF" || s==="VL" || s==="ML" || s==="SL" || s==="NO SCHEDULE" || s==="UNSCHEDULED") return "off";
+  if(s==="BOP" || s==="TRAINING" || s==="MEETING" || s) return "other";
+  return "none";
+}
+function wfmActivityLabel(activityType){
+  const s=String(activityType||"").trim().toUpperCase();
+  if(!s)return "";
+  if(s.includes("BREAK"))return "BREAK";
+  if(s.includes("LUNCH"))return "LUNCH";
+  return s;
+}
+function wfmTimeToMinutes(value){
+  if(value==null)return null;
+  const m=String(value).slice(0,5).match(/^(\d{1,2}):(\d{2})$/);
+  if(!m)return null;
+  const h=Number(m[1]), mins=Number(m[2]);
+  if(h<0||h>23||mins<0||mins>59)return null;
+  return h*60+mins;
+}
+function wfmMinutesToTime(mins){
+  const m=((Number(mins)||0)%1440+1440)%1440;
+  let h=Math.floor(m/60),mm=m%60;
+  const ap=h>=12?"PM":"AM"; h=h%12||12;
+  return `${String(h).padStart(2,"0")}:${String(mm).padStart(2,"0")} ${ap}`;
+}
+// Alpha 10 enhancement: interval size is configurable without changing schedule data.
+let wfmIntervalMinutes=30;
+function wfmFloorInterval(mins){ return Math.floor(mins/wfmIntervalMinutes)*wfmIntervalMinutes; }
+function wfmCeilInterval(mins){ return Math.ceil(mins/wfmIntervalMinutes)*wfmIntervalMinutes; }
+function wfmFloor30(mins){ return Math.floor(mins/30)*30; }
+function wfmCeil30(mins){ return Math.ceil(mins/30)*30; }
+function wfmCurrentMinutes(){
+  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date());
+  const get=t=>Number(parts.find(x=>x.type===t)?.value||0);
+  return get("hour")*60+get("minute");
+}
+function wfmCurrentIntervalStart(){ return wfmFloorInterval(wfmCurrentMinutes()); }
+function wfmIntervalLabel(start){ return `${wfmMinutesToTime(start)} – ${wfmMinutesToTime(start+wfmIntervalMinutes)}`; }
+function wfmIntervalContains(start, minutes){ return minutes>=start && minutes<start+wfmIntervalMinutes; }
+function wfmIntervalOverlap(aStart,aEnd,bStart,bEnd){ return aStart<bEnd && aEnd>bStart; }
+function wfmNormalizeScheduleStatus(value){
+  const s=String(value||"").trim().toUpperCase();
+  if(s==="WORKING")return "WORKING";
+  if(["OFF","VL","ML","SL","PTO","LEAVE","HOLIDAY"].includes(s))return s;
+  return s||"NO SCHEDULE";
+}
+function wfmRowStatusForInterval(row, intervalStart){
+  const intervalEnd=intervalStart+wfmIntervalMinutes;
+  const status=wfmNormalizeScheduleStatus(row.schedule?.schedule_status);
+  if(status!=="WORKING") return {status,activity:null};
+  const shiftStart=wfmTimeToMinutes(row.schedule?.shift_start), shiftEnd=wfmTimeToMinutes(row.schedule?.shift_end);
+  if(shiftStart==null||shiftEnd==null||!wfmIntervalOverlap(shiftStart,shiftEnd,intervalStart,intervalEnd)) return {status:"UNSCHEDULED",activity:null};
+  const acts=(row.activities||[]).filter(a=>{
+    const s=wfmTimeToMinutes(a.start_time),e=wfmTimeToMinutes(a.end_time); return s!=null&&e!=null&&wfmIntervalOverlap(s,e,intervalStart,intervalEnd);
+  }).sort((a,b)=>(wfmTimeToMinutes(a.start_time)||0)-(wfmTimeToMinutes(b.start_time)||0));
+  if(acts.length){
+    const label=wfmActivityLabel(acts[0].activity_type);
+    return {status:label||"OTHER",activity:acts[0]};
+  }
+  return {status:"CALL",activity:null};
+}
+function wfmPersonHtml(row, status){
+  return `<div class="wfm-person"><div><div class="name">${escapeHtml(row.name||"—")}</div><div class="meta">${escapeHtml(row.employee_id||"—")} · ${escapeHtml(wfmBranchLabel(row.branch))}</div></div><span class="wfm-status-pill ${wfmStatusClass(status)}">${escapeHtml(status)}</span></div>`;
+}
+function wfmSetList(id,rows,status){
+  const el=$(id); if(!el)return;
+  el.innerHTML=rows.length?rows.map(r=>wfmPersonHtml(r,status)).join(""):`<div class="wfm-empty">No employees scheduled in this status for the interval.</div>`;
+}
+function wfmBuildIntervals(rows){
+  const starts=[];
+  rows.forEach(r=>{
+    const ss=wfmTimeToMinutes(r.schedule?.shift_start), se=wfmTimeToMinutes(r.schedule?.shift_end);
+    if(ss!=null&&se!=null){starts.push(wfmFloorInterval(ss-wfmIntervalMinutes),wfmCeilInterval(se+wfmIntervalMinutes));}
+    (r.activities||[]).forEach(a=>{
+      const s=wfmTimeToMinutes(a.start_time),e=wfmTimeToMinutes(a.end_time);
+      if(s!=null&&e!=null){starts.push(wfmFloorInterval(s),wfmCeilInterval(e));}
+    });
+  });
+  if(!starts.length){
+    const c=wfmCurrentIntervalStart(); return Array.from({length:Math.ceil(720/wfmIntervalMinutes)},(_,i)=>c-360+i*wfmIntervalMinutes);
+  }
+  let min=Math.max(0,Math.min(...starts)), max=Math.min(1440,Math.max(...starts));
+  if(max-min<360){const c=wfmCurrentIntervalStart();min=Math.max(0,wfmFloorInterval(c-180));max=Math.min(1440,wfmCeilInterval(c+360));}
+  const out=[];for(let x=min;x<max;x+=wfmIntervalMinutes)out.push(x);return out;
+}
+function wfmSelectedRows(){
+  return wfmCommandState.selectedBranch==="ALL"?wfmCommandState.rows:wfmCommandState.rows.filter(r=>r.branch===wfmCommandState.selectedBranch);
+}
+function wfmIsOffStatus(status){
+  return ["UNSCHEDULED","NO SCHEDULE","OFF","VL","ML","SL","PTO","LEAVE","HOLIDAY"].includes(String(status||"").toUpperCase());
+}
+function wfmDisplayStatus(status){
+  const s=String(status||"").toUpperCase();
+  if(s==="CALL")return "Calls";
+  if(s==="BREAK")return "Break";
+  if(s==="LUNCH")return "Lunch";
+  if(wfmIsOffStatus(s))return s==="UNSCHEDULED"||s==="NO SCHEDULE"?"Not scheduled":s;
+  return s.replaceAll("_"," ")||"Other";
+}
+function wfmAgentBucket(status){
+  const s=String(status||"").toUpperCase();
+  if(s==="CALL"||s==="BREAK"||s==="LUNCH")return s;
+  return wfmIsOffStatus(s)?"OFF":"OTHER";
+}
+function wfmCompactIntervalLabel(start){return wfmIntervalLabel(start).replace(/\s+–\s+/,'–');}
+function wfmPct(count,total){return total?`${Math.round(count/total*1000)/10}% of scheduled`:"0% of scheduled";}
+function wfmFormatCurrentDate(){
+  const value=phtDate();
+  const d=new Date(`${value}T12:00:00+08:00`);
+  return Number.isNaN(d.getTime())?value:new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",month:"short",day:"numeric"}).format(d);
+}
+function wfmStatusIconName(status){
+  const s=String(status||"").toUpperCase();
+  if(s==="CALL")return "headset";
+  if(s==="BREAK")return "coffee";
+  if(s==="LUNCH")return "utensils";
+  return "calendar-clock";
+}
+function wfmRenderAgentRoster(){
+  const body=$("wfmAgentTableBody");
+  if(!body)return;
+  const selectedGroup=wfmUpcomingGroups.find(g=>g.key===wfmSelectedUpcomingKey)||null;
+  if(wfmSelectedUpcomingKey&&!selectedGroup)wfmSelectedUpcomingKey=null;
+  const selectedIds=selectedGroup?new Set(selectedGroup.rows.map(r=>String(r.employee_id||""))):null;
+  let list=selectedGroup
+    ? wfmAgentItemsCache.filter(item=>selectedIds.has(String(item.row.employee_id||"")))
+    : wfmAgentItemsCache.filter(item=>!wfmIsOffStatus(item.status));
+  if(wfmAgentFilter!=="ALL")list=list.filter(item=>wfmAgentBucket(item.status)===wfmAgentFilter);
+  const input=$("wfmAgentSearch");
+  const query=String(input?.value||"").trim().toLocaleLowerCase();
+  if(query)list=list.filter(item=>[
+    item.row.name,item.row.employee_id,item.row.branch,item.row.lob,item.row.group_name,item.row.subgroup,item.row.team_leader
+  ].some(value=>String(value||"").toLocaleLowerCase().includes(query)));
+  list.sort((a,b)=>String(a.row.name||"").localeCompare(String(b.row.name||"")));
+  const totalScheduled=wfmAgentItemsCache.filter(item=>!wfmIsOffStatus(item.status)).length;
+  const allCounts={ALL:totalScheduled,CALL:0,BREAK:0,LUNCH:0,OTHER:0};
+  wfmAgentItemsCache.filter(item=>!wfmIsOffStatus(item.status)).forEach(item=>{allCounts[wfmAgentBucket(item.status)]++;});
+  const countIds={ALL:"wfmCountAll",CALL:"wfmCountCall",BREAK:"wfmCountBreak",LUNCH:"wfmCountLunch",OTHER:"wfmCountOther"};
+  Object.entries(countIds).forEach(([key,id])=>{const el=$(id);if(el)el.textContent=allCounts[key]??0;});
+  document.querySelectorAll("[data-wfm-agent-filter]").forEach(btn=>btn.classList.toggle("active",btn.dataset.wfmAgentFilter===wfmAgentFilter));
+  const focus=$("wfmAgentFocus");
+  if(focus){
+    focus.hidden=!selectedGroup;
+    if(selectedGroup){
+      const focusText=$("wfmAgentFocusText");
+      if(focusText)focusText.textContent=`${wfmDisplayStatus(selectedGroup.label)} at ${wfmMinutesToTime(selectedGroup.start)} · ${selectedGroup.rows.length} affected agent${selectedGroup.rows.length===1?"":"s"}`;
+    }
+  }
+  const resultLabel=$("wfmAgentResultsCount");
+  if(resultLabel)resultLabel.textContent=`${list.length} shown`;
+  if(!list.length){
+    body.innerHTML=`<tr><td colspan="3" class="wfm-agent-empty">${query?"No agents match your search.":selectedGroup?"No affected agents match the current filter.":"No agents match this activity filter in the current interval."}</td></tr>`;
+    return;
+  }
+  body.innerHTML=list.map(item=>{
+    const r=item.row,status=item.status,bucket=wfmAgentBucket(status);
+    const statusClass=bucket==="CALL"?"call":bucket==="BREAK"?"break":bucket==="LUNCH"?"lunch":bucket==="OTHER"?"other":"off";
+    const label=wfmDisplayStatus(status);
+    const rowId=String(r.employee_id||"");
+    return `<tr tabindex="0" role="button" aria-label="Locate ${escapeHtml(r.name||"agent")} in the intraday schedule" data-wfm-agent-id="${escapeHtml(rowId)}"><td><span class="wfm-agent-name">${escapeHtml(r.name||"—")}</span><span class="wfm-agent-id">${escapeHtml(rowId||"—")}</span></td><td>${escapeHtml(wfmBranchLabel(r.branch))}</td><td><span class="wfm-agent-status ${statusClass}">${escapeHtml(label)}</span></td></tr>`;
+  }).join("");
+}
+function wfmUpcomingGroupHtml(group,index){
+  const selected=group.key===wfmSelectedUpcomingKey;
+  const bucket=wfmAgentBucket(group.label);
+  const rail=bucket==="BREAK"?"#d97706":bucket==="LUNCH"?"#c95624":bucket==="CALL"?"#059669":"#4169d8";
+  const shown=group.rows.slice(0,2).map(r=>r.name||r.employee_id||"Agent");
+  const extra=Math.max(0,group.rows.length-shown.length);
+  const label=String(group.label||"OTHER");
+  const summary=shown.join(" · ")+(extra?` · +${extra} more`:"");
+  return `<button type="button" class="wfm-upcoming-item${selected?" selected":""}" data-wfm-upcoming-key="${escapeHtml(group.key)}" aria-pressed="${selected}"><span class="wfm-upcoming-rail" style="background:${rail}"></span><span class="wfm-upcoming-body"><span class="wfm-upcoming-time">${escapeHtml(wfmMinutesToTime(group.start))} · ${group.rows.length} agent${group.rows.length===1?"":"s"}</span><span class="wfm-upcoming-kind">${escapeHtml(label)}</span><span class="wfm-upcoming-names">${escapeHtml(summary||"Scheduled agents")}</span><span class="wfm-upcoming-meta">Select to inspect affected agents</span></span></button>`;
+}
+function wfmRenderNow(){
+  const rows=wfmSelectedRows(),start=wfmCurrentIntervalStart(),next=start+wfmIntervalMinutes;
+  const bucketCounts={CALL:0,BREAK:0,LUNCH:0,OTHER:0};
+  wfmAgentItemsCache=rows.map(row=>({row,status:wfmRowStatusForInterval(row,start).status}));
+  wfmAgentItemsCache.forEach(item=>{const bucket=wfmAgentBucket(item.status);if(bucket!=="OFF")bucketCounts[bucket]++;});
+  const scheduled=bucketCounts.CALL+bucketCounts.BREAK+bucketCounts.LUNCH+bucketCounts.OTHER;
+  $("wfmCurrentInterval").textContent=wfmCompactIntervalLabel(start);
+  $("wfmCurrentSub").textContent="Current PHT interval · published schedule";
+  $("wfmCurrentDate").textContent=wfmFormatCurrentDate();
+  $("wfmCurrentScheduled").textContent=scheduled;
+  $("wfmCallsCount").textContent=bucketCounts.CALL;
+  $("wfmBreakCount").textContent=bucketCounts.BREAK;
+  $("wfmLunchCount").textContent=bucketCounts.LUNCH;
+  $("wfmOtherCount").textContent=bucketCounts.OTHER;
+  $("wfmCallsMeta").textContent=wfmPct(bucketCounts.CALL,scheduled);
+  $("wfmBreakMeta").textContent=wfmPct(bucketCounts.BREAK,scheduled);
+  $("wfmLunchMeta").textContent=wfmPct(bucketCounts.LUNCH,scheduled);
+  $("wfmOtherMeta").textContent=wfmPct(bucketCounts.OTHER,scheduled);
+  $("wfmStatusHeader").textContent=`${wfmBranchLabel(wfmCommandState.selectedBranch)} · current interval roster`;
+
+  const nextBuckets={CALL:0,BREAK:0,LUNCH:0,OTHER:0};
+  rows.forEach(row=>{
+    const status=wfmRowStatusForInterval(row,next).status,bucket=wfmAgentBucket(status);
+    if(bucket!=="OFF")nextBuckets[bucket]++;
+  });
+  const nextTotal=nextBuckets.CALL+nextBuckets.BREAK+nextBuckets.LUNCH+nextBuckets.OTHER;
+  $("wfmNextInterval").textContent=wfmCompactIntervalLabel(next);
+  $("wfmNextScheduled").textContent=nextTotal;
+  $("wfmNextMeta").textContent=`${nextBuckets.CALL} calls · ${nextBuckets.BREAK} break · ${nextBuckets.LUNCH} lunch · ${nextBuckets.OTHER} other`;
+  const dist=$("wfmNextDistBar");
+  if(dist){
+    const segments=[{label:"Calls",count:nextBuckets.CALL,color:"#059669"},{label:"Break",count:nextBuckets.BREAK,color:"#d97706"},{label:"Lunch",count:nextBuckets.LUNCH,color:"#c95624"},{label:"Other",count:nextBuckets.OTHER,color:"#4169d8"}];
+    dist.innerHTML=segments.filter(x=>x.count>0).map(x=>`<span class="wfm-dist-segment" title="${x.label}: ${x.count}" style="width:${nextTotal?x.count/nextTotal*100:0}%;background:${x.color}"></span>`).join("");
+    dist.setAttribute("aria-label",segments.map(x=>`${x.count} ${x.label.toLowerCase()}`).join(", "));
+  }
+
+  const groupMap=new Map();
+  const horizon=Math.min(next+240,1440);
+  rows.forEach(row=>{
+    (row.activities||[]).forEach(activity=>{
+      const at=wfmTimeToMinutes(activity.start_time);
+      if(at==null||at<next||at>=horizon)return;
+      const label=wfmActivityLabel(activity.activity_type)||"OTHER";
+      const key=`${at}|${label}`;
+      if(!groupMap.has(key))groupMap.set(key,{key,start:at,label,rows:[]});
+      const group=groupMap.get(key);
+      if(!group.rows.some(r=>String(r.employee_id||"")===String(row.employee_id||"")))group.rows.push(row);
+    });
+  });
+  wfmUpcomingGroups=[...groupMap.values()].sort((a,b)=>a.start-b.start||a.label.localeCompare(b.label));
+  if(wfmSelectedUpcomingKey&&!wfmUpcomingGroups.some(g=>g.key===wfmSelectedUpcomingKey))wfmSelectedUpcomingKey=null;
+  const upList=$("wfmUpcomingList");
+  if(upList){
+    if(!wfmUpcomingGroups.length){
+      upList.innerHTML='<div class="wfm-upcoming-empty">No upcoming scheduled transitions found in the next four hours for this view.</div>';
+    }else{
+      const items=wfmUpcomingGroups.slice(0,4);
+      upList.innerHTML=items.map((group,index)=>`${index===1?'<div class="wfm-upcoming-section-label">Following transitions</div>':''}${wfmUpcomingGroupHtml(group,index)}`).join("")+(wfmUpcomingGroups.length>4?`<div class="wfm-upcoming-meta">+${wfmUpcomingGroups.length-4} more transition groups in the published schedule</div>`:"");
+    }
+  }
+  $("wfmNextBreaks").textContent="Upcoming activities";
+  $("wfmNextBreaksMeta").textContent="Next scheduled transitions · select one to inspect its agents";
+  wfmRenderAgentRoster();
+}
+
+const WFM_ABSENCE_CUTOFF_MINUTES = 30;
+// Reuse WorkSync's existing archived Intalk attendance checks; never fabricate login times.
+let wfmArchivedAttendanceByEid = new Map();
+let wfmAttendanceArchiveDate = "";
+let wfmAttendanceArchiveState = "not-loaded";
+async function wfmLoadArchivedAttendance(date=phtDate()){
+  wfmArchivedAttendanceByEid = new Map();
+  wfmAttendanceArchiveDate = date;
+  wfmAttendanceArchiveState = "loading";
+  try{
+    const {data:snaps,error}=await sb.from("attendance_snapshots")
+      .select("id,lob,session,created_at,is_latest")
+      .eq("snapshot_date",date).eq("is_latest",true).order("created_at",{ascending:false});
+    if(error) throw error;
+    const latestByLob=new Map();
+    (snaps||[]).forEach(x=>{if(!latestByLob.has(x.lob))latestByLob.set(x.lob,x)});
+    const chosen=[...latestByLob.values()];
+    if(!chosen.length){wfmAttendanceArchiveState="no-check";return;}
+    const recs=await fetchAllArchiveRecords(chosen.map(x=>x.id));
+    recs.forEach(rec=>{
+      const key=String(rec.employee_id||"").trim().toUpperCase();
+      if(key)wfmArchivedAttendanceByEid.set(key,rec);
+    });
+    wfmAttendanceArchiveState="ready";
+  }catch(err){
+    console.warn("Command Center attendance archive load failed",err);
+    wfmAttendanceArchiveState="unavailable";
+  }
+}
+function wfmParseClockMinutes(value){if(value==null||value==="")return null;const m=String(value).trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);if(!m)return null;let h=+m[1],mi=+m[2],ap=(m[3]||"").toUpperCase();if(ap==="PM"&&h<12)h+=12;if(ap==="AM"&&h===12)h=0;if(!ap&&h>23)return null;return h*60+mi;}
+function wfmAttendanceForRow(r){
+ const st=String(r.schedule?.schedule_status||r.schedule_status||r.status||"").toUpperCase();
+ if(/OFF|REST|VL|SL|ML|LEAVE|HOLIDAY/.test(st))return {key:"off",label:"OFF",title:"Not scheduled to work today."};
+ const id=String(r.employee_id||"").trim().toUpperCase();
+ const archived=wfmAttendanceArchiveDate===phtDate()?wfmArchivedAttendanceByEid.get(id):null;
+ const start=wfmParseClockMinutes(r.schedule?.shift_start||r.shift_start);
+ if(archived){
+   const st=String(archived.status||"");
+   const login=archived.first_login?String(archived.first_login).slice(0,5):"not captured";
+   const diff=archived.diff_minutes;
+   if(st==="Tardy")return {key:"tardy",label:"TARDY",title:`Scheduled ${archived.scheduled_shift|| (start==null?"start unavailable":wfmMinutesToTime(start))} · captured login ${login}${diff!=null?` · ${diff} minute(s) late`:""}; stays tardy for this shift.`};
+   if(st==="Present - on time"||st==="Early - outside window")return {key:"present",label:"PRESENT",title:`Attendance check: ${st} · captured login ${login}.`};
+   if(st==="Absent - no login")return {key:"absent",label:"ABSENT",title:"Attendance check recorded no login by the report cutoff. Verify exceptions if needed."};
+   if(st==="Not yet due")return {key:"pending",label:"AWAITING LOGIN",title:"Latest attendance check says not yet due; rerun the check after the cutoff."};
+   if(/OFF|VL|SL|ML|leave|exception/i.test(st))return {key:"off",label:"OFF / EXCEPTION",title:`Attendance archive status: ${st}.`};
+   return {key:"unknown",label:st.toUpperCase()||"REVIEW",title:`Attendance archive status: ${st||"unclassified"}.`};
+ }
+ if(wfmAttendanceArchiveState==="unavailable")return {key:"unknown",label:"ATTENDANCE UNAVAILABLE",title:"Could not load today's saved attendance history. Check console or refresh."};
+ if(wfmAttendanceArchiveState==="no-check")return {key:"unknown",label:"RUN ATTENDANCE CHECK",title:"No saved attendance check found for today. Run the existing Intalk Login vs Schedule brief to populate indicators."};
+ return {key:"unknown",label:"ATTENDANCE LOADING",title:"Loading today's saved attendance check."};
+}
+function wfmRenderTimeline(){
+  const rows=wfmSelectedRows();
+  const intervals=wfmCommandState.intervals;
+  const head=$("wfmTimelineHead"),body=$("wfmTimelineBody"); if(!head||!body)return;
+  head.innerHTML=`<tr><th>Employee / Attendance</th>${intervals.map(start=>`<th>${wfmMinutesToTime(start)}</th>`).join("")}</tr>`;
+  if(!rows.length){body.innerHTML=`<tr><td colspan="${intervals.length+1}" style="padding:24px;color:#667a91;text-align:center">No roster/schedule rows were found for ${escapeHtml(wfmBranchLabel(wfmCommandState.selectedBranch))} today.</td></tr>`;return;}
+  const now=wfmCurrentMinutes();
+  body.innerHTML=rows.slice().sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""))).map(r=>{
+    const cells=intervals.map(start=>{
+      const x=wfmRowStatusForInterval(r,start), cls=wfmStatusClass(x.status); 
+      const current=wfmIntervalContains(start,now);
+      const label=x.status==="CALL"?"CALLS":x.status==="UNSCHEDULED"?"—":x.status;
+      return `<td class="wfm-cell"><div class="wfm-block ${cls}" title="${escapeHtml(r.name||"")} · ${escapeHtml(wfmIntervalLabel(start))} · ${escapeHtml(x.status)}">${escapeHtml(label)}${current?'<span class="wfm-current-line"></span><span class="wfm-current-dot"></span>':''}</div></td>`;
+    }).join("");
+    const att=wfmAttendanceForRow(r); return `<tr data-employee-id="${escapeHtml(r.employee_id||"")}"><td><div class="wfm-row-name">${escapeHtml(r.name||"—")} <span class="wfm-attendance-dot ${att.key}" title="${escapeHtml(att.title)}" aria-label="${escapeHtml(att.label)}"></span></div><div class="wfm-row-id">${escapeHtml(r.employee_id||"—")}</div><div class="wfm-row-branch">${escapeHtml(wfmBranchLabel(r.branch))}</div><div class="wfm-attendance-label ${att.key}">${escapeHtml(att.label)}</div></td>${cells}</tr>`;
+  }).join("");
+  $("wfmCoverageMeta").textContent=`${rows.length} roster rows · ${intervals.length} intervals`;
+  const noSchedule=rows.filter(r=>!r.schedule).length;
+  const noActivities=rows.filter(r=>r.schedule&&!r.activities.length).length;
+  $("wfmExceptions").textContent=noSchedule?`${noSchedule} employee(s) have no published daily schedule for today; they remain visible but are not counted as scheduled.`:"All selected roster rows have a published daily schedule today.";
+}
+function wfmRenderHeader(){
+  document.querySelectorAll("#wfmBranchBar .wfm-branch-btn").forEach(btn=>btn.classList.toggle("active",btn.dataset.wfmBranch===wfmCommandState.selectedBranch));
+  $("wfmFilterSummary").innerHTML=`<span class="tag">${escapeHtml(wfmBranchLabel(wfmCommandState.selectedBranch))}</span><span class="tag">${escapeHtml(phtDate())} · PHT</span>`;
+  const version=wfmCommandState.selectedBranch==="ALL"?Object.values(wfmCommandState.versions).filter(Boolean)[0]:wfmCommandState.versions[wfmCommandState.selectedBranch];
+  $("wfmVersionBadge").textContent=version?`Published · v${version.version_number??"—"} · ${version.week_start} → ${version.week_end}`:"Published schedule · none found";
+  $("wfmLastRefresh").textContent=wfmCommandState.loadedAt?`Last refreshed ${new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",hour:"numeric",minute:"2-digit",second:"2-digit"}).format(wfmCommandState.loadedAt)} PHT`:"Last refreshed —";
+  $("wfmStatusHeader").textContent=`${wfmBranchLabel(wfmCommandState.selectedBranch)} · current interval roster`;
+}
+async function wfmFetchBranch(branch){
+  const today=phtDate();
+  const {data:version,error:ve}=await getPublishedVersionForDate(today,branch);
+  if(ve)throw ve;
+  if(!version)return {version:null,rows:[]};
+  const {data:roster,error:re}=await sb.from("roster")
+    .select("employee_id,name,group_name,subgroup,team_leader,active,lob")
+    .eq("active",true).eq("lob",branch).order("name");
+  if(re)throw re;
+  const ids=(roster||[]).map(x=>x.employee_id).filter(Boolean);
+  let schedules=[];
+  if(ids.length){
+    const {data:s,error:se}=await sb.from("schedules")
+      .select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id")
+      .eq("schedule_version_id",version.id).eq("schedule_date",today).in("employee_id",ids);
+    if(se)throw se;schedules=s||[];
+  }
+  const byEmployee=new Map(schedules.map(s=>[s.employee_id,s]));
+  const scheduleIds=schedules.map(s=>s.id).filter(Boolean);
+  let activities=[];
+  if(scheduleIds.length){
+    const {data:a,error:ae}=await sb.from("schedule_activities").select("schedule_id,activity_type,start_time,end_time").in("schedule_id",scheduleIds).order("start_time");
+    if(ae)throw ae;activities=a||[];
+  }
+  const actsBySchedule=new Map();activities.forEach(a=>{if(!actsBySchedule.has(a.schedule_id))actsBySchedule.set(a.schedule_id,[]);actsBySchedule.get(a.schedule_id).push(a);});
+  const rows=(roster||[]).map(m=>({
+    employee_id:m.employee_id,name:m.name,group_name:m.group_name,subgroup:m.subgroup,team_leader:m.team_leader,lob:m.lob,branch,
+    schedule:byEmployee.get(m.employee_id)||null,
+    activities:(byEmployee.get(m.employee_id)?actsBySchedule.get(byEmployee.get(m.employee_id).id)||[]:[])
+  }));
+  return {version,rows};
+}
+async function loadWFMCommandCenter(force=false){
+  if(effectiveBranch()!=="wfm")return;
+  const head=document.getElementById("wfmCommandCenterView"); if(!head)return;
+  try{
+    if(force || !wfmCommandState.loadedAt){
+      const branchKeys=allBranchKeys();
+      const results=await Promise.all(branchKeys.map(async b=>({b,data:await wfmFetchBranch(b)})));
+      wfmCommandState.rows=results.flatMap(x=>x.data.rows);
+      wfmCommandState.versions=Object.fromEntries(results.map(x=>[x.b,x.data.version]).filter(x=>x[1]));
+      wfmCommandState.intervals=wfmBuildIntervals(wfmCommandState.rows);
+      wfmCommandState.loadedAt=new Date();
+    }
+    await wfmLoadArchivedAttendance(phtDate());
+    wfmRenderHeader();wfmRenderNow();wfmRenderTimeline();
+    if(!wfmCommandState.timer){
+      wfmCommandState.timer=setInterval(()=>{
+        if(!document.getElementById("wfmCommandCenterView")?.classList.contains("active")||userIsScrolling())return;
+        wfmRenderHeader();wfmRenderNow();wfmRenderTimeline();
+      },15000);
+    }
+  }catch(err){
+    console.error("WFM Command Center load failed",err);
+    $("wfmVersionBadge").textContent="Schedule load error";
+    $("wfmLastRefresh").textContent=err?.message||String(err);
+    $("wfmTimelineBody").innerHTML=`<tr><td colspan="30" style="padding:24px;text-align:center;color:#c33c3c">Could not load the published WFM schedule: ${escapeHtml(err?.message||String(err))}</td></tr>`;
+  }
+}
+
+const wfmIntervalSelector=$("wfmIntervalSize");
+if(wfmIntervalSelector){
+  wfmIntervalSelector.addEventListener("change",()=>{
+    const nextSize=Number(wfmIntervalSelector.value);
+    if(nextSize!==15 && nextSize!==30){wfmIntervalSelector.value=String(wfmIntervalMinutes);return;}
+    wfmIntervalMinutes=nextSize;
+    const help=$("wfmIntervalHelp");if(help)help.textContent=`${wfmIntervalMinutes}-minute scheduled interval view · scroll horizontally for the full day`;
+    wfmCommandState.intervals=wfmBuildIntervals(wfmCommandState.rows||[]);
+    wfmRenderHeader();wfmRenderNow();wfmRenderTimeline();
+  });
+}
+
+document.querySelectorAll("#wfmBranchBar .wfm-branch-btn").forEach(btn=>btn.addEventListener("click",()=>{
+  wfmCommandState.selectedBranch=btn.dataset.wfmBranch||"ALL";
+  wfmSelectedUpcomingKey=null;wfmAgentFilter="ALL";
+  wfmRenderHeader();wfmRenderNow();wfmRenderTimeline();
+}));
+
+// Incremental dashboard interactions: search, activity filters, upcoming focus, and map cross-link.
+$("wfmAgentSearch")?.addEventListener("input",()=>wfmRenderAgentRoster());
+document.querySelectorAll("[data-wfm-agent-filter]").forEach(btn=>btn.addEventListener("click",()=>{
+  wfmAgentFilter=btn.dataset.wfmAgentFilter||"ALL";
+  wfmRenderAgentRoster();
+}));
+$("wfmUpcomingList")?.addEventListener("click",event=>{
+  const button=event.target.closest("[data-wfm-upcoming-key]");
+  if(!button)return;
+  const key=button.dataset.wfmUpcomingKey;
+  wfmSelectedUpcomingKey=wfmSelectedUpcomingKey===key?null:key;
+  wfmAgentFilter="ALL";
+  wfmRenderAgentRoster();
+  $("wfmUpcomingList")?.querySelectorAll("[data-wfm-upcoming-key]").forEach(el=>{
+    const selected=el.dataset.wfmUpcomingKey===wfmSelectedUpcomingKey;
+    el.classList.toggle("selected",selected);el.setAttribute("aria-pressed",String(selected));
+  });
+});
+document.querySelector("#wfmAgentFocus [data-wfm-clear-upcoming]")?.addEventListener("click",()=>{
+  wfmSelectedUpcomingKey=null;wfmAgentFilter="ALL";wfmRenderAgentRoster();
+  $("wfmUpcomingList")?.querySelectorAll("[data-wfm-upcoming-key]").forEach(el=>{el.classList.remove("selected");el.setAttribute("aria-pressed","false");});
+});
+$("wfmAgentTableBody")?.addEventListener("click",event=>{
+  const row=event.target.closest("tr[data-wfm-agent-id]");if(!row)return;
+  const employeeId=row.dataset.wfmAgentId||"";
+  const mapRows=[...document.querySelectorAll("#wfmTimelineBody tr[data-employee-id]")];
+  const target=mapRows.find(el=>(el.dataset.employeeId||"")===employeeId);
+  if(!target)return;
+  mapRows.forEach(el=>el.classList.remove("wfm-agent-highlight"));
+  target.classList.add("wfm-agent-highlight");
+  target.scrollIntoView({behavior:"smooth",block:"center",inline:"nearest"});
+});
+$("wfmAgentTableBody")?.addEventListener("keydown",event=>{
+  if(event.key!=="Enter"&&event.key!==" ")return;
+  const row=event.target.closest("tr[data-wfm-agent-id]");if(!row)return;
+  event.preventDefault();row.click();
+});
+$("wfmViewFullSchedule")?.addEventListener("click",()=>{
+  const map=$("wfmIntradayMapPanel");if(!map)return;
+  map.scrollIntoView({behavior:"smooth",block:"start"});
+});
+
+async function refreshDashboard(){
+  const btn=$("refreshDashboardBtn");
+  if(btn){btn.disabled=true;btn.textContent="↻ Refreshing…";}
+  try{
+    const activeView=sessionStorage.getItem("worksync.activeView") || (
+      document.querySelector(".view.active")?.id === "scheduleView" ? "schedule" :
+      document.querySelector(".view.active")?.id === "rosterAdminView" ? "rosterAdmin" :
+      "home"
+    );
+    if(activeView==="wfmCommandCenter"){
+      await loadWFMCommandCenter(true);
+    }else if(activeView==="tlHome"){
+      tlTeamRows=[];
+      await loadTLHome();
+    }else if(activeView==="myTeam"){
+      tlTeamRows=[];
+      await loadMyTeam();
+    }else if(activeView==="omHome" || activeView==="omMyTLs" || activeView==="omDailyStaffing"){
+      omData.tlRows=new Map();
+      await loadOMHome(activeView==="omDailyStaffing"?$("omStaffingDate")?.value:undefined);
+    }else{
+      await loadViewData(activeView);
+    }
+  }catch(err){
+    console.error(err);
+    toast("Dashboard refresh failed: "+(err?.message||err));
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent="↻ Refresh Dashboard";}
+  }
+}
+$("refreshDashboardBtn").onclick=refreshDashboard;
+
+$("refreshScheduleBtn").onclick=async()=>{
+  const btn=$("refreshScheduleBtn");
+  btn.disabled=true;btn.textContent="↻ Refreshing…";
+  try{ await loadScheduleManagement(); }
+  catch(err){ console.error(err); toast("Schedule refresh failed: "+(err?.message||err)); }
+  finally{ btn.disabled=false;btn.textContent="↻ Refresh Schedule"; }
+};
+
+$("refreshRosterBtn").onclick=async()=>{
+  const btn=$("refreshRosterBtn");
+  btn.disabled=true;btn.textContent="↻ Refreshing…";
+  try{ await loadRosterAdmin(); }
+  catch(err){ console.error(err); toast("Roster refresh failed: "+(err?.message||err)); }
+  finally{ btn.disabled=false;btn.textContent="↻ Refresh Roster"; }
+};
+
+
+function initializeScheduleWeekControls(){
+  const start=$("scheduleWeekStart"),end=$("scheduleWeekEnd");
+  if(!start||!end)return;
+  if(start.value&&end.value)return;
+  const today=new Date(`${phtDate()}T00:00:00+08:00`);
+  const day=today.getDay();
+  const mondayOffset=(day===0?-6:1-day);
+  const monday=new Date(today); monday.setDate(monday.getDate()+mondayOffset);
+  const sunday=new Date(monday); sunday.setDate(sunday.getDate()+6);
+  const iso=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),dd=String(d.getDate()).padStart(2,"0");return `${y}-${m}-${dd}`;};
+  start.value=iso(monday); end.value=iso(sunday);
+  if($("scheduleLob")){
+    const configured=String($("scheduleLob").value||"").toUpperCase() || branchKeyFromLabel(WORKSYNC_LOB_KEY) || "CCAC";
+    $("scheduleLob").value=allBranchKeys().includes(configured)?configured:"CCAC";
+  }
+}
+
+async function loadScheduleManagement(){
+  initializeScheduleWeekControls();
+  $("currentScheduleSummary").textContent="Loading the current published schedule…";
+  try{
+    loadPublishedWeeks();
+    // Show the published schedule that is EFFECTIVE today in PHT for the selected branch.
+    const selectedBranch=selectedScheduleBranch();
+    const {data:effectiveVersion,error:ve}=await getCurrentPublishedVersion(phtDate(),selectedBranch);
+    const version=effectiveVersion;
+    if(ve) throw ve;
+    if(!version){
+      $("currentScheduleBadge").textContent="NO PUBLISHED SCHEDULE"; $("currentScheduleBadge").className="access-badge none";
+      $("currentScheduleSummary").textContent="There is no published schedule effective for today in WorkSync yet.";
+      ["currentScheduleVersion","currentScheduleEmployees","currentScheduleRows","currentScheduleActivities"].forEach(id=>$(id).textContent="0");
+      $("currentScheduleMeta").textContent="Upload and publish the official scheduler snapshot below to establish the current effective schedule."; return;
+    }
+    const [{count:rowCount,error:re},{data:scheduleEmployees,error:ee},{data:activitySchedules,error:ae}]=await Promise.all([
+      sb.from("schedules").select("id",{count:"exact",head:true}).eq("schedule_version_id",version.id),
+      sb.from("schedules").select("employee_id").eq("schedule_version_id",version.id),
+      sb.from("schedules").select("id").eq("schedule_version_id",version.id)
+    ]);
+    if(re) throw re; if(ee) throw ee; if(ae) throw ae;
+    const scheduleIds=(activitySchedules||[]).map(x=>x.id).filter(Boolean); let activityCount=0;
+    if(scheduleIds.length){ const {count,error:ac}=await sb.from("schedule_activities").select("id",{count:"exact",head:true}).in("schedule_id",scheduleIds); if(ac) throw ac; activityCount=count||0; }
+    const employeeCount=new Set((scheduleEmployees||[]).map(x=>x.employee_id).filter(Boolean)).size;
+    const publishedAt=version.published_at?new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",dateStyle:"medium",timeStyle:"short"}).format(new Date(version.published_at))+" PHT":"—";
+    $("currentScheduleBadge").textContent="PUBLISHED"; $("currentScheduleBadge").className="access-badge linked";
+    $("currentScheduleSummary").textContent=`Week ${version.week_start||"—"} to ${version.week_end||"—"} · ${version.source_file_name||"Scheduler snapshot"}`;
+    $("currentScheduleVersion").textContent=version.version_number??"—"; $("currentScheduleEmployees").textContent=employeeCount; $("currentScheduleRows").textContent=rowCount||0; $("currentScheduleActivities").textContent=activityCount;
+    $("currentScheduleMeta").textContent=`This is the schedule WorkSync currently treats as authoritative. Published ${publishedAt}. Source: ${version.source_file_name||"—"}.`;
+  }catch(err){
+    console.error("Could not load current published schedule",err); $("currentScheduleBadge").textContent="LOAD ERROR"; $("currentScheduleBadge").className="access-badge none"; $("currentScheduleSummary").textContent="The published schedule could not be loaded."; $("currentScheduleMeta").textContent=err.message||String(err);
+  }
+}
+
+function phtDate(){return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());}
+async function getCurrentPublishedVersion(){
+  const result=await getPublishedVersionForDate(phtDate());
+  return {data:result.data||null,error:result.error||null};
+}
+function fmtTime(t){if(!t)return "—";const parts=String(t).slice(0,5).split(":");let h=Number(parts[0]),m=parts[1];const ap=h>=12?"PM":"AM";h=h%12||12;return `${String(h).padStart(2,"0")}:${m} ${ap}`;}
+
+function scheduleWeekNextBounds(){
+  const base=new Date(`${phtDate()}T00:00:00+08:00`);
+  const day=base.getDay();
+  const daysUntilNextMonday=((8-day)%7)||7;
+  const start=new Date(base); start.setDate(start.getDate()+daysUntilNextMonday);
+  const end=new Date(start); end.setDate(end.getDate()+6);
+  const iso=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return `${y}-${m}-${day}`;};
+  return {start:iso(start),end:iso(end)};
+}
+async function getScheduleLob(){
+  // For an Agent/TL, resolve the published schedule from their own roster branch first.
+  if(currentProfile?.employee_id){
+    const {data}=await sb.from("roster").select("lob").eq("employee_id",currentProfile.employee_id).maybeSingle();
+    if(data?.lob){
+      const branch=branchKeyFromLabel(data.lob);
+      if(allBranchKeys().includes(branch)) return branch;
+    }
+  }
+  const configured=branchKeyFromLabel(WORKSYNC_LOB_KEY);
+  return allBranchKeys().includes(configured)?configured:"CCAC";
+}
+async function getPublishedVersionForDate(targetDate=phtDate(), targetLob){
+  const lob=targetLob===undefined?await getScheduleLob():targetLob;
+  let q=sb.from("schedule_versions")
+    .select("id,version_number,week_start,week_end,published_at,source_file_name,status,lob")
+    .eq("status","published")
+    .lte("week_start",targetDate)
+    .gte("week_end",targetDate)
+    .order("week_start",{ascending:false})
+    .order("published_at",{ascending:false})
+    .limit(1);
+  if(lob) q=q.eq("lob",lob);
+  return await q.maybeSingle();
+}
+async function loadPublishedWeeks(){
+  const body=$("publishedWeeksBody"),summary=$("publishedWeeksSummary");
+  if(!body)return;
+  body.innerHTML='<tr><td colspan="6" style="color:#667a91">Loading…</td></tr>';
+  const selectedLob=($("scheduleLob")?.value||"").trim().toUpperCase() || await getScheduleLob();
+  let q=sb.from("schedule_versions")
+    .select("version_number,week_start,week_end,status,source_file_name,published_at,lob")
+    .eq("status","published")
+    .order("week_start",{ascending:false})
+    .limit(12);
+  if(selectedLob)q=q.eq("lob",selectedLob);
+  const {data,error}=await q;
+  if(error){
+    body.innerHTML=`<tr><td colspan="6">${escapeHtml(error.message||String(error))}</td></tr>`;
+    if(summary)summary.textContent="Could not load published weeks.";
+    return;
+  }
+  const rows=data||[];
+  const today=phtDate();
+  const active=rows.filter(x=>String(x.week_start)<=today && String(x.week_end)>=today).length;
+  const upcoming=rows.filter(x=>String(x.week_start)>today).length;
+  if(summary)summary.textContent=`${rows.length} published week${rows.length===1?"":"s"} · ${active} currently effective · ${upcoming} upcoming${selectedLob?` · ${branchLabel(selectedLob)}`:""}`;
+  if(!rows.length){
+    body.innerHTML='<tr><td colspan="6" style="color:#667a91">No published weeks found for this LOB.</td></tr>';
+    return;
+  }
+  body.innerHTML=rows.map(x=>{
+    const isCurrent=String(x.week_start)<=today && String(x.week_end)>=today;
+    const isUpcoming=String(x.week_start)>today;
+    const label=isCurrent?"CURRENT":isUpcoming?"UPCOMING":"OUTSIDE CURRENT WINDOW";
+    const cls=isCurrent||isUpcoming?"linked":"none";
+    const published=x.published_at?new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",dateStyle:"medium",timeStyle:"short"}).format(new Date(x.published_at))+" PHT":"—";
+    return `<tr><td>${escapeHtml(branchLabel(x.lob||selectedLob)||"—")}</td><td>${escapeHtml(x.week_start||"—")} → ${escapeHtml(x.week_end||"—")}</td><td>${escapeHtml(x.version_number??"—")}</td><td><span class="access-badge ${cls}">${label}</span></td><td>${escapeHtml(x.source_file_name||"—")}</td><td>${escapeHtml(published)}</td></tr>`;
+  }).join("");
+}
+
+
+// ---------------- UI7 Schedule Manager ----------------
+const smState={lob:"CCAC",tl:"",weekStart:null,weekEnd:null,version:null,roster:[],rows:[],actsByScheduleId:new Map(),selectedEmployee:null,selectedDate:null,drafts:{}};
+// UI7 date helpers use UTC calendar arithmetic so the selected Workforce week
+// cannot shift by a day when the browser itself is running outside PHT.
+function smIso(d){return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;}
+function smShiftDate(dateStr,delta){const [y,m,d]=String(dateStr||phtDate()).slice(0,10).split("-").map(Number);const x=new Date(Date.UTC(y,m-1,d));x.setUTCDate(x.getUTCDate()+delta);return smIso(x);}
+function smPhtWeekday(dateStr){const [y,m,d]=String(dateStr||phtDate()).slice(0,10).split("-").map(Number);return new Date(Date.UTC(y,m-1,d)).getUTCDay();}
+function smMonday(dateStr){const base=String(dateStr||phtDate()).slice(0,10);const day=smPhtWeekday(base);return smShiftDate(base,day===0?-6:1-day);}
+function smMoveWeek(delta){smState.weekStart=smShiftDate(smState.weekStart,delta*7);smState.weekEnd=smShiftDate(smState.weekStart,6);}
+function smFmtWeek(){if(!smState.weekStart)return "—";const a=new Date(`${smState.weekStart}T12:00:00+08:00`),b=new Date(`${smState.weekEnd}T12:00:00+08:00`);return `${a.toLocaleDateString("en-US",{month:"short",day:"numeric",timeZone:"Asia/Manila"})} – ${b.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric",timeZone:"Asia/Manila"})}`;}
+function smStatusClass(status){const s=String(status||"").toUpperCase();if(s==="WORKING")return "duty";if(s==="ML")return "ml";if(s==="SL")return "sl";if(s==="OFF")return "off";return "blank";}
+function smStatusLabel(status){const s=String(status||"").toUpperCase();return s==="WORKING"?"ON DUTY":s||"NOT PUBLISHED";}
+function smDateAt(i){return smShiftDate(smState.weekStart,i);}
+function smDayLabel(dateStr){return new Date(`${dateStr}T12:00:00+08:00`).toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric",timeZone:"Asia/Manila"});}
+function smFindRow(employeeId,date){
+  const target=String(employeeId||"").trim().toUpperCase();
+  return smState.rows.find(r=>String(r.employee_id||"").trim().toUpperCase()===target && String(r.schedule_date).slice(0,10)===date)||null;
+}
+function smTeamMembers(){return smState.roster.filter(r=>String(r.team_leader||"").trim()===smState.tl).filter(r=>r.active!==false);}
+function smDraftKey(){return `${smState.version?.id||"noversion"}|${smState.selectedEmployee||""}|${smState.selectedDate||""}`;}
+function smGetEffectiveRow(employeeId,date){const base=smFindRow(employeeId,date);const draft=smState.drafts[`${smState.version?.id||"noversion"}|${employeeId}|${date}`];return draft?{...(base||{employee_id:employeeId,schedule_date:date}),...draft}:base;}
+async function smLoadTLs(){
+  const sel=$("smTl");if(!sel)return;
+  sel.innerHTML='<option value="">Loading…</option>';
+  const {data,error}=await sb.from("roster").select("team_leader").eq("active",true).eq("lob",smState.lob).order("team_leader");
+  if(error){sel.innerHTML='<option value="">Unable to load</option>';toast("Could not load Team Leaders: "+error.message);return;}
+  const tls=[...new Set((data||[]).map(x=>String(x.team_leader||"").trim()).filter(Boolean))];
+  sel.innerHTML=tls.length?tls.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join(""):'<option value="">No TLs found</option>';
+  if(tls.includes(smState.tl))sel.value=smState.tl;else{smState.tl=tls[0]||"";sel.value=smState.tl;}
+}
+async function smLoadRoster(){
+  const {data,error}=await sb.from("roster").select("employee_id,name,team_leader,lob,active,site,group_name,subgroup").eq("active",true).eq("lob",smState.lob).order("name");
+  if(error){toast("Could not load roster: "+error.message);smState.roster=[];return;}
+  smState.roster=data||[];
+}
+async function smLoadPublishedWeek(){
+  const badge=$("smVersionBadge");
+  badge.textContent="LOADING";
+  badge.className="access-badge linked";
+  smState.version=null;
+  smState.rows=[];
+  smState.actsByScheduleId=new Map();
+
+  // Schedule Management reads the already-published branch snapshot.
+  // The schedules table does NOT carry a name column; roster is the authoritative
+  // source for agent names/TL membership. Keep the schedule query limited to the
+  // canonical columns used by the publisher and the locked Alpha 8 manager.
+  const {data:versionRows,error:versionError}=await sb.from("schedule_versions")
+    .select("id,version_number,week_start,week_end,status,source_file_name,published_at,lob")
+    .eq("status","published")
+    .eq("lob",smState.lob)
+    .eq("week_start",smState.weekStart)
+    .order("version_number",{ascending:false})
+    .order("published_at",{ascending:false})
+    .limit(20);
+  if(versionError){
+    toast("Could not load published schedule: "+versionError.message);
+    badge.textContent="LOAD ERROR";
+    badge.className="access-badge none";
+    return;
+  }
+
+  const version=(versionRows||[])[0]||null;
+  if(!version){
+    badge.textContent="NO PUBLISHED WEEK";
+    badge.className="access-badge none";
+    return;
+  }
+
+  const {data:rows,error:scheduleError}=await sb.from("schedules")
+    .select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id")
+    .eq("schedule_version_id",version.id)
+    .order("schedule_date");
+  if(scheduleError){
+    toast("Could not load schedules for v"+(version.version_number??"—")+": "+scheduleError.message);
+    badge.textContent=`PUBLISHED v${version.version_number??"—"}`;
+    badge.className="access-badge none";
+    return;
+  }
+
+  // Canonicalize schedule Employee IDs against the current branch roster so minor
+  // whitespace/casing differences cannot break the roster-to-schedule lookup.
+  const rosterIds=new Map(smState.roster.map(r=>[
+    String(r.employee_id||"").trim().toUpperCase(),
+    r.employee_id
+  ]));
+  smState.rows=(rows||[]).map(r=>({
+    ...r,
+    employee_id:rosterIds.get(String(r.employee_id||"").trim().toUpperCase())||r.employee_id,
+    schedule_date:String(r.schedule_date||"").slice(0,10)
+  }));
+  smState.version=version;
+
+  const scheduleIds=smState.rows.map(r=>r.id).filter(Boolean);
+  if(scheduleIds.length){
+    const {data:acts,error:activityError}=await sb.from("schedule_activities")
+      .select("schedule_id,activity_type,start_time,end_time")
+      .in("schedule_id",scheduleIds)
+      .order("start_time");
+    if(activityError){
+      toast("Could not load schedule activities: "+activityError.message);
+    }else{
+      (acts||[]).forEach(a=>{
+        if(!smState.actsByScheduleId.has(a.schedule_id))smState.actsByScheduleId.set(a.schedule_id,[]);
+        smState.actsByScheduleId.get(a.schedule_id).push(a);
+      });
+    }
+  }
+
+  badge.textContent=`PUBLISHED v${version.version_number??"—"}`;
+  badge.className="access-badge linked";
+}
+function smRenderTable(){
+  $("smWeekLabel").textContent=smFmtWeek();
+  $("smTeamTitle").textContent=smState.tl||"Team Schedule";
+  const members=smTeamMembers();$("smTeamMeta").textContent=`${branchLabel(smState.lob)} · ${members.length} active agents`;
+  const q=String($("smSearch")?.value||"").trim().toLowerCase();
+  const filtered=members.filter(m=>!q||String(m.name||"").toLowerCase().includes(q)||String(m.employee_id||"").toLowerCase().includes(q));
+  const body=$("smWeekBody");if(!body)return;
+  // The roster is authoritative for agent visibility. A missing published snapshot
+  // must NEVER hide the agents themselves; it only changes the status shown in
+  // each day cell to NOT PUBLISHED.
+  body.innerHTML=filtered.length?filtered.map(m=>{const cells=[];for(let i=0;i<7;i++){const date=smDateAt(i),r=smGetEffectiveRow(m.employee_id,date);const cls=smStatusClass(r?.schedule_status);const label=smStatusLabel(r?.schedule_status);const shift=r?.schedule_status==="WORKING"&&r?.shift_start&&r?.shift_end?`${fmtTime(r.shift_start)}–${fmtTime(r.shift_end)}`:"";cells.push(`<td><div class="sm-status-cell ${cls}" data-sm-agent="${escapeHtml(m.employee_id)}" data-sm-date="${date}"><strong>${label}</strong>${shift?`<span>${escapeHtml(shift)}</span>`:""}</div></td>`)}return `<tr><td><div class="sm-agent-name">${escapeHtml(m.name||"—")}</div><div class="sm-agent-id">${escapeHtml(m.employee_id||"—")}</div></td>${cells.join("")}<td class="sm-action-cell"><button type="button" data-sm-view="${escapeHtml(m.employee_id)}">View</button></td></tr>`}).join(""):'<tr><td colspan="9">No agents match your search.</td></tr>';
+  body.querySelectorAll("[data-sm-view]").forEach(btn=>btn.onclick=()=>smSelectAgent(btn.dataset.smView,smState.selectedDate||smDateAt(0)));
+  body.querySelectorAll("[data-sm-agent]").forEach(cell=>cell.onclick=()=>smSelectAgent(cell.dataset.smAgent,cell.dataset.smDate));
+}
+function smRenderMiniWeek(){
+  const box=$("smMiniWeek");if(!box)return;const emp=smState.selectedEmployee;if(!emp){box.innerHTML="";return;}box.innerHTML=Array.from({length:7},(_,i)=>{const date=smDateAt(i),r=smGetEffectiveRow(emp,date),cls=smStatusClass(r?.schedule_status);return `<button type="button" class="sm-mini-day ${cls} ${date===smState.selectedDate?"active":""}" data-sm-mini-date="${date}"><div class="d">${new Date(`${date}T12:00:00+08:00`).toLocaleDateString("en-US",{weekday:"short",timeZone:"Asia/Manila"})}</div><div class="v">${smStatusLabel(r?.schedule_status)}</div></button>`}).join("");box.querySelectorAll("[data-sm-mini-date]").forEach(b=>b.onclick=()=>smSelectAgent(emp,b.dataset.smMiniDate));
+}
+function smRenderDay(){
+  const emp=smState.roster.find(r=>r.employee_id===smState.selectedEmployee);if(!emp||!smState.selectedDate){$("smAgentName").textContent="Select an agent";$("smAgentMeta").textContent="—";$("smDayDetails").innerHTML='<div class="agent-empty"><strong>Select an agent.</strong>Choose “View” from the weekly schedule.</div>';return;}
+  $("smAgentName").textContent=emp.name||emp.employee_id;$("smAgentMeta").textContent=`${emp.employee_id} · TL ${emp.team_leader||"—"} · ${branchLabel(emp.lob)}`;smRenderMiniWeek();
+  const r=smGetEffectiveRow(emp.employee_id,smState.selectedDate),status=smStatusLabel(r?.schedule_status),cls=smStatusClass(r?.schedule_status),acts=r?.id?smState.actsByScheduleId.get(r.id)||[]:[];
+  let html=`<div class="sm-day-state"><h3>${smDayLabel(smState.selectedDate)}</h3><span class="access-badge ${cls==='duty'?'linked':cls==='ml'||cls==='sl'?'linked':'none'}">${status}</span></div>`;
+  if(status==="ON DUTY"){
+    const shift= r?.shift_start&&r?.shift_end?`${fmtTime(r.shift_start)} – ${fmtTime(r.shift_end)}`:"—";
+    const workStart=r?.shift_start?.slice(0,5)||"08:00",workEnd=r?.shift_end?.slice(0,5)||"17:00";
+    html+=`<div class="sm-day-timeline"><div class="sm-time-row"><span>${escapeHtml(fmtTime(workStart))}</span><span>${escapeHtml(fmtTime(workEnd))}</span></div><div class="sm-bar"><span class="sm-seg work"></span><span class="sm-seg break"></span><span class="sm-seg lunch"></span><span class="sm-seg break"></span><span class="sm-seg work"></span></div><div class="sm-time-row"><span>Shift Start</span><span>Shift End</span></div></div>`;
+    html+=`<div class="sm-readonly">${[['Shift',shift],...['Break 1','Lunch 1','Break 2','Lunch 2','BOP'].map(label=>{const a=acts.find(x=>String(x.activity_type||"").toLowerCase()===label.toLowerCase());return [label,a?`${fmtTime(a.start_time)} – ${fmtTime(a.end_time)}`:"—"]})].map(([k,v])=>`<div class="sm-readonly-row"><span>${k}</span><b>${escapeHtml(v)}</b></div>`).join("")}</div>`;
+  }else{html+=`<div class="sm-day-timeline"><strong>No working shift scheduled.</strong><div style="font-size:10px;color:var(--muted);margin-top:4px">This day is ${escapeHtml(status.toLowerCase())} for schedule-management purposes.</div></div>`;}
+  html+=`<button id="smEditDayBtn" class="primary sm-edit-btn" type="button">✎ Edit Schedule</button>`;
+  $("smDayDetails").innerHTML=html;$("smEditDayBtn").onclick=smOpenEdit;
+}
+function smSelectAgent(emp,date){smState.selectedEmployee=emp;smState.selectedDate=date||smDateAt(0);smRenderDay();document.querySelector(".sm-day-card")?.scrollIntoView({behavior:"smooth",block:"nearest"});}
+function smOpenEdit(){
+  const emp=smState.roster.find(r=>r.employee_id===smState.selectedEmployee);if(!emp)return;const r=smGetEffectiveRow(emp.employee_id,smState.selectedDate)||{};const acts=r.id?smState.actsByScheduleId.get(r.id)||[]:[];$("smEditTitle").textContent="Edit Schedule";$("smEditMeta").textContent=`${emp.name} · ${emp.employee_id} · ${branchLabel(emp.lob)}`;$("smEditDate").value=smDayLabel(smState.selectedDate);$("smEditStatus").value=String(r.schedule_status||"WORKING").toUpperCase();$("smEditStart").value=String(r.shift_start||"").slice(0,5);$("smEditEnd").value=String(r.shift_end||"").slice(0,5);$("smEditNotes").value="";
+  const labels=['Break 1','Lunch 1','Break 2','Lunch 2','BOP'];$("smEditActivities").innerHTML=labels.map(label=>{const a=acts.find(x=>String(x.activity_type||"").toLowerCase()===label.toLowerCase());return `<div class="sm-edit-activity"><b>${label}</b><input type="time" value="${String(a?.start_time||"").slice(0,5)}" data-edit-act="${label}" data-edit-part="start"><input type="time" value="${String(a?.end_time||"").slice(0,5)}" data-edit-act="${label}" data-edit-part="end"><button type="button" class="secondary" data-edit-clear="${label}" title="Clear">×</button></div>`}).join("");
+  $("smEditActivities").querySelectorAll("[data-edit-clear]").forEach(b=>b.onclick=()=>{const label=b.dataset.editClear;$("smEditActivities").querySelectorAll(`[data-edit-act="${CSS.escape(label)}"]`).forEach(i=>i.value="");});
+  $("smEditModal").classList.remove("hidden");$("smEditModal").setAttribute("aria-hidden","false");
+}
+function smCloseEdit(){$("smEditModal")?.classList.add("hidden");$("smEditModal")?.setAttribute("aria-hidden","true");}
+function smSaveEditDraft(){
+  const emp=smState.roster.find(r=>r.employee_id===smState.selectedEmployee);if(!emp||!smState.selectedDate)return;const key=`${smState.version?.id||"noversion"}|${emp.employee_id}|${smState.selectedDate}`;const activities={};document.querySelectorAll("[data-edit-act]").forEach(i=>{const label=i.dataset.editAct,part=i.dataset.editPart;activities[label]??={};activities[label][part]=i.value;});
+  smState.drafts[key]={schedule_status:$("smEditStatus").value,shift_start:$("smEditStart").value||null,shift_end:$("smEditEnd").value||null,activities};smCloseEdit();smRenderTable();smRenderDay();toast("Schedule change saved as a WFM draft for this session. The published snapshot was not overwritten.");
+}
+async function initScheduleManager(){
+  if(!$('smLob'))return;const allowed=allowedBranchesForProfile();const lobSel=$('smLob');[...lobSel.options].forEach(o=>o.disabled=!allowed.includes(o.value));if(!allowed.includes(smState.lob))smState.lob=allowed[0]||'CCAC';lobSel.value=smState.lob;if(!smState.weekStart){smState.weekStart=smMonday(phtDate());const d=new Date(`${smState.weekStart}T00:00:00+08:00`);d.setDate(d.getDate()+6);smState.weekEnd=smIso(d);}
+  await smLoadRoster();await smLoadTLs();await smLoadPublishedWeek();if(!smState.selectedEmployee){const m=smTeamMembers()[0];if(m){smState.selectedEmployee=m.employee_id;smState.selectedDate=smDateAt(0);}}smRenderTable();smRenderDay();
+}
+async function smReloadAll(){await smLoadRoster();await smLoadTLs();await smLoadPublishedWeek();const m=smTeamMembers();if(!m.some(x=>x.employee_id===smState.selectedEmployee))smState.selectedEmployee=m[0]?.employee_id||null;smState.selectedDate=smState.selectedDate||smDateAt(0);smRenderTable();smRenderDay();}
+
+$("smLob")?.addEventListener("change",async e=>{smState.lob=e.target.value;smState.tl="";smState.selectedEmployee=null;smState.selectedDate=null;await smReloadAll();});
+$("smTl")?.addEventListener("change",async e=>{smState.tl=e.target.value;smState.selectedEmployee=smTeamMembers()[0]?.employee_id||null;smState.selectedDate=smDateAt(0);await smLoadPublishedWeek();smRenderTable();smRenderDay();});
+$("smPrevWeek")?.addEventListener("click",async()=>{smMoveWeek(-1);await smLoadPublishedWeek();smRenderTable();smRenderDay();});
+$("smNextWeek")?.addEventListener("click",async()=>{smMoveWeek(1);await smLoadPublishedWeek();smRenderTable();smRenderDay();});
+$("smTodayWeek")?.addEventListener("click",async()=>{smState.weekStart=smMonday(phtDate());const d=new Date(`${smState.weekStart}T00:00:00+08:00`);d.setDate(d.getDate()+6);smState.weekEnd=smIso(d);await smLoadPublishedWeek();smRenderTable();smRenderDay();});
+$("smSearch")?.addEventListener("input",()=>smRenderTable());$("smRefresh")?.addEventListener("click",smReloadAll);$("smCloseDay")?.addEventListener("click",()=>{smState.selectedEmployee=null;smState.selectedDate=null;smRenderDay();smRenderMiniWeek();});$("smEditClose")?.addEventListener("click",smCloseEdit);$("smEditCancel")?.addEventListener("click",smCloseEdit);$("smEditModal .sm-modal-backdrop")?.addEventListener("click",smCloseEdit);$("smEditSave")?.addEventListener("click",smSaveEditDraft);
+
+let agentActivityTimer=null;
+let agentActivityState={acts:[],row:null};
+let liveScheduleWindow=null;
+function phtNowSeconds(){const parts=new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Manila",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).formatToParts(new Date());const get=t=>Number(parts.find(x=>x.type===t)?.value||0);return get("hour")*3600+get("minute")*60+get("second");}
+function activitySeconds(t){const p=String(t||"").slice(0,8).split(":");return Number(p[0]||0)*3600+Number(p[1]||0)*60+Number(p[2]||0);}
+function countdownText(seconds){const s=Math.max(0,Math.ceil(seconds));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return `${String(h).padStart(2,"0")}-${String(m).padStart(2,"0")}-${String(sec).padStart(2,"0")}`;}
+function friendlyStatus(s){const x=String(s||"").toUpperCase();return x==="WORKING"?"WORKING":x||"—";}
+async function loadAgentHome(){
+  if(!currentProfile?.employee_id)return;
+  $("agentNameHeading").textContent=currentProfile.display_name||"Agent";$("agentSubheading").textContent="CCAC · Agent";
+  $("agentEmployee").textContent=currentProfile.employee_id;
+  const {data:roster}=await sb.from("roster").select("employee_id,name,group_name,subgroup,site,team_leader,lob").eq("employee_id",currentProfile.employee_id).maybeSingle();
+  if(roster){$("agentSubheading").textContent=`Concepcion Carrier · ${branchLabel(roster.lob||"CCAC")}`;$("agentTL").textContent=roster.team_leader||"—";$("agentGroup").textContent=roster.group_name||"—";$("agentSubgroup").textContent=roster.subgroup||"—";$("agentLOB").textContent=branchLabel(roster.lob||"CCAC");$("agentSite").textContent=roster.site||"—";}
+  const today=phtDate();$("agentDatePill").textContent=new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"long",day:"numeric",year:"numeric"}).format(new Date())+" · PHT";
+  const {data:version,error:versionError}=await getCurrentPublishedVersion();
+  if(versionError){console.error("Current schedule load failed",versionError);setAgentNoSchedule();return;}
+  if(!version){setAgentNoSchedule();return;}
+  const {data:rows}=await sb.from("schedules").select("id,schedule_date,schedule_status,shift_start,shift_end").eq("schedule_version_id",version.id).eq("employee_id",currentProfile.employee_id).order("schedule_date");
+  if(!rows?.length){setAgentNoSchedule();return;}
+  const todayRow=rows.find(r=>String(r.schedule_date).slice(0,10)===today);
+  if(todayRow){
+    const st=friendlyStatus(todayRow.schedule_status);$("agentShiftTitle").textContent=st==="WORKING"?"Your schedule today":"Today: "+st;
+    $("agentShiftSub").textContent=`Version ${version.version_number ?? "—"} · ${version.week_start||""} to ${version.week_end||""}${version.source_file_name?" · "+version.source_file_name:""}`;
+    $("agentShift").textContent=st==="WORKING"?`${fmtTime(todayRow.shift_start)} – ${fmtTime(todayRow.shift_end)}`:"—";$("agentState").textContent=st;
+    const {data:acts}=await sb.from("schedule_activities").select("activity_type,start_time,end_time").eq("schedule_id",todayRow.id).order("start_time");
+    renderAgentActivities(acts||[]);renderCurrentActivity(acts||[],todayRow);
+  }else{
+    $("agentShiftTitle").textContent="No schedule for today";$("agentShiftSub").textContent=`Published week: ${version.week_start||"—"} to ${version.week_end||"—"}`;$("agentShift").textContent="—";$("agentState").textContent="NO SCHEDULE";renderAgentActivities([]);$("agentCurrentActivity").textContent="Scheduled Status";$("agentActivityDetail").textContent="No schedule published for today.";
+  }
+  renderWeek(rows);
+}
+async function loadAgentSchedule(){
+  const box=$("agentScheduleDetail");
+  if(!box || !currentProfile?.employee_id)return;
+  box.innerHTML='<div class="agent-empty"><strong>Loading schedule…</strong>Reading the current published Workforce week.</div>';
+  const {data:version,error:versionError}=await getCurrentPublishedVersion();
+  if(versionError){box.innerHTML=`<div class="agent-empty"><strong>Schedule could not be loaded.</strong>${escapeHtml(versionError.message||String(versionError))}</div>`;return;}
+  if(!version){box.innerHTML='<div class="agent-empty"><strong>No published schedule yet.</strong>Your detailed weekly schedule will appear here once Workforce publishes one.</div>';return;}
+  const {data:rows,error:rowError}=await sb.from("schedules").select("id,schedule_date,schedule_status,shift_start,shift_end").eq("schedule_version_id",version.id).eq("employee_id",currentProfile.employee_id).order("schedule_date");
+  if(rowError){box.innerHTML=`<div class="agent-empty"><strong>Schedule could not be loaded.</strong>${escapeHtml(rowError.message||String(rowError))}</div>`;return;}
+  if(!rows?.length){box.innerHTML='<div class="agent-empty"><strong>No schedule for your account.</strong>Your published week does not contain any schedule rows for this Employee ID.</div>';return;}
+  const ids=rows.map(r=>r.id).filter(Boolean);
+  let activities=[];
+  if(ids.length){
+    const {data:acts,error:activityError}=await sb.from("schedule_activities").select("schedule_id,activity_type,start_time,end_time").in("schedule_id",ids).order("start_time");
+    if(activityError){box.innerHTML=`<div class="agent-empty"><strong>Activities could not be loaded.</strong>${escapeHtml(activityError.message||String(activityError))}</div>`;return;}
+    activities=acts||[];
+  }
+  const bySchedule=new Map();
+  activities.forEach(a=>{if(!bySchedule.has(a.schedule_id))bySchedule.set(a.schedule_id,[]);bySchedule.get(a.schedule_id).push(a);});
+  const today=phtDate();
+  const formatDayDate=d=>new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",weekday:"long",month:"short",day:"numeric"}).format(new Date(`${String(d).slice(0,10)}T00:00:00+08:00`));
+  const cards=rows.map(r=>{
+    const date=String(r.schedule_date).slice(0,10), status=friendlyStatus(r.schedule_status), acts=bySchedule.get(r.id)||[];
+    const activityHtml=acts.length?acts.map(a=>`<div class="schedule-activity"><span class="schedule-activity-name">${escapeHtml(a.activity_type)}</span><span class="schedule-activity-time">${fmtTime(a.start_time)} – ${fmtTime(a.end_time)}</span></div>`).join(""):'<div class="schedule-no-activity">No scheduled activities</div>';
+    return `<article class="schedule-day-card${date===today?' today':''}"><div class="schedule-day-head"><div><div class="schedule-day-name">${escapeHtml(formatDayDate(date))}${date===today?' · Today':''}</div><div class="schedule-day-date">${escapeHtml(date)}</div></div><div><div class="schedule-day-shift">${status==="WORKING"?`${fmtTime(r.shift_start)} – ${fmtTime(r.shift_end)}`:'—'}</div><div class="schedule-day-status"><span class="badge ${status==='WORKING'?'work':status==='OFF'?'off':'other'}">${escapeHtml(status)}</span></div></div></div><div class="schedule-activity-list">${activityHtml}</div></article>`;
+  }).join("");
+  $("agentScheduleWeekPill").textContent=`${version.week_start||"—"} → ${version.week_end||"—"}`;
+  box.innerHTML=`<div class="schedule-section-note">Published Workforce week · Version ${escapeHtml(version.version_number??"—")}${version.source_file_name?` · ${escapeHtml(version.source_file_name)}`:""}</div><div class="schedule-week-grid">${cards}</div>`;
+}
+function setAgentNoSchedule(){$("agentShiftTitle").textContent="No published schedule";$('agentShiftSub').textContent="Nothing has been published for your account yet.";$('agentShift').textContent="—";$('agentState').textContent="WAITING";renderAgentActivities([]);$('agentCurrentActivity').textContent="Scheduled Status";$('agentActivityDetail').textContent="—";$('agentWeek').innerHTML='<div class="agent-empty"><strong>No published schedule yet.</strong>Your weekly schedule will appear here once Workforce publishes one.</div>';}
+function renderAgentActivities(acts){agentActivityState.acts=acts||[];if(!acts.length){$('agentActivities').innerHTML='<div class="agent-empty"><strong>No activities or special events today.</strong>Your assigned training and other scheduled activities for today will appear here.</div>';return}updateAgentActivityClock();}
+
+function liveScheduleState(acts,now){
+  const list=(acts||[]).slice().sort((a,b)=>activitySeconds(a.start_time)-activitySeconds(b.start_time));
+  let current=null;
+  for(const a of list){
+    const start=activitySeconds(a.start_time),end=activitySeconds(a.end_time);
+    if(now>=start&&now<end){current=a;break;}
+  }
+  const next=list.find(a=>a!==current&&activitySeconds(a.start_time)>now)||null;
+  return {list,current,next};
+}
+function liveSchedulePayload(row,acts,now){
+  const state=liveScheduleState(acts,now),current=state.current,next=state.next;
+  const untilNext=next?Math.max(0,activitySeconds(next.start_time)-now):null;
+  const remaining=current?Math.max(0,activitySeconds(current.end_time)-now):null;
+  return {
+    shift:row?.shift_start?`${fmtTime(row.shift_start)} – ${fmtTime(row.shift_end)}`:(row?friendlyStatus(row.schedule_status):"No schedule for today"),
+    current:current?{name:current.activity_type,remaining,end:fmtTime(current.end_time)}:null,
+    next:next?{name:next.activity_type,start:fmtTime(next.start_time),until:untilNext,near:untilNext<=600}:null
+  };
+}
+function liveSchedulePopupDocument(){
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkSync · Live Schedule</title>
+<style>
+html,body{margin:0;padding:0;background:#f5f8fb;color:#17324f;font-family:Arial,Helvetica,sans-serif}
+body{min-width:320px}
+.card{box-sizing:border-box;margin:0;padding:18px;background:#fff;border:1px solid #d9e4ee;border-radius:16px;box-shadow:0 12px 34px rgba(13,39,65,.18)}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px}
+.kicker{font-size:9px;letter-spacing:1.5px;font-weight:900;color:#2185b4;text-transform:uppercase}
+.title{font-size:16px;font-weight:900;margin-top:3px}
+.dot{width:9px;height:9px;border-radius:50%;background:#21b87a;box-shadow:0 0 0 4px rgba(33,184,122,.12);margin-top:4px}
+.label{font-size:9px;letter-spacing:1px;text-transform:uppercase;color:#7b8da2;font-weight:900}
+.now-card{padding:14px;border-radius:13px;background:#f3faf6;border:1px solid #ccebdc;margin-bottom:12px}
+.now-name{font-size:23px;font-weight:900;color:#0b7a4a;margin-top:5px;line-height:1.15}
+.now-time{font-size:12px;font-weight:900;color:#0b7a4a;margin-top:7px}
+.shift{padding:12px;border-radius:12px;background:#f7fbfe;border:1px solid #e6eef5;margin-bottom:12px}
+.value{font-size:15px;font-weight:900;color:#1c3b58;margin-top:4px}
+.section{padding:12px 0;border-top:1px solid #edf1f6}
+.item{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-top:7px}
+.name{font-size:13px;font-weight:900;color:#27405d}
+.time{font-size:11px;color:#6d8095;text-align:right;white-space:nowrap}
+.near .name,.near .time{color:#8a5a00}
+.muted .name{color:#7a899c}
+.wait{font-size:10px;color:#8291a3;margin-top:10px}
+@media(max-width:340px){.card{padding:15px}.time{white-space:normal}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div><div class="kicker">LIVE SCHEDULE · PHT</div><div class="title">Current Status</div></div>
+    <div class="dot"></div>
+  </div>
+
+  <!-- PRIMARY: current agent status/activity -->
+  <div id="currentBlock" class="now-card">
+    <div class="label">Now</div>
+    <div id="currentName" class="now-name">Loading…</div>
+    <div id="currentTime" class="now-time">—</div>
+  </div>
+
+  <!-- SECONDARY: scheduled shift context -->
+  <div id="shift" class="shift">
+    <div class="label">Scheduled Shift</div>
+    <div class="value">Waiting for WorkSync…</div>
+  </div>
+
+  <!-- TERTIARY: what's coming next -->
+  <div class="section">
+    <div class="label">Next Activity</div>
+    <div id="next" class="item muted">
+      <div class="name">No upcoming activity</div>
+      <div class="time">—</div>
+    </div>
+  </div>
+
+  <div class="wait">Live updates from WorkSync.</div>
+</div>
+
+<scr` + `ipt>
+window.addEventListener("message",function(e){
+  var p=e.data||{}; if(p.type!=="WORKSYNC_LIVE_SCHEDULE") return;
+
+  var shift=document.querySelector("#shift .value");
+  var currentName=document.getElementById("currentName");
+  var currentTime=document.getElementById("currentTime");
+  var currentBlock=document.getElementById("currentBlock");
+  var next=document.getElementById("next");
+
+  if(shift) shift.textContent=p.shift||"No schedule for today";
+
+  if(p.current){
+    currentBlock.className="now-card";
+    currentName.textContent=p.current.name||"Active";
+    currentTime.textContent="Ends in "+p.current.remainingText+" · "+p.current.end;
+  }else{
+    currentBlock.className="now-card";
+    currentName.textContent="Working";
+    currentTime.textContent="No active activity";
+  }
+
+  if(p.next){
+    next.className="item"+(p.next.near?" near":"");
+    next.innerHTML="";
+    var nn=document.createElement("div");nn.className="name";nn.textContent=p.next.name;
+    var nt=document.createElement("div");nt.className="time";nt.textContent=p.next.near?"Starts in "+p.next.untilText:"Starts "+p.next.start;
+    next.append(nn,nt);
+  }else{
+    next.className="item muted";
+    next.innerHTML='<div class="name">No upcoming activity</div><div class="time">—</div>';
+  }
+});
+<` + `/script>
+
+<style>
+/* Alpha 5 Increment: WFM Intraday Command Center · UI refinement 4 · enlarge status section */
+.wfm-panel{padding:18px;border-radius:16px}
+.wfm-panel-head{margin-bottom:13px}
+.wfm-panel-head h2{font-size:18px}
+.wfm-panel-head span{font-size:11px}
+.wfm-statusgrid{gap:12px}
+.wfm-status-card{padding:14px;min-height:178px;border-radius:13px}
+.wfm-status-card h3{font-size:14px;margin-bottom:10px}
+.wfm-status-pill{padding:4px 8px;font-size:9px}
+.wfm-person-list{gap:6px;max-height:128px}
+.wfm-person{padding:8px 10px;border-radius:9px}
+.wfm-person .name{font-size:12px}
+.wfm-person .meta{font-size:9px;margin-top:3px}
+.wfm-empty{font-size:11px;padding:10px 0}
+.wfm-nextbar{gap:12px;margin-top:12px}
+.wfm-next-card{padding:12px;border-radius:12px}
+.wfm-next-card .next-time{font-size:13px}
+.wfm-next-card .next-meta{font-size:10px;margin-top:5px}
+.wfm-filter-summary .tag{padding:6px 9px;font-size:10px}
+@media(max-width:720px){.wfm-status-card{min-height:160px}}
+</style>
+
+
+</body>
+</html>`;
+}
+function sendLiveScheduleUpdate(){
+  const payload=liveSchedulePayload(agentActivityState.row,agentActivityState.acts||[],phtNowSeconds());
+  const launcherText=payload.current?`NOW ${countdownText(payload.current.remaining)}`:(payload.next?.near?`NEXT ${countdownText(payload.next.until)}`:"");
+  const timer=$("liveScheduleLauncherTimer");
+  if(timer){timer.textContent=launcherText;timer.classList.toggle("hidden",!launcherText);}
+  if(liveScheduleWindow&&!liveScheduleWindow.closed){
+    try{
+      liveScheduleWindow.postMessage({
+        type:"WORKSYNC_LIVE_SCHEDULE",
+        shift:payload.shift,
+        current:payload.current?{name:payload.current.name,remainingText:countdownText(payload.current.remaining),end:payload.current.end}:null,
+        next:payload.next?{name:payload.next.name,start:payload.next.start,untilText:countdownText(payload.next.until),near:payload.next.near}:null
+      },"*");
+      liveScheduleWindow.focus();
+    }catch(e){}
+  }
+}
+function openLiveScheduleWindow(){
+  if(liveScheduleWindow&&!liveScheduleWindow.closed){
+    liveScheduleWindow.focus();
+    sendLiveScheduleUpdate();
+    return;
+  }
+  // Must be called directly by the button click so the browser treats this as a user-initiated popup.
+  liveScheduleWindow=window.open("", "WorkSyncLiveSchedule", "popup=yes,width=400,height=470,resizable=yes,scrollbars=no");
+  if(!liveScheduleWindow){
+    setMessage("Live Schedule could not open. Allow pop-ups for WorkSync in the browser, then click Live Schedule again.","err");
+    return;
+  }
+  liveScheduleWindow.document.open();
+  liveScheduleWindow.document.write(liveSchedulePopupDocument());
+  liveScheduleWindow.document.close();
+  liveScheduleWindow.document.title="WorkSync · Live Schedule";
+  sendLiveScheduleUpdate();
+}
+function updateAgentActivityClock(){
+  const acts=agentActivityState.acts||[],row=agentActivityState.row,now=phtNowSeconds();
+  const state=liveScheduleState(acts,now),current=state.current,next=state.next;
+
+  if(acts.length){
+    $("agentActivities").innerHTML=acts.map(a=>{
+      const start=activitySeconds(a.start_time),end=activitySeconds(a.end_time),active=now>=start&&now<end,ended=now>=end;
+      const stateText=active?`<span style="font-weight:800">NOW · ${countdownText(end-now)} left</span>`:ended?'<span style="color:#8291a3">Completed</span>':`<span>${fmtTime(a.start_time)} – ${fmtTime(a.end_time)}</span>`;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid #edf1f6"><strong>${escapeHtml(a.activity_type)}</strong><span>${active?`<span style="font-weight:800">${countdownText(end-now)} left</span>`:stateText}</span></div>`;
+    }).join("");
+  }else{
+    $("agentActivities").innerHTML='<div class="agent-empty"><strong>No activities or special events today.</strong>Your assigned training and other scheduled activities for today will appear here.</div>';
+  }
+
+  if(row)updateCurrentActivityFromClock(acts,row,now,current,next);
+  sendLiveScheduleUpdate();
+}
+function updateCurrentActivityFromClock(acts,row,now,current,next){
+  if(String(row.schedule_status).toUpperCase()!=="WORKING"){
+    $("agentCurrentActivity").textContent="Scheduled Status";
+    $("agentActivityDetail").textContent=friendlyStatus(row.schedule_status);return;
+  }
+  if(current){
+    $("agentCurrentActivity").textContent=`Current: ${current.activity_type}`;
+    $("agentActivityDetail").textContent=`${countdownText(activitySeconds(current.end_time)-now)} remaining · ends ${fmtTime(current.end_time)}`;
+  }else if(next){
+    const until=activitySeconds(next.start_time)-now;
+    $("agentCurrentActivity").textContent=`Next: ${next.activity_type}`;
+    $("agentActivityDetail").textContent=until<=600?`Starts in ${countdownText(until)}`:`Starts at ${fmtTime(next.start_time)}`;
+  }else{
+    $("agentCurrentActivity").textContent="Scheduled Status";
+    $("agentActivityDetail").textContent="No active or upcoming activity.";
+  }
+}
+function renderCurrentActivity(acts,row){
+  agentActivityState.acts=acts||[];agentActivityState.row=row||null;updateAgentActivityClock();
+  if(!agentActivityTimer)agentActivityTimer=setInterval(()=>{
+    if(document.visibilityState==="visible"&&agentActivityState.row)updateAgentActivityClock();
+  },1000);
+}
+
+if($("liveScheduleLauncher"))$("liveScheduleLauncher").onclick=()=>openLiveScheduleWindow();
+
+function renderWeek(rows){$('agentWeek').innerHTML=`<div class="tablewrap"><table class="weektable"><thead><tr><th>Date</th><th>Status</th><th>Shift</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${escapeHtml(r.schedule_date)}</td><td><span class="badge ${String(r.schedule_status).toUpperCase()==='WORKING'?'work':String(r.schedule_status).toUpperCase()==='OFF'?'off':'other'}">${escapeHtml(r.schedule_status)}</span></td><td>${r.shift_start?fmtTime(r.shift_start)+' – '+fmtTime(r.shift_end):'—'}</td></tr>`).join('')}</tbody></table></div>`;}
+function normalizeDate(v){
+  // Preserve the calendar date from Excel/browser Date objects.
+  // Do not use toISOString() here because a local midnight can shift
+  // to the previous UTC date (e.g. Sep 28 -> Sep 27 in UTC-08/UTC+08 contexts).
+  if(v instanceof Date){
+    return `${v.getFullYear()}-${String(v.getMonth()+1).padStart(2,"0")}-${String(v.getDate()).padStart(2,"0")}`;
+  }
+  if(typeof v === "number"){ const d=XLSX.SSF.parse_date_code(v); return `${d.y}-${String(d.m).padStart(2,"0")}-${String(d.d).padStart(2,"0")}`; }
+  const s=String(v??"").trim(); if(!s) return "";
+  const m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(m) return `${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`;
+  const d=new Date(s); return isNaN(d)?s:`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+function readWorkbook(file){
+  const reader=new FileReader();
+  reader.onload=async e=>{
+    try{
+      const wb=XLSX.read(e.target.result,{type:"array",cellDates:true});
+      const names=wb.SheetNames;
+      const required=["Schedule Version","Roster","Schedules","Schedule Activities"];
+      if(required.every(n=>names.includes(n))) parseConverted(wb);
+      else if(names.includes("Schedule Import")) parseWorkSyncTemplate(wb,file.name);
+      else parseRawSample(wb);
+      await matchImportRoster();
+      renderPreview();
+    }catch(err){
+      console.error(err);
+      setMessage("Could not read the workbook: "+(err.message||String(err)),"err");
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function parseWorkSyncTemplate(wb,fileName){
+  const ws=wb.Sheets["Schedule Import"];
+  if(!ws) throw new Error("The workbook must contain a Schedule Import sheet.");
+  const rows=XLSX.utils.sheet_to_json(ws,{defval:null,raw:true});
+  if(!rows.length) throw new Error("The Schedule Import sheet contains no employee rows.");
+  const week_start=String($("scheduleWeekStart")?.value||"").trim();
+  const week_end=String($("scheduleWeekEnd")?.value||"").trim();
+  if(!week_start || !week_end) throw new Error("Select the Week Start and Week End above the upload control before importing the schedule.");
+  const startDate=new Date(week_start+"T00:00:00Z"), endDate=new Date(week_end+"T00:00:00Z");
+  if(week_end<week_start || Math.round((endDate-startDate)/86400000)!==6) throw new Error("The schedule import must cover exactly 7 days.");
+  const headers=Object.keys(rows[0]||{});
+  for(const h of ["Employee ID","Agent Name"]) if(!headers.includes(h)) throw new Error(`Schedule Import is missing required column: ${h}`);
+  const roster=[],schedules=[],activities=[],seenIds=new Set(),errors=[];
+  const cleanTime=v=>cleanText(v).replace(/[–—]/g,"-");
+  const allowedStatuses=["OFF","VL","ML","SL"];
+  const parseTimePart=raw=>{
+    const value=cleanText(raw).toUpperCase();
+    let m=value.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
+    if(m){
+      let h=Number(m[1]); const min=Number(m[2]); const mer=m[3];
+      if(h<1 || h>12 || min>59) return null;
+      if(mer==="AM"){ if(h===12) h=0; } else { if(h!==12) h+=12; }
+      return `${String(h).padStart(2,"0")}:${String(min).padStart(2,"0")}`;
+    }
+    m=value.match(/^(\d{1,2}):(\d{2})$/);
+    if(m){
+      const h=Number(m[1]); const min=Number(m[2]);
+      if(h>23 || min>59) return null;
+      return `${String(h).padStart(2,"0")}:${String(min).padStart(2,"0")}`;
+    }
+    return null;
+  };
+  const parseTimeRange=raw=>{
+    const value=cleanTime(raw);
+    if(!value)return null;
+    const m=value.match(/^(.+?)\s*-\s*(.+?)$/);
+    if(!m)return null;
+    const start=parseTimePart(m[1]); const end=parseTimePart(m[2]);
+    return start && end ? {start,end} : null;
+  };
+  const parseShiftOrStatus=raw=>{
+    const value=cleanTime(raw);
+    if(!value)return {status:null,start:null,end:null};
+    const range=parseTimeRange(value);
+    if(range)return {status:"WORKING",start:range.start,end:range.end};
+    const normalized=value.toUpperCase();
+    if(allowedStatuses.includes(normalized))return {status:normalized,start:null,end:null};
+    return {status:null,start:null,end:null,invalid:value};
+  };
+  const parseActivity=raw=>{
+    const value=cleanTime(raw);
+    if(!value)return null;
+    if(/^off$/i.test(value))return null;
+    const range=parseTimeRange(value);
+    return range?{start_time:range.start,end_time:range.end}:{invalid:value};
+  };
+  rows.forEach((row,index)=>{
+    const line=index+2, employee_id=cleanText(row["Employee ID"]), name=cleanText(row["Agent Name"]);
+    const agentGroup=cleanText(row["Agent Group"]||row["agent_group"]||"").toUpperCase()||null;
+    if(!employee_id&&!name)return;
+    if(!employee_id){errors.push(`Row ${line}: Employee ID is required.`);return;}
+    if(seenIds.has(employee_id)){errors.push(`Row ${line}: duplicate Employee ID ${employee_id}.`);return;}
+    seenIds.add(employee_id);
+    if(!name) errors.push(`Row ${line} (${employee_id}): Agent Name is required.`);
+    roster.push({employee_id,name,lob:null,group_name:null,subgroup:null,site:null,team_leader:null,active:null,agent_group:agentGroup});
+    daysOfWeek.forEach((day,di)=>{
+      const d=new Date(startDate);d.setUTCDate(d.getUTCDate()+di);const date=d.toISOString().slice(0,10);
+      const parsed=parseShiftOrStatus(row[`${day} Shift/Status`]);
+      if(parsed.invalid){
+        errors.push(`Row ${line} (${employee_id}): ${day} Shift/Status has unsupported value "${parsed.invalid}".`);
+      }else if(parsed.status){
+        schedules.push({employee_id,name,schedule_date:date,schedule_status:parsed.status,shift_start:parsed.start,shift_end:parsed.end,agent_group:agentGroup});
+      }
+      activityNames.forEach(activity=>{const pa=parseActivity(row[`${day} ${activity}`]);if(pa?.invalid) errors.push(`Row ${line} (${employee_id}): ${day} ${activity} has invalid format "${pa.invalid}".`);else if(pa) activities.push({employee_id,name,schedule_date:date,activity_type:activity,start_time:pa.start_time,end_time:pa.end_time});});
+    });
+  });
+  if(!roster.length) throw new Error("No employee records were found in the Schedule Import sheet.");
+
+  // Optional Special Activities sheet. This is intentionally additive: existing
+  // schedule imports keep working unchanged when the sheet is absent.
+  if(wb.SheetNames.includes("Special Activities")){
+    // The sheet is optional. A header-only/empty sheet must not fail the import.
+    const specialSheet=wb.Sheets["Special Activities"];
+    const headerMatrix=XLSX.utils.sheet_to_json(specialSheet,{header:1,defval:null,raw:true});
+    const headerRow=headerMatrix.find(r=>Array.isArray(r)&&r.some(v=>cleanText(v))); 
+    const specialRows=XLSX.utils.sheet_to_json(specialSheet,{defval:null,raw:true});
+    const requiredSpecial=["Date","Batch","Activity Type","Start Time","End Time"];
+    if(headerRow){
+      const normalizedHeaders=headerRow.map(v=>cleanText(v));
+      for(const h of requiredSpecial) if(!normalizedHeaders.includes(h)) throw new Error(`Special Activities is missing required column: ${h}`);
+    }
+    const batchKey=v=>cleanText(v).toLowerCase().replace(/\s+/g,"");
+    const parseSpecialTime=raw=>{
+      if(raw instanceof Date){
+        const hh=raw.getUTCHours(), mm=raw.getUTCMinutes();
+        return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}`;
+      }
+      return parseTimePart(raw);
+    };
+    const specialByDateBatch=new Map();
+    specialRows.forEach((row,index)=>{
+      const line=index+2, date=normalizeDate(row["Date"]), batch=cleanText(row["Batch"]), type=cleanText(row["Activity Type"]), name=cleanText(row["Activity Name"]), start=parseSpecialTime(row["Start Time"]), end=parseSpecialTime(row["End Time"]);
+      if(!date&&!batch&&!type&&!start&&!end)return;
+      if(!date){errors.push(`Special Activities row ${line}: Date is required.`);return;}
+      if(date<week_start || date>week_end){errors.push(`Special Activities row ${line}: Date ${date} is outside the selected week ${week_start} to ${week_end}.`);return;}
+      if(!batch){errors.push(`Special Activities row ${line}: Batch is required.`);return;}
+      if(!type){errors.push(`Special Activities row ${line}: Activity Type is required.`);return;}
+      if(!start || !end){errors.push(`Special Activities row ${line}: Start Time and End Time must be valid times.`);return;}
+      const key=`${date}|${batchKey(batch)}`;
+      if(!specialByDateBatch.has(key))specialByDateBatch.set(key,[]);
+      specialByDateBatch.get(key).push({activity_type:name?`${type} · ${name}`:type,start_time:start,end_time:end});
+    });
+    rows.forEach((row,index)=>{
+      const employee_id=cleanText(row["Employee ID"]), batch=cleanText(row["Training Batch"]);
+      if(!employee_id || !batch)return;
+      daysOfWeek.forEach((day,di)=>{
+        const d=new Date(startDate);d.setUTCDate(d.getUTCDate()+di);const date=d.toISOString().slice(0,10);
+        const matches=specialByDateBatch.get(`${date}|${batchKey(batch)}`)||[];
+        matches.forEach(a=>activities.push({employee_id,name:cleanText(row["Agent Name"]),schedule_date:date,activity_type:a.activity_type,start_time:a.start_time,end_time:a.end_time}));
+      });
+    });
+  }
+  importData={format:"WorkSync Schedule Import v1",version:{version_name:`WorkSync ${week_start} to ${week_end}`,week_start,week_end,source_file_name:fileName},roster,schedules,activities,validation:{errors,warnings:[]}};
+  if(errors.length) throw new Error("WorkSync template validation failed: "+errors.slice(0,8).join(" | ")+(errors.length>8?` | +${errors.length-8} more`:""));
+}
+
+// Canonical template behavior: blank Shift/Status means no schedule row.
+// Off activity cells and blank activity cells produce no activity record.
+// Source times may be supplied as 24-hour or AM/PM values and are normalized to HH:MM internally; statuses are normalized
+// only to the database canonical values WORKING/OFF/VL/ML/SL.
+function lobFix(v){ return String(v||"").trim(); }
+const daysOfWeek=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+const activityNames=["Break 1","Lunch 1","Break 2","Lunch 2","BOP"];
+function sheetRows(wb,name){ return XLSX.utils.sheet_to_json(wb.Sheets[name],{defval:null}); }
+
+function parseConverted(wb){
+  const version=sheetRows(wb,"Schedule Version")[0]||{};
+  const roster=sheetRows(wb,"Roster");
+  const schedules=sheetRows(wb,"Schedules");
+  const activities=sheetRows(wb,"Schedule Activities");
+  const importedGroupById=new Map(roster.map(r=>[cleanText(r.employee_id),cleanText(r.agent_group||r["Agent Group"]||r.group_name||"").toUpperCase()||null]));
+  schedules.forEach(r=>{r.agent_group=cleanText(r.agent_group||r["Agent Group"]||"").toUpperCase()||importedGroupById.get(cleanText(r.employee_id))||null;});
+  importData={
+    version:{
+      version_name:version.version_name||`CCAC ${version.week_start||""} to ${version.week_end||""}`.trim(),
+      week_start:normalizeDate(version.week_start), week_end:normalizeDate(version.week_end),
+      source_file_name:version.source_file_name||"Beta1 workbook"
+    },
+    roster, schedules, activities
+  };
+}
+
+function parseRawSample(wb){
+  // Beta 1 fallback: the sample scheduler layout is on the first sheet.
+  const ws=wb.Sheets[wb.SheetNames[0]], rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+  if(rows.length<3) throw new Error("The schedule sheet is too short.");
+  const dateCols=[4,5,6,7,8,9,10];
+  const activityStarts=[12,17,22,27,32,37,42];
+  const activityTypes=["Break 1","Lunch 1","Break 2","Lunch 2","BOP"];
+  const dates=dateCols.map(c=>normalizeDate(rows[0][c]));
+  const roster=[], schedules=[], activities=[], seen=new Set();
+  for(let r=2;r<rows.length;r++){
+    const group=rows[r][1], display=rows[r][2]; if(!display) continue;
+    const m=String(display).match(/^\s*([^,]+)\s*,\s*(.+?)\s*$/);
+    const employee_id=m?m[1].trim():String(display).trim(), name=m?m[2].trim():String(display).trim();
+    if(!seen.has(employee_id)){roster.push({employee_id,name,lob:"CCAC",group_name:group||null,subgroup:null,site:null,team_leader:null,active:true});seen.add(employee_id)}
+    dates.forEach((date,di)=>{
+      const raw=rows[r][dateCols[di]], value=raw==null?"":String(raw).trim();
+      let schedule_status="",shift_start=null,shift_end=null;
+      if(!value){
+        // Blank source day = no schedule row. Never synthesize OTHER.
+        return;
+      }else if(value.toLowerCase()==="off"){
+        schedule_status="OFF";
+      }else if(value.includes(" - ")){
+        schedule_status="WORKING";
+        [shift_start,shift_end]=value.split(" - ").map(x=>x.trim());
+      }else{
+        schedule_status=value.toUpperCase();
+      }
+      schedules.push({employee_id,name,schedule_date:date,schedule_status,shift_start,shift_end,agent_group:cleanText(group).toUpperCase()||null});
+      for(let i=0;i<5;i++){
+        const av=rows[r][activityStarts[di]+i]; if(!av) continue;
+        const s=String(av).trim(); if(!s.includes(" - ")) continue;
+        const [start_time,end_time]=s.split(" - ").map(x=>x.trim());
+        activities.push({employee_id,name,schedule_date:date,activity_type:activityTypes[i],start_time,end_time});
+      }
+    });
+  }
+  importData={version:{version_name:`CCAC ${dates[0]} to ${dates[dates.length-1]}`,week_start:dates[0],week_end:dates[dates.length-1],source_file_name:"Raw scheduler workbook"},roster,schedules,activities};
+}
+
+async function matchImportRoster(){
+  if(!importData?.roster?.length){
+    importRosterMatch={matched:false,total:0,missing:[],inactive:[],directoryWarning:""};
+    return;
+  }
+
+  const btn=$("matchRosterBtn");
+  if(btn){btn.disabled=true;btn.textContent="Matching…";}
+  const statusEl=$("rosterMatchStatus");
+  if(statusEl) statusEl.innerHTML='<span style="color:#52677d">Matching Employee IDs to the current WorkSync roster…</span>';
+
+  const ids=[...new Set(importData.roster.map(x=>cleanText(x.employee_id)).filter(Boolean))];
+  importRosterMatch={matched:false,total:ids.length,missing:[],inactive:[],directoryWarning:""};
+
+  try{
+    // Authoritative workforce mapping: Employee ID -> LOB / Team Leader / Active.
+    const {data:masterRows,error:masterErr}=await sb.from("roster")
+      .select("employee_id,name,lob,team_leader,active,channel_allocation")
+      .in("employee_id",ids);
+    if(masterErr) throw masterErr;
+
+    const masterMap=new Map((masterRows||[]).map(x=>[cleanText(x.employee_id),x]));
+
+    // Existing employee directory supplies the richer workforce attributes
+    // already maintained in WorkSync (Group / Subgroup / Site / Email).
+    // This enrichment is best-effort so roster matching remains dependent on
+    // the authoritative roster rather than on a second identity source.
+    let agentMap=new Map();
+    const {data:agentRows,error:agentErr}=await sb.from("agents")
+      .select("employee_id,name,email,group_name,subgroup,site,team_leader,status")
+      .in("employee_id",ids);
+    if(agentErr){
+      importRosterMatch.directoryWarning="The employee directory could not be read; roster matching still completed.";
+      console.warn("Agent directory enrichment unavailable:",agentErr);
+    }else{
+      agentMap=new Map((agentRows||[]).map(x=>[cleanText(x.employee_id),x]));
+    }
+
+    importData.roster=importData.roster.map(incoming=>{
+      const id=cleanText(incoming.employee_id);
+      const master=masterMap.get(id);
+      const agent=agentMap.get(id);
+
+      if(!master){
+        importRosterMatch.missing.push({employee_id:id,name:cleanText(incoming.name)});
+        return {
+          ...incoming,
+          match_status:"NOT FOUND",
+          match_source:"Master Roster",
+          active:false
+        };
+      }
+
+      if(master.active===false){
+        importRosterMatch.inactive.push({employee_id:id,name:cleanText(master.name||incoming.name)});
+      }
+
+      return {
+        ...incoming,
+        name:cleanText(master.name||agent?.name||incoming.name),
+        lob:master.lob||incoming.lob||null,
+        group_name:agent?.group_name||incoming.group_name||null,
+        subgroup:agent?.subgroup||incoming.subgroup||null,
+        site:agent?.site||incoming.site||null,
+        team_leader:master.team_leader||agent?.team_leader||incoming.team_leader||null,
+        active:master.active===true,
+        channel_allocation:cleanText(master.channel_allocation||"").toUpperCase()||null,
+        email:agent?.email||incoming.email||null,
+        match_status:master.active===false?"INACTIVE":"MATCHED",
+        match_source:"Master Roster"
+      };
+    });
+
+    importRosterMatch.matched=
+      importRosterMatch.missing.length===0 &&
+      importRosterMatch.inactive.length===0;
+
+    if(statusEl){
+      if(importRosterMatch.matched){
+        const directoryNote=importRosterMatch.directoryWarning
+          ? ` <span style="color:#7a5b00">${escapeHtml(importRosterMatch.directoryWarning)}</span>`
+          : "";
+        statusEl.innerHTML=
+          `<span style="color:#087443;font-weight:800">✓ ${ids.length}/${ids.length} employees matched to the current roster.</span>`+
+          ` <span style="color:#52677d">Employee metadata is resolved by Employee ID before publish.</span>`+
+          directoryNote;
+      }else{
+        const pieces=[];
+        if(importRosterMatch.missing.length) pieces.push(`${importRosterMatch.missing.length} not found`);
+        if(importRosterMatch.inactive.length) pieces.push(`${importRosterMatch.inactive.length} inactive`);
+        statusEl.innerHTML=
+          `<span style="color:#a12a2a;font-weight:800">⚠ ${pieces.join(" · ")} — publishing is blocked until the roster issue is resolved.</span>`;
+      }
+    }
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent="↻ Match to Current Roster";}
+    $("publishBtn").disabled=!importRosterMatch.matched;
+  }
+}
+
+$("matchRosterBtn").onclick=async()=>{
+  try{
+    await matchImportRoster();
+    renderPreview();
+  }catch(err){
+    console.error(err);
+    importRosterMatch.matched=false;
+    $("publishBtn").disabled=true;
+    if($("rosterMatchStatus")) $("rosterMatchStatus").innerHTML=`<span style="color:#a12a2a;font-weight:800">Roster match failed: ${escapeHtml(err.message||String(err))}</span>`;
+    setMessage("Roster match failed: "+(err.message||String(err)),"err");
+  }
+};
+
+function renderPreview(){
+  const d=importData,s=d.schedules;
+  $("employees").textContent=d.roster.length;
+  $("working").textContent=s.filter(x=>String(x.schedule_status).toUpperCase()==="WORKING").length;
+  $("off").textContent=s.filter(x=>String(x.schedule_status).toUpperCase()==="OFF").length;
+  $("exceptions").textContent=s.filter(x=>["VL","ML","SL"].includes(String(x.schedule_status).toUpperCase())).length;
+  $("activities").textContent=d.activities.length;
+  $("versionText").textContent=`${d.version.version_name} · ${d.version.week_start} → ${d.version.week_end} · Source: ${d.version.source_file_name}`;
+  $("rosterBody").innerHTML=d.roster.slice(0,100).map(x=>{
+    const state=String(x.match_status||"").toUpperCase();
+    const badge=state==="MATCHED"
+      ? `<span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#e7f7ef;color:#087443;font-size:11px;font-weight:800">✓ MATCHED</span>`
+      : state==="INACTIVE"
+      ? `<span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#fff4df;color:#8a5a00;font-size:11px;font-weight:800">INACTIVE</span>`
+      : state==="NOT FOUND"
+      ? `<span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#fdeaea;color:#a12a2a;font-size:11px;font-weight:800">NOT FOUND</span>`
+      : `<span style="color:#8291a3">—</span>`;
+    return `<tr><td>${escapeHtml(x.employee_id)}</td><td>${escapeHtml(x.name)}</td><td>${escapeHtml(x.lob||"")}</td><td>${escapeHtml(x.group_name||"")}</td><td>${escapeHtml(x.team_leader||"")}</td><td>${badge}</td></tr>`;
+  }).join("");
+  $("scheduleBody").innerHTML=s.slice(0,160).map(x=>`<tr><td>${escapeHtml(x.employee_id)}</td><td>${escapeHtml(x.name||"")}</td><td>${escapeHtml(x.schedule_date)}</td><td class="status ${escapeHtml(String(x.schedule_status).toUpperCase())}">${escapeHtml(x.schedule_status)}</td><td>${escapeHtml(x.shift_start||"")}</td><td>${escapeHtml(x.shift_end||"")}</td></tr>`).join("");
+  $("preview").classList.remove("hidden"); $("publishBtn").disabled=!importRosterMatch.matched;
+}
+const nextWeekBtn=$("nextWeekBtn");
+if(nextWeekBtn){
+  nextWeekBtn.onclick=()=>{
+    const b=scheduleWeekNextBounds();
+    if($("scheduleLob")){
+      const current=branchKeyFromLabel($("scheduleLob").value)||branchKeyFromLabel(WORKSYNC_LOB_KEY)||"CCAC";
+      $("scheduleLob").value=allBranchKeys().includes(current)?current:"CCAC";
+    }
+    $("scheduleWeekStart").value=b.start;
+    $("scheduleWeekEnd").value=b.end;
+    loadPublishedWeeks();
+  };
+}
+$("file").onchange=e=>{const f=e.target.files[0];if(f){$("filemeta").textContent=f.name+" · "+Math.round(f.size/1024)+" KB";readWorkbook(f)}};
+$("drop").ondragover=e=>{e.preventDefault();$("drop").classList.add("drag")};
+$("drop").ondragleave=()=>$("drop").classList.remove("drag");
+$("drop").ondrop=e=>{e.preventDefault();$("drop").classList.remove("drag");const f=e.dataTransfer.files[0];if(f){$("file").files=e.dataTransfer.files;$("filemeta").textContent=f.name+" · "+Math.round(f.size/1024)+" KB";readWorkbook(f)}};
+$("clearBtn").onclick=()=>{
+  importData=null;
+  importRosterMatch={matched:false,total:0,missing:[],inactive:[],directoryWarning:""};
+  $("preview").classList.add("hidden");
+  $("file").value="";
+  $("filemeta").textContent="No file selected.";
+  if($("rosterMatchStatus")) $("rosterMatchStatus").textContent="Matching the uploaded employees to the current WorkSync roster…";
+  if($("matchRosterBtn")){ $("matchRosterBtn").disabled=false; $("matchRosterBtn").textContent="↻ Match to Current Roster"; }
+  setMessage("");
+};
+
+function sbWithTimeout(promise,label,ms=20000){
+  let timer;
+  const timeout=new Promise((_,reject)=>{ timer=setTimeout(()=>reject(new Error(`${label} timed out after ${Math.round(ms/1000)} seconds.`)),ms); });
+  return Promise.race([promise,timeout]).finally(()=>clearTimeout(timer));
+}
+function publishProgress(message){
+  setMessage(message,"info");
+  $("scheduleEngineFrame")?.contentWindow?.postMessage({type:"WORKSYNC_SCHEDULE_PUBLISH_PROGRESS",message},"*");
+}
+
+window.addEventListener("message",async e=>{
+  if(e.source!==$("scheduleEngineFrame")?.contentWindow || e.data?.type!=="WORKSYNC_SCHEDULE_INGEST_READY_TO_PUBLISH") return;
+  const pkg=e.data.payload;
+  try{
+    if(!pkg?.version?.week_start||!pkg?.version?.week_end||!Array.isArray(pkg.roster)||!Array.isArray(pkg.schedules)||!Array.isArray(pkg.activities)) throw new Error("The ingestion engine returned an incomplete publication package.");
+    const branch=branchKeyFromLabel(pkg.engineMeta?.branch||pkg.roster?.[0]?.lob||"");
+    if(!allBranchKeys().includes(branch)) throw new Error("The ingestion engine returned an invalid Concepcion Carrier branch.");
+    if(!pkg.schedules.length) throw new Error("No daily schedule rows are available to publish.");
+    const scheduleLob=$("scheduleLob"); if(scheduleLob) scheduleLob.value=branch;
+    const ws=$("scheduleWeekStart"),we=$("scheduleWeekEnd"); if(ws) ws.value=pkg.version.week_start; if(we) we.value=pkg.version.week_end;
+    importData={format:pkg.format||"WorkSync Schedule Import v1",version:pkg.version,roster:pkg.roster,schedules:pkg.schedules,activities:pkg.activities,validation:{errors:[],warnings:[]}};
+    importRosterMatch={matched:true,total:pkg.roster.length,missing:[],inactive:[],directoryWarning:""};
+    $("publishBtn").disabled=false;
+    await $("publishBtn").click();
+  }catch(err){
+    console.error("Engine-to-Alpha5 publication handoff failed",err);
+    $("scheduleEngineFrame")?.contentWindow?.postMessage({type:"WORKSYNC_SCHEDULE_PUBLISH_RESULT",ok:false,message:err.message||String(err)},"*");
+  }
+});
+
+$("publishBtn").onclick=async()=>{
+  if(!importData || !currentUser || !currentProfile) return;
+  const allowed=["admin","ops","wfm"];
+  if(!allowed.includes(String(currentProfile.role||"").toLowerCase())){
+    setMessage("This account is not authorized to publish schedules.","err");
+    return;
+  }
+  const btn=$("publishBtn");btn.disabled=true;btn.textContent="Publishing…";
+  try{
+    const v=importData.version;
+    if(!v.week_start || !v.week_end) throw new Error("The scheduler snapshot does not contain a valid week range.");
+    if(!importData.schedules?.length) throw new Error("No schedule rows were found in the snapshot.");
+
+    const publishLob=branchKeyFromLabel($("scheduleLob")?.value)||await getScheduleLob();
+    if(!allBranchKeys().includes(publishLob)) throw new Error("Select a valid Concepcion Carrier branch before publishing the schedule.");
+
+    publishProgress(`Validating ${importData.roster.length} employees against the current roster…`);
+    const ids=importData.roster.map(x=>x.employee_id).filter(Boolean);
+    const {data:masterRoster,error:mr}=await sbWithTimeout(
+      sb.from("roster").select("employee_id,name,lob,team_leader,active,group_name,subgroup,site,channel_allocation").in("employee_id",ids),
+      "Roster validation",20000
+    );
+    if(mr) throw mr;
+    const masterMap=new Map((masterRoster||[]).map(x=>[x.employee_id,x]));
+    const validationErrors=[];
+    for(const incoming of importData.roster){
+      const master=masterMap.get(incoming.employee_id);
+      if(!master){
+        incoming.match_status="ROSTER PENDING";
+        incoming.lob=incoming.lob||publishLob;
+        if(branchKeyFromLabel(incoming.lob)!==publishLob){
+          validationErrors.push(`${incoming.employee_id} — ${incoming.name}: source branch ${branchLabel(incoming.lob)||incoming.lob||"—"} does not match selected branch ${branchLabel(publishLob)}.`);
+        }
+        continue;
+      }
+      if(master.active===false) validationErrors.push(`${incoming.employee_id} — ${incoming.name}: employee is inactive in the master roster.`);
+      incoming.lob=master.lob||publishLob;
+      incoming.group_name=master.group_name||null;
+      incoming.subgroup=master.subgroup||null;
+      incoming.team_leader=master.team_leader||null;
+      incoming.site=master.site||null;
+      incoming.active=master.active;
+      incoming.channel_allocation=cleanText(master.channel_allocation||"").toUpperCase()||null;
+      if(branchKeyFromLabel(incoming.lob)!==publishLob){
+        validationErrors.push(`${incoming.employee_id} — ${incoming.name}: roster branch ${branchLabel(incoming.lob)||incoming.lob||"—"} does not match selected branch ${branchLabel(publishLob)}.`);
+      }
+    }
+    if(validationErrors.length) throw new Error("Schedule validation failed: "+validationErrors.slice(0,10).join(" | ")+(validationErrors.length>10?` | +${validationErrors.length-10} more`:""));
+
+    publishProgress(`Preparing publication version for ${branchLabel(publishLob)} · ${v.week_start} to ${v.week_end}…`);
+    // Version numbers are constrained by week_start + week_end + version_number,
+    // regardless of LOB/status. A previous failed attempt can leave a draft row behind,
+    // so looking only at published rows can calculate the same version again and trigger
+    // the unique-constraint error. Derive the next number from every existing row for the
+    // selected Workforce week before creating a new version.
+    // Normalize week bounds to YYYY-MM-DD (avoids format mismatch hangs / empty matches)
+    const weekStart=String(v.week_start||"").slice(0,10);
+    const weekEnd=String(v.week_end||"").slice(0,10);
+    v.week_start=weekStart; v.week_end=weekEnd;
+    async function lookupWeekVersions(){
+      return sbWithTimeout(
+        sb.from("schedule_versions")
+          .select("version_number,week_start,week_end,lob,status,published_at")
+          .eq("week_start",weekStart)
+          .eq("week_end",weekEnd)
+          .order("version_number",{ascending:false})
+          .limit(50),
+        "Workforce-week version lookup",30000
+      );
+    }
+    let existingWeekVersions, vr;
+    ({data:existingWeekVersions,error:vr}=await lookupWeekVersions());
+    if(vr && /timed out/i.test(vr.message||"")){
+      publishProgress("Version lookup timed out — retrying…");
+      ({data:existingWeekVersions,error:vr}=await lookupWeekVersions());
+    }
+    if(vr) throw vr;
+    const nextVersionNumber=(existingWeekVersions||[]).reduce((m,row)=>Math.max(m,Number(row?.version_number)||0),0)+1;
+
+    const {data:version,error:ve}=await sbWithTimeout(
+      sb.from("schedule_versions").insert({lob:publishLob,week_start:v.week_start,week_end:v.week_end,version_number:nextVersionNumber,source_file_name:v.source_file_name,status:"draft",uploaded_by:currentUser.id}).select("id,version_number,lob,week_start,week_end").single(),
+      "Schedule version creation",15000
+    );
+    if(ve) throw ve;
+
+    const matchedRosterById=new Map((importData.roster||[]).map(r=>[cleanText(r.employee_id),r]));
+    const groupById=new Map((importData.roster||[]).map(r=>[cleanText(r.employee_id),cleanText(r.agent_group||r["Agent Group"]||"").toUpperCase()||null]));
+    const schedulePayload=importData.schedules.map(x=>{
+      const linked=matchedRosterById.get(cleanText(x.employee_id))||{};
+      return {schedule_version_id:version.id,employee_id:x.employee_id,schedule_date:x.schedule_date,schedule_status:x.schedule_status,shift_start:x.shift_start||null,shift_end:x.shift_end||null,agent_group:cleanText(x.agent_group||groupById.get(cleanText(x.employee_id))||"").toUpperCase()||null,channel_allocation:cleanText(linked.channel_allocation||"").toUpperCase()||null,team_leader_snapshot:cleanText(linked.team_leader||"").trim()||null};
+    });
+    publishProgress(`Writing ${schedulePayload.length} daily schedules to WorkSync…`);
+    const {data:inserted,error:se}=await sbWithTimeout(
+      sb.from("schedules").insert(schedulePayload).select("id,employee_id,schedule_date"),
+      `${schedulePayload.length} daily schedule rows`,25000
+    );
+    if(se) throw se;
+    if(!inserted || inserted.length!==schedulePayload.length) throw new Error(`Expected ${schedulePayload.length} schedules, but only ${inserted?.length||0} were returned.`);
+
+    const idMap=new Map(inserted.map(x=>[`${x.employee_id}|${x.schedule_date}`,x.id]));
+    const activityPayload=importData.activities.map(x=>({schedule_id:idMap.get(`${x.employee_id}|${x.schedule_date}`),activity_type:x.activity_type,start_time:x.start_time,end_time:x.end_time})).filter(x=>x.schedule_id);
+    if(activityPayload.length){
+      publishProgress(`Writing ${activityPayload.length} schedule activities…`);
+      const {error:ae}=await sbWithTimeout(sb.from("schedule_activities").insert(activityPayload),`${activityPayload.length} schedule activities`,25000);
+      if(ae) throw ae;
+    }
+
+    publishProgress("Checking for overlapping published versions…");
+    const {data:overlaps,error:overlapErr}=await sbWithTimeout(
+      sb.from("schedule_versions").select("id,week_start,week_end,lob").eq("status","published").eq("lob",publishLob).lte("week_start",v.week_end).gte("week_end",v.week_start),
+      "Published-version overlap check",10000
+    );
+    if(overlapErr) throw overlapErr;
+    if(overlaps?.length){
+      const overlapIds=overlaps.map(x=>x.id).filter(Boolean);
+      publishProgress(`Archiving ${overlapIds.length} overlapping published version(s)…`);
+      const {error:archiveErr}=await sbWithTimeout(
+        sb.from("schedule_versions").update({status:"archived"}).in("id",overlapIds),
+        "Archiving overlapping published version(s)",10000
+      );
+      if(archiveErr) throw archiveErr;
+    }
+
+    publishProgress(`Switching version ${version.version_number} to PUBLISHED…`);
+    // Do not request a returned row from the UPDATE. PostgREST can require SELECT visibility
+    // for return=representation even when the UPDATE itself is permitted; publication should
+    // depend only on the write succeeding, then we perform a lightweight verification read.
+    const {error:publishErr}=await sbWithTimeout(
+      sb.from("schedule_versions").update({status:"published",published_at:new Date().toISOString(),published_by:currentUser.id}).eq("id",version.id),
+      "Publishing the schedule version",10000
+    );
+    if(publishErr) throw publishErr;
+
+    // The publish UPDATE itself is the authoritative write acknowledgement.
+    // Do not block a successful publication on a follow-up SELECT; RLS/network latency
+    // can delay that read even after the write has already completed.
+    publishProgress("Publish write confirmed by WorkSync…");
+
+    const isUpcoming=String(v.week_start)>phtDate();
+    const successMsg=`Published ${branchLabel(publishLob)} successfully for ${v.week_start} to ${v.week_end}. ${importData.roster.length} employees, ${schedulePayload.length} daily schedules, and ${activityPayload.length} activities are now available to WorkSync. ${isUpcoming?"This is an upcoming week and will become effective automatically on its Week Start date.":"This is the current effective week."}`;
+    setMessage(successMsg,"ok");
+    // Notify the Schedule Engine iframe so its button leaves "Publishing…"
+    $("scheduleEngineFrame")?.contentWindow?.postMessage({type:"WORKSYNC_SCHEDULE_PUBLISH_RESULT",ok:true,message:successMsg},"*");
+    btn.textContent="Published";
+    // Refresh schedule management in the background; do not block the success UI
+    loadScheduleManagement().catch(err=>console.error("Post-publish schedule management refresh failed",err));
+  }catch(err){
+    console.error(err);
+    setMessage(`Publish stopped: ${err.message || err}. The draft can be cleaned up later; agents will only read published schedules.`,"err");
+    $("scheduleEngineFrame")?.contentWindow?.postMessage({type:"WORKSYNC_SCHEDULE_PUBLISH_RESULT",ok:false,message:err.message||String(err)},"*");
+    btn.disabled=false;btn.textContent="Publish Schedule";
+  }
+};
+
+// Live schedule propagation: refresh schedule-driven views every 30 seconds so Agent, TL,
+// and OM read the same effective published schedule version from Supabase.
+// This never touches roster data and does not interrupt Schedule Management uploads.
+let lastUserScrollAt=0;
+window.addEventListener("wheel",()=>{lastUserScrollAt=Date.now();},{passive:true,capture:true});
+window.addEventListener("scroll",()=>{lastUserScrollAt=Date.now();},{passive:true,capture:true});
+function userIsScrolling(){ return Date.now()-lastUserScrollAt < 4000; }
+let liveScheduleRefreshBusy=false;
+setInterval(async()=>{
+  if(!currentUser || !currentProfile || liveScheduleRefreshBusy || document.visibilityState!=="visible" || userIsScrolling()) return;
+  const activeView=sessionStorage.getItem("worksync.activeView") || "";
+  const liveViews=new Set(["agentHome","tlHome","myTeam","omHome","omMyTLs"]);
+  if(!liveViews.has(activeView)) return;
+  liveScheduleRefreshBusy=true;
+  try{
+    if(activeView==="agentHome") await loadAgentHome();
+    else if(activeView==="tlHome"){ tlTeamRows=[]; await loadTLHome(); }
+    else if(activeView==="myTeam"){ tlTeamRows=[]; await loadMyTeam(); }
+    else { omData.tlRows=new Map(); await loadOMHome(); }
+  }catch(err){ console.error("Live schedule refresh failed",err); }
+  finally{ liveScheduleRefreshBusy=false; }
+},30000);
+
+
+/* ========== Leave Requests Beta ==========
+   Requires Supabase tables (run in SQL editor once):
+
+   create table if not exists leave_requests (
+     id uuid primary key default gen_random_uuid(),
+     employee_id text not null,
+     employee_name text,
+     lob text,
+     team_leader text,
+     request_type text not null,
+     start_date date not null,
+     end_date date not null,
+     reason text,
+     status text not null default 'pending_om',
+     om_decision text,
+     om_note text,
+     om_decided_by uuid,
+     om_decided_at timestamptz,
+     wfm_note text,
+     wfm_updated_by uuid,
+     wfm_updated_at timestamptz,
+     created_by uuid,
+     created_at timestamptz default now(),
+     updated_at timestamptz default now()
+   );
+
+   create table if not exists app_notifications (
+     id uuid primary key default gen_random_uuid(),
+     leave_request_id uuid references leave_requests(id) on delete cascade,
+     audience_role text,
+     audience_employee_id text,
+     title text not null,
+     body text,
+     is_read boolean default false,
+     created_at timestamptz default now()
+   );
+
+   -- Beta RLS (tighten later): allow authenticated read/write
+   alter table leave_requests enable row level security;
+   alter table app_notifications enable row level security;
+   create policy if not exists "lr_auth_all" on leave_requests for all to authenticated using (true) with check (true);
+   create policy if not exists "notif_auth_all" on app_notifications for all to authenticated using (true) with check (true);
+========================================== */
+const LR_STATUS_LABEL={
+  pending_om:"Pending OM",
+  om_approved:"OM Approved · Awaiting WFM",
+  om_declined:"OM Declined · Awaiting WFM",
+  applied:"Applied (WFM)",
+  not_applied:"Not Applied (WFM)"
+};
+function lrStatusLabel(s){return LR_STATUS_LABEL[s]||s||"—";}
+function lrBadge(s){return `<span class="lr-badge ${escapeHtml(s||"")}">${escapeHtml(lrStatusLabel(s))}</span>`;}
+function lrFmtDate(d){if(!d)return "—";try{return new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",month:"short",day:"numeric",year:"numeric"}).format(new Date(String(d).slice(0,10)+"T00:00:00+08:00"));}catch(e){return String(d).slice(0,10);}}
+function lrCardMeta(row){
+  return `${escapeHtml(row.request_type||"—")} · ${lrFmtDate(row.start_date)} → ${lrFmtDate(row.end_date)}`+
+    (row.employee_name?` · ${escapeHtml(row.employee_name)}`:"")+
+    (row.employee_id?` · ${escapeHtml(row.employee_id)}`:"")+
+    (row.lob?` · ${escapeHtml(branchLabel(row.lob)||row.lob)}`:"")+
+    (row.team_leader?` · TL ${escapeHtml(row.team_leader)}`:"");
+}
+async function lrNotify({leave_request_id,audience_role,audience_employee_id,title,body}){
+  try{
+    await sb.from("app_notifications").insert({
+      leave_request_id:leave_request_id||null,
+      audience_role:audience_role||null,
+      audience_employee_id:audience_employee_id||null,
+      title, body:body||null, is_read:false
+    });
+  }catch(err){ console.warn("Notification insert failed",err); }
+}
+async function lrNotifyMany(items){ for(const it of items) await lrNotify(it); }
+
+
+function lrAddDaysPht(isoDate, days){
+  const d=new Date(String(isoDate).slice(0,10)+"T00:00:00+08:00");
+  d.setDate(d.getDate()+days);
+  const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");
+  return `${y}-${m}-${day}`;
+}
+
+function setupRequestsHub(){
+  const branch=effectiveBranch();
+  const sub=$("lrHubSubtitle"), makeHint=$("lrHubMakeHint"), viewHint=$("lrHubViewHint"), note=$("lrHubNote"), makeBtn=$("lrHubMake");
+  const makeCard=$("lrHubMake");
+  if(branch==="agent"){
+    if(sub) sub.textContent="Submit a leave request or check the status of requests you already filed.";
+    if(makeHint) makeHint.textContent="Open the leave request form (2-week advance required).";
+    if(viewHint) viewHint.textContent="See Pending OM, OM decision, and final WFM status.";
+    if(makeBtn) makeBtn.style.display="";
+    if(makeCard) makeCard.style.display="";
+  }else if(branch==="tl"){
+    if(sub) sub.textContent="File your own leave request, or review requests from your team.";
+    if(makeHint) makeHint.textContent="File a personal leave request to Ops OM.";
+    if(viewHint) viewHint.textContent="Read-only list of your team's leave requests and history.";
+    if(makeBtn) makeBtn.style.display="";
+    if(makeCard) makeCard.style.display="";
+  }else if(branch==="om"){
+    if(sub) sub.textContent="Review pending agent leave requests and take Accept or Decline action.";
+    if(makeHint) makeHint.textContent="";
+    if(viewHint) viewHint.textContent="Pending decisions with agent, dates, TL, and reason.";
+    if(makeBtn) makeBtn.style.display="none";
+    const makeCard=$("lrHubMake"); if(makeCard) makeCard.style.display="none";
+  }else{
+    if(sub) sub.textContent="Workforce heads-up queue and final status updates after OM decision.";
+    if(makeHint) makeHint.textContent="WFM does not file agent leave here.";
+    if(viewHint) viewHint.textContent="Open the WFM leave queue to finalize applied / not applied.";
+    if(makeBtn) makeBtn.style.display="none";
+    if(note) note.textContent="After OM decides, requests appear here for WFM. Confirm email, plot the schedule, then mark Applied or Not Applied.";
+  }
+}
+function lrOpenMakeRequest(){
+  const branch=effectiveBranch();
+  if(branch==="wfm"||branch==="admin"){ showView("wfmRequests"); return; }
+  showView("agentRequests");
+}
+function lrOpenViewRequests(){
+  const branch=effectiveBranch();
+  if(branch==="agent") showView("viewRequests");
+  else if(branch==="tl") showView("tlViewRequests");
+  else if(branch==="om") showView("omRequests");
+  else showView("wfmRequests");
+}
+function lrBackToHub(){ showView("requestsHub"); }
+
+function initLeaveRequestForm(){
+  const filedOn=typeof phtDate==="function"?phtDate():new Date().toISOString().slice(0,10);
+  const minStart=lrAddDaysPht(filedOn,14);
+  const start=$("lrStart"), end=$("lrEnd"), msg=$("lrSubmitMsg"), type=$("lrType");
+  if(type){ type.value="VL"; }
+  if(start){ start.min=minStart; if(start.value && start.value<minStart) start.value=minStart; }
+  if(end){ end.min=minStart; }
+  if(start && end){
+    start.onchange=()=>{ if(end.value && end.value<start.value) end.value=start.value; end.min=start.value||minStart; };
+  }
+  if(msg && !msg.dataset.keep) msg.innerHTML="";
+}
+
+async function submitLeaveRequest(){
+  const btn=$("lrSubmitBtn");
+  if(!currentUser||!currentProfile) return;
+  const request_type=($("lrType")?.value||"").trim();
+  const start_date=($("lrStart")?.value||"").trim();
+  const end_date=($("lrEnd")?.value||"").trim();
+  const reason=($("lrReason")?.value||"").trim();
+  const msg=$("lrSubmitMsg");
+  if(!request_type||!start_date||!end_date){ if(msg) msg.innerHTML='<div class="banner err">Invalid request: request type, start date, and end date are required.</div>'; return; }
+  if(request_type!=="VL"){ if(msg) msg.innerHTML='<div class="banner err">Invalid request: only <strong>VL (Vacation Leave)</strong> is available in this beta. Other request types are locked.</div>'; return; }
+  if(end_date<start_date){ if(msg) msg.innerHTML='<div class="banner err">Invalid request: end date cannot be before start date.</div>'; return; }
+  // Lead time: requested start must be at least 14 calendar days after filing date (PHT).
+  const filedOn=typeof phtDate==="function"?phtDate():new Date().toISOString().slice(0,10);
+  const minStart=(()=>{const d=new Date(filedOn+"T00:00:00+08:00");d.setDate(d.getDate()+14);const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,"0"),day=String(d.getDate()).padStart(2,"0");return `${y}-${m}-${day}`;})();
+  if(start_date<minStart){
+    if(msg) msg.innerHTML=`<div class="banner err">Invalid request: leave must be requested at least 2 weeks in advance. Earliest allowed start date is <strong>${escapeHtml(minStart)}</strong> (filed ${escapeHtml(filedOn)} PHT).</div>`;
+    return;
+  }
+  btn.disabled=true; btn.textContent="Submitting…";
+  try{
+    let lob=null, team_leader=null, employee_name=currentProfile.display_name||null;
+    if(currentProfile.employee_id){
+      const {data:roster}=await sb.from("roster").select("lob,team_leader,name").eq("employee_id",currentProfile.employee_id).maybeSingle();
+      if(roster){ lob=roster.lob||null; team_leader=roster.team_leader||null; employee_name=roster.name||employee_name; }
+    }
+    const payload={
+      employee_id:currentProfile.employee_id||null,
+      employee_name,
+      lob, team_leader,
+      request_type, start_date, end_date, reason:reason||null,
+      status:"pending_om",
+      created_by:currentUser.id
+    };
+    const {data,error}=await sb.from("leave_requests").insert(payload).select("id,request_type,start_date,end_date,employee_name,employee_id").single();
+    if(error) throw error;
+    await lrNotifyMany([
+      {
+        leave_request_id:data.id,
+        audience_role:"ops",
+        title:"New leave request pending OM decision",
+        body:`${data.employee_name||data.employee_id||"Agent"} filed ${data.request_type} (${data.start_date} → ${data.end_date}).`
+      },
+      {
+        leave_request_id:data.id,
+        audience_employee_id:data.employee_id||currentProfile.employee_id,
+        title:"Leave request submitted",
+        body:`Your ${data.request_type} request (${data.start_date} → ${data.end_date}) was sent to Ops OM. Status: Pending OM.`
+      },
+      {
+        leave_request_id:data.id,
+        audience_role:"tl",
+        title:"Team member filed a leave request",
+        body:`${data.employee_name||data.employee_id||"Agent"} filed ${data.request_type} (${data.start_date} → ${data.end_date}). Awaiting OM decision.`
+      }
+    ]);
+    if(msg) msg.innerHTML=`<div class="banner ok"><strong>Request submitted.</strong> Your ${escapeHtml(data.request_type)} request (${escapeHtml(data.start_date)} → ${escapeHtml(data.end_date)}) was sent to Ops OM. Status: Pending OM. Open <strong>View Requests</strong> to track it.</div>`;
+    if($("lrReason")) $("lrReason").value="";
+    if($("lrStart")) $("lrStart").value="";
+    if($("lrEnd")) $("lrEnd").value="";
+    await loadAgentLeaveRequests();
+    await refreshLeaveNotifications();
+  }catch(err){
+    console.error(err);
+    if(msg) msg.innerHTML=`<div class="banner err">Could not submit: ${escapeHtml(err.message||String(err))}. Ensure leave_requests table exists and RLS allows insert.</div>`;
+  }finally{
+    btn.disabled=false; btn.textContent="Submit request";
+  }
+}
+
+function renderLeaveCards(rows, mode){
+  if(!rows?.length) return '<div class="lr-empty"><strong>No requests yet.</strong>Nothing to show for this view.</div>';
+  return rows.map(row=>{
+    const filed=row.created_at?new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Manila",dateStyle:"medium",timeStyle:"short"}).format(new Date(row.created_at))+" PHT":"—";
+    const noteBits=[];
+    if(row.om_decision) noteBits.push(`OM: ${row.om_decision}${row.om_note?" — "+row.om_note:""}`);
+    if(row.wfm_note) noteBits.push(`WFM: ${row.wfm_note}`);
+    if(row.reason) noteBits.push(`Reason: ${row.reason}`);
+    let actions="";
+    if((mode==="om"||mode==="om_hist") && row.status==="pending_om"){
+      actions=`<input class="lr-note-input" id="lrNote_${row.id}" placeholder="Optional OM note"><div class="lr-card-actions">
+        <button type="button" class="lr-approve" data-lr-om="${row.id}" data-decision="approved">Accept</button>
+        <button type="button" class="lr-decline" data-lr-om="${row.id}" data-decision="declined">Decline</button>
+      </div>`;
+    }
+    if(mode==="wfm" && (row.status==="om_approved"||row.status==="om_declined")){
+      actions=`<input class="lr-note-input" id="lrWfmNote_${row.id}" placeholder="WFM note after email / plot"><div class="lr-card-actions">
+        <button type="button" class="lr-apply" data-lr-wfm="${row.id}" data-final="applied">Mark Applied</button>
+        <button type="button" class="lr-reject" data-lr-wfm="${row.id}" data-final="not_applied">Mark Not Applied</button>
+        <button type="button" class="lr-decline" data-lr-del="${row.id}">Delete</button>
+      </div>`;
+    }
+    if(mode==="wfm_hist"){
+      actions=`<div class="lr-card-actions">
+        <button type="button" class="lr-decline" data-lr-del="${row.id}">Delete</button>
+      </div>`;
+    }
+    // Richer card for OM
+    if(mode==="om"||mode==="om_hist"){
+      return `<article class="lr-card" data-id="${row.id}">
+        <div class="lr-card-head">
+          <div>
+            <strong>${escapeHtml(row.request_type||"Request")} · ${escapeHtml(row.employee_name||"—")}</strong>
+            <div class="meta" style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;max-width:560px">
+              <span><b style="color:#52677d">Employee ID</b><br>${escapeHtml(row.employee_id||"—")}</span>
+              <span><b style="color:#52677d">Team Leader</b><br>${escapeHtml(row.team_leader||"—")}</span>
+              <span><b style="color:#52677d">Start date</b><br>${escapeHtml(lrFmtDate(row.start_date))}</span>
+              <span><b style="color:#52677d">End date</b><br>${escapeHtml(lrFmtDate(row.end_date))}</span>
+              <span><b style="color:#52677d">Date filed</b><br>${escapeHtml(filed)}</span>
+              <span><b style="color:#52677d">LOB</b><br>${escapeHtml(branchLabel(row.lob)||row.lob||"—")}</span>
+            </div>
+            ${row.reason?`<div class="meta" style="margin-top:8px"><b style="color:#52677d">Reason</b> — ${escapeHtml(row.reason)}</div>`:""}
+            ${noteBits.filter(x=>!x.startsWith("Reason:")).length?`<div class="meta" style="margin-top:6px">${escapeHtml(noteBits.filter(x=>!x.startsWith("Reason:")).join(" · "))}</div>`:""}
+          </div>
+          ${lrBadge(row.status)}
+        </div>
+        ${actions}
+      </article>`;
+    }
+    return `<article class="lr-card" data-id="${row.id}">
+      <div class="lr-card-head"><div><strong>${escapeHtml(row.request_type||"Request")}</strong><div class="meta">${lrCardMeta(row)}</div>
+      <div class="meta" style="margin-top:4px">Filed ${escapeHtml(filed)}</div>
+      ${noteBits.length?`<div class="meta" style="margin-top:6px">${escapeHtml(noteBits.join(" · "))}</div>`:""}
+      </div>${lrBadge(row.status)}</div>${actions}</article>`;
+  }).join("");
+}
+
+async function loadAgentLeaveRequests(){
+  const box=$("lrAgentList"); if(!box) return;
+  if(!currentProfile?.employee_id){ box.innerHTML='<div class="lr-empty">Your profile has no Employee ID linked.</div>'; return; }
+  box.innerHTML='<div class="lr-empty">Loading…</div>';
+  const {data,error}=await sb.from("leave_requests").select("*").eq("employee_id",currentProfile.employee_id).order("created_at",{ascending:false}).limit(50);
+  if(error){ box.innerHTML=`<div class="lr-empty"><strong>Could not load requests.</strong>${escapeHtml(error.message)}</div>`; return; }
+  box.innerHTML=renderLeaveCards(data||[], "agent");
+}
+
+async function loadTLLeaveRequests(){
+  const list=$("lrTLList"), hist=$("lrTLHistory");
+  if(!currentProfile?.display_name){ if(list) list.innerHTML='<div class="lr-empty">TL profile required.</div>'; return; }
+  const {data:tlProfiles}=await sb.from("profiles").select("display_name").eq("role","tl");
+  const leaders=(tlProfiles||[]).map(x=>({name:cleanText(x.display_name)})).filter(x=>x.name);
+  const tlName=(typeof resolveMasterTL==="function"?resolveMasterTL(currentProfile.display_name,leaders).name:null)||currentProfile.display_name;
+  const {data:roster}=await sb.from("roster").select("employee_id").eq("team_leader",tlName).eq("active",true);
+  const ids=(roster||[]).map(x=>x.employee_id).filter(Boolean);
+  if(!ids.length){
+    const empty='<div class="lr-empty">No active agents found under your team leader name.</div>';
+    if(list) list.innerHTML=empty; if(hist) hist.innerHTML=empty; return;
+  }
+  const {data,error}=await sb.from("leave_requests").select("*").in("employee_id",ids).order("created_at",{ascending:false}).limit(80);
+  if(error){
+    const err=`<div class="lr-empty"><strong>Could not load team requests.</strong>${escapeHtml(error.message)}</div>`;
+    if(list) list.innerHTML=err; if(hist) hist.innerHTML=err; return;
+  }
+  const rows=data||[];
+  const open=rows.filter(r=>r.status==="pending_om"||r.status==="om_approved"||r.status==="om_declined");
+  if(list) list.innerHTML=renderLeaveCards(open, "tl");
+  if(hist) hist.innerHTML=renderLeaveCards(rows, "tl");
+}
+
+async function loadOMLeaveRequests(pendingOnly){
+  const box=pendingOnly?$("lrOMPending"):$("lrOMHistory");
+  if(!box) return;
+  box.innerHTML='<div class="lr-empty">Loading…</div>';
+  // View requests for OM: show pending first (with actions), then recent history
+  if(pendingOnly){
+    const {data,error}=await sb.from("leave_requests").select("*").order("created_at",{ascending:false}).limit(100);
+    if(error){ box.innerHTML=`<div class="lr-empty"><strong>Could not load requests.</strong>${escapeHtml(error.message)}</div>`; return; }
+    const rows=data||[];
+    const pending=rows.filter(r=>r.status==="pending_om");
+    const rest=rows.filter(r=>r.status!=="pending_om");
+    let html="";
+    html+=`<h3 style="margin:0 0 10px;font-size:15px">Pending decisions (${pending.length})</h3>`;
+    html+=renderLeaveCards(pending,"om");
+    if(rest.length){
+      html+=`<h3 style="margin:22px 0 10px;font-size:15px">Recent history</h3>`;
+      html+=renderLeaveCards(rest.slice(0,30),"om_hist");
+    }
+    box.innerHTML=html;
+    box.querySelectorAll("[data-lr-om]").forEach(btn=>{
+      btn.onclick=()=>omDecideLeave(btn.getAttribute("data-lr-om"), btn.getAttribute("data-decision"));
+    });
+    return;
+  }
+  let q=sb.from("leave_requests").select("*").order("created_at",{ascending:false}).limit(100);
+  const {data,error}=await q;
+  if(error){ box.innerHTML=`<div class="lr-empty"><strong>Could not load requests.</strong>${escapeHtml(error.message)}</div>`; return; }
+  box.innerHTML=renderLeaveCards(data||[], "om_hist");
+  box.querySelectorAll("[data-lr-om]").forEach(btn=>{
+    btn.onclick=()=>omDecideLeave(btn.getAttribute("data-lr-om"), btn.getAttribute("data-decision"));
+  });
+}
+
+async function omDecideLeave(id, decision){
+  if(!id||!decision) return;
+  const note=($("lrNote_"+id)?.value||"").trim();
+  const status=decision==="approved"?"om_approved":"om_declined";
+  try{
+    const {data:row,error}=await sb.from("leave_requests").update({
+      status, om_decision:decision, om_note:note||null,
+      om_decided_by:currentUser.id, om_decided_at:new Date().toISOString(), updated_at:new Date().toISOString()
+    }).eq("id",id).eq("status","pending_om").select("*").single();
+    if(error) throw error;
+    // WFM heads-up first, then agent + TL
+    await lrNotifyMany([
+      {leave_request_id:id,audience_role:"wfm",title:`OM ${decision} leave request — WFM heads-up`,body:`${row.employee_name||row.employee_id} · ${row.request_type} ${row.start_date}→${row.end_date}. Await email, then plot and finalize in WorkSync.`},
+      {leave_request_id:id,audience_employee_id:row.employee_id,title:`OM ${decision} your leave request`,body:`${row.request_type} (${row.start_date} → ${row.end_date}). Final status will follow after email confirmation and WFM update.`},
+      {leave_request_id:id,audience_role:"tl",title:`OM ${decision} team leave request`,body:`${row.employee_name||row.employee_id} · ${row.request_type} ${row.start_date}→${row.end_date}.`}
+    ]);
+    toast(`Request ${decision}. Workforce has been notified.`);
+    await loadOMLeaveRequests(true);
+    await loadOMLeaveRequests(false);
+    await refreshLeaveNotifications();
+  }catch(err){
+    console.error(err);
+    toast("OM decision failed: "+(err.message||String(err)));
+  }
+}
+
+async function loadWFMLeaveRequests(){
+  const queue=$("lrWFMQueue"), hist=$("lrWFMHistory");
+  if(queue) queue.innerHTML='<div class="lr-empty">Loading…</div>';
+  const {data,error}=await sb.from("leave_requests").select("*").order("created_at",{ascending:false}).limit(100);
+  if(error){
+    const err=`<div class="lr-empty"><strong>Could not load leave requests.</strong>${escapeHtml(error.message)}<br>Create the leave_requests table in Supabase if needed.</div>`;
+    if(queue) queue.innerHTML=err; if(hist) hist.innerHTML=err; return;
+  }
+  const rows=data||[];
+  const waiting=rows.filter(r=>r.status==="om_approved"||r.status==="om_declined");
+  const done=rows.filter(r=>r.status==="applied"||r.status==="not_applied");
+  if(queue){
+    queue.innerHTML=renderLeaveCards(waiting,"wfm");
+    queue.querySelectorAll("[data-lr-wfm]").forEach(btn=>{
+      btn.onclick=()=>wfmFinalizeLeave(btn.getAttribute("data-lr-wfm"), btn.getAttribute("data-final"));
+    });
+    queue.querySelectorAll("[data-lr-del]").forEach(btn=>{
+      btn.onclick=()=>wfmDeleteLeave(btn.getAttribute("data-lr-del"));
+    });
+  }
+  if(hist){
+    hist.innerHTML=renderLeaveCards(done,"wfm_hist");
+    hist.querySelectorAll("[data-lr-del]").forEach(btn=>{
+      btn.onclick=()=>wfmDeleteLeave(btn.getAttribute("data-lr-del"));
+    });
+  }
+}
+
+async function wfmFinalizeLeave(id, finalStatus){
+  if(!id||!finalStatus) return;
+  const note=($("lrWfmNote_"+id)?.value||"").trim();
+  try{
+    const {data:row,error}=await sb.from("leave_requests").update({
+      status:finalStatus,
+      wfm_note:note||null,
+      wfm_updated_by:currentUser.id,
+      wfm_updated_at:new Date().toISOString(),
+      updated_at:new Date().toISOString()
+    }).eq("id",id).in("status",["om_approved","om_declined"]).select("*").single();
+    if(error) throw error;
+    const label=finalStatus==="applied"?"applied to schedule":"not applied";
+    await lrNotifyMany([
+      {leave_request_id:id,audience_employee_id:row.employee_id,title:`Leave request ${label}`,body:`${row.request_type} (${row.start_date} → ${row.end_date}) is now ${label} in WorkSync.`},
+      {leave_request_id:id,audience_role:"tl",title:`Team leave ${label}`,body:`${row.employee_name||row.employee_id} · ${row.request_type} ${row.start_date}→${row.end_date}.`},
+      {leave_request_id:id,audience_role:"ops",title:`Leave request ${label}`,body:`${row.employee_name||row.employee_id} · ${row.request_type} finalized by WFM.`}
+    ]);
+    toast("Final status updated. Agent, TL, and Ops notified in-app.");
+    await loadWFMLeaveRequests();
+    await refreshLeaveNotifications();
+  }catch(err){
+    console.error(err);
+    toast("WFM update failed: "+(err.message||String(err)));
+  }
+}
+
+async function wfmDeleteLeave(id){
+  if(!id) return;
+  const branch=effectiveBranch();
+  if(branch!=="wfm" && branch!=="admin"){
+    toast("Only WFM can delete leave requests.");
+    return;
+  }
+  if(!confirm("Delete this leave request permanently? Related in-app notifications will also be removed.")) return;
+  try{
+    // Notifications cascade if FK is ON DELETE CASCADE; still try explicit cleanup
+    await sb.from("app_notifications").delete().eq("leave_request_id",id);
+    const {error}=await sb.from("leave_requests").delete().eq("id",id);
+    if(error) throw error;
+    toast("Leave request deleted.");
+    await loadWFMLeaveRequests();
+    await refreshLeaveNotifications();
+  }catch(err){
+    console.error(err);
+    toast("Delete failed: "+(err.message||String(err)));
+  }
+}
+
+
+async function refreshLeaveNotifications(){
+  const panel=$("lrNotifPanel"), countEl=$("lrNotifCount");
+  if(!panel||!currentProfile) return;
+  const role=String(currentProfile.role||"").toLowerCase();
+  const eid=currentProfile.employee_id||"";
+  // Pull recent notifications; filter client-side for beta simplicity
+  const {data,error}=await sb.from("app_notifications").select("*").order("created_at",{ascending:false}).limit(40);
+  if(error){ panel.innerHTML=`<div class="lr-empty" style="margin:6px">${escapeHtml(error.message)}</div>`; return; }
+  const mine=(data||[]).filter(n=>{
+    if(n.audience_employee_id && eid && n.audience_employee_id===eid) return true;
+    if(n.audience_role==="wfm" && (role==="wfm"||role==="admin")) return true;
+    if(n.audience_role==="ops" && (role==="ops"||role==="ops_om")) return true;
+    if(n.audience_role==="tl" && role==="tl") return true;
+    if(n.audience_role==="user" && role==="user") return true;
+    return false;
+  });
+  const unread=mine.filter(n=>!n.is_read).length;
+  if(countEl){ countEl.textContent=String(unread); countEl.classList.toggle("show", unread>0); }
+  if(!mine.length){ panel.innerHTML='<div class="lr-empty" style="margin:6px">No notifications yet.</div>'; return; }
+  panel.innerHTML=mine.map(n=>`<div class="lr-notif-item ${n.is_read?"":"unread"}" data-nid="${n.id}" data-leave="${n.leave_request_id||""}" style="cursor:pointer">
+    <div class="t">${escapeHtml(n.title||"Alert")}</div>
+    <div class="b">${escapeHtml(n.body||"")}</div>
+  </div>`).join("");
+  panel.querySelectorAll(".lr-notif-item").forEach(el=>{
+    el.onclick=async()=>{
+      const id=el.getAttribute("data-nid");
+      try{ await sb.from("app_notifications").update({is_read:true}).eq("id",id); }catch(e){}
+      el.classList.remove("unread");
+      $("lrNotifPanel")?.classList.remove("open");
+      const branch=effectiveBranch();
+      if(branch==="agent") showView("viewRequests");
+      else if(branch==="tl") showView("tlViewRequests");
+      else if(branch==="om") showView("omRequests");
+      else if(branch==="wfm"||branch==="admin") showView("wfmRequests");
+      else showView("requestsHub");
+      await refreshLeaveNotifications();
+    };
+  });
+}
+
+// Wire submit + notifications UI
+document.addEventListener("click",e=>{
+  if(e.target?.id==="lrNotifBtn" || e.target?.closest?.("#lrNotifBtn")){
+    e.stopPropagation();
+    $("lrNotifPanel")?.classList.toggle("open");
+    refreshLeaveNotifications();
+  }else if(!e.target?.closest?.("#lrNotifWrap")){
+    $("lrNotifPanel")?.classList.remove("open");
+  }
+});
+
+
+
+/* CIT Voice allocation pool — Working status still comes from published schedule for the day */
+const CCAC_VOICE_POOL=new Set([
+  "M151475","M152004","M152010","M153851","M156262","M156986","M158130",
+  "M159249","M159255","M159259","M159261","M159760","M159762","M159764",
+  "M159768","M159770","M159772","M159774","M159778"
+]);
+function isCcacVoiceAgent(employeeId){
+  return CCAC_VOICE_POOL.has(String(employeeId||"").trim().toUpperCase());
+}
+
+/* ===== Break dispersion (Schedule Management) ===== */
+let dispersionRows=[];
+function dispParseHHMM(v){
+  const m=String(v||"").match(/^(\d{1,2}):(\d{2})/);
+  if(!m) return null;
+  return parseInt(m[1],10)*60+parseInt(m[2],10);
+}
+function dispHealth(available, minAvail){
+  // RED: below hard floor | AMBER: at floor but thin | GREEN: comfortable (>= min*2 or >=4 when min=2)
+  const floor=Math.max(1,minAvail||2);
+  const greenAt=Math.max(floor*2, floor+2);
+  if(available<floor) return {level:"red", label:"RED", outlook:"SL likely compromised — too few on cover"};
+  if(available<greenAt) return {level:"amber", label:"AMBER", outlook:"SL at risk but manageable — thin cover"};
+  return {level:"green", label:"GREEN", outlook:"Healthy cover — room to breathe"};
+}
+/* DISP_NOW_BEGIN -- "current time" for re-dispersion: activities starting before it are frozen */
+let dispNowManual=false;
+function dispPcClockHHMM(){ const d=new Date(); return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
+function dispPhtClockHHMM(){
+  try{
+    const p=new Intl.DateTimeFormat("en-GB",{timeZone:"Asia/Manila",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(new Date());
+    const h=p.find(x=>x.type==="hour").value, m=p.find(x=>x.type==="minute").value;
+    return (h==="24"?"00":h)+":"+m;
+  }catch(e){ return dispPcClockHHMM(); }
+}
+function dispUpdateNowNote(){
+  const note=$("dispNowNote"); if(!note) return;
+  const pc=dispPcClockHHMM(), pht=dispPhtClockHHMM();
+  const date=($("dispDate")?.value||"").slice(0,10);
+  let today=""; try{ today=typeof phtDate==="function"?phtDate():""; }catch(e){}
+  let rule="Activities starting before this time are left as scheduled; later ones can be re-dispersed.";
+  if(date && today && date<today) rule="This date is in the past: nothing can be re-dispersed.";
+  else if(date && today && date>today) rule="This date is in the future: the whole day can be re-dispersed.";
+  note.textContent=rule+" PC clock "+pc+" | Manila (PHT) "+pht+(pc!==pht?" -- the schedule is in PHT, so check the field matches it.":"");
+}
+function dispSyncNow(force){
+  const el=$("dispNow"); if(!el) return;
+  if(force||!dispNowManual||!el.value){ el.value=dispPcClockHHMM(); if(force) dispNowManual=false; }
+  dispUpdateNowNote();
+}
+/** Minutes-after-midnight that the engine should treat as "now" for the selected date. */
+function dispNowMinutes(){
+  const date=($("dispDate")?.value||"").slice(0,10);
+  let today=""; try{ today=typeof phtDate==="function"?phtDate():""; }catch(e){}
+  if(date && today && date<today) return 24*60;   // past day: everything is frozen
+  if(date && today && date>today) return 0;       // future day: nothing is frozen
+  const v=dispParseHHMM($("dispNow")?.value);
+  return v!=null ? v : dispParseHHMM(dispPcClockHHMM());
+}
+/* DISP_NOW_END */
+function initBreakDispersion(){
+  dispSyncNow(false);
+  const d=$("dispDate");
+  if(d && !d.value){
+    try{ d.value=typeof phtDate==="function"?phtDate():new Date().toISOString().slice(0,10); }catch(e){ d.value=new Date().toISOString().slice(0,10); }
+  }
+}
+async function runBreakDispersion(){
+  if (!WorkSyncModules.isEnabled('break-dispersion')) { toast('Break Dispersion is disabled in this development session.'); return; }
+  const msg=$("dispMsg"), body=$("dispBody"), btn=$("dispRunBtn"), exp=$("dispExportBtn");
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const minAvail=dsMinOrNull();
+  const voiceTotal=Math.max(1,Number($("dispVoiceTotal")?.value||19));
+  const manualOff=Math.max(0,Math.min(50,Number($("dispManualOff")?.value||0)));
+  const win0=dispParseHHMM($("dispFrom")?.value)||0;
+  const win1=dispParseHHMM($("dispTo")?.value)||24*60;
+  if(!date){ if(msg) msg.innerHTML='<div class="banner err">Pick a date.</div>'; return; }
+  if(win1<=win0){ if(msg) msg.innerHTML='<div class="banner err">Window end must be after start.</div>'; return; }
+  if(btn){ btn.disabled=true; btn.textContent="Analyzing…"; }
+  if(msg) msg.innerHTML='<div class="banner info">Loading published CCAC schedule…</div>';
+  dispersionRows=[];
+  try{
+    await WorkSyncEnvironment.ensureReady();
+    let versions, schedules, roster, activities;
+    if (WorkSyncEnvironment.current() === 'sandbox') {
+      const snapshot = await WorkSyncEnvironment.sandboxRequest('load', { date });
+      versions = snapshot.versions || []; schedules = snapshot.schedules || [];
+      roster = snapshot.roster || []; activities = snapshot.activities || [];
+    } else {
+      const {data,error}=await sb.from("schedule_versions")
+        .select("id,lob,week_start,week_end,version_number,status")
+        .eq("status","published").eq("lob","CCAC")
+        .lte("week_start",date).gte("week_end",date)
+        .order("version_number",{ascending:false}).limit(5);
+      if(error) throw error;
+      versions = data || [];
+    }
+    if(!versions?.length){
+      if(msg) msg.innerHTML='<div class="banner err">No published CCAC schedule covers '+date+'.</div>';
+      if(body) body.innerHTML='<tr><td colspan="9" class="muted">No data.</td></tr>';
+      return;
+    }
+    const versionId=versions[0].id;
+    if (WorkSyncEnvironment.current() !== 'sandbox') {
+      const {data,error}=await sb.from("schedules")
+        .select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end")
+        .eq("schedule_version_id",versionId).eq("schedule_date",date);
+      if(error) throw error;
+      schedules = data || [];
+    }
+    const workingAll=(schedules||[]).filter(s=>String(s.schedule_status||"").toUpperCase()==="WORKING");
+    const working=workingAll.filter(s=>isCcacVoiceAgent(s.employee_id));
+    if(!workingAll.length){
+      if(msg) msg.innerHTML='<div class="banner warn">No WORKING agents on '+date+'.</div>';
+      if(body) body.innerHTML='<tr><td colspan="9" class="muted">No WORKING rows.</td></tr>';
+      return;
+    }
+    if(!working.length){
+      if(msg) msg.innerHTML='<div class="banner warn">No CIT Voice agents are WORKING on '+date+' (pool size '+CCAC_VOICE_POOL.size+').</div>';
+      if(body) body.innerHTML='<tr><td colspan="9" class="muted">No voice WORKING rows.</td></tr>';
+      return;
+    }
+    const eids=[...new Set(working.map(s=>s.employee_id).filter(Boolean))];
+    if (WorkSyncEnvironment.current() !== 'sandbox') {
+      const {data,error}=await sb.from("roster").select("employee_id,name,team_leader,group_name,lob").in("employee_id",eids);
+      if(error) throw error;
+      roster=data||[];
+      activities=[];
+      const schedIds=working.map(s=>s.id).filter(Boolean);
+      const empBySched=new Map(working.map(s=>[String(s.id), s.employee_id]));
+      if(schedIds.length){
+        const {data:acts,error:ae}=await sb.from("schedule_activities")
+          .select("schedule_id,activity_type,start_time,end_time")
+          .in("schedule_id",schedIds);
+        if(ae) throw new Error("Could not load schedule activities: "+(ae.message||String(ae)));
+        activities=(acts||[]).map(a=>Object.assign({}, a, {employee_id:empBySched.get(String(a.schedule_id))}));
+      }
+    } else {
+      const empBySched=new Map(working.map(s=>[String(s.id), s.employee_id]));
+      activities=(activities||[]).map(a=>Object.assign({}, a, {employee_id:empBySched.get(String(a.schedule_id))}));
+    }
+    const rosterBy=new Map((roster||[]).map(r=>[r.employee_id,r]));
+    const actsBy=new Map();
+    activities.forEach(a=>{
+      if(!actsBy.has(a.employee_id)) actsBy.set(a.employee_id,[]);
+      actsBy.get(a.employee_id).push(a);
+    });
+    const agents=working.map(s=>{
+      const r=rosterBy.get(s.employee_id)||{};
+      const ss=covParseTimeToMin(s.shift_start), se=covParseTimeToMin(s.shift_end);
+      const segs=covBuildIntervals(ss,se,actsBy.get(s.employee_id)||[]);
+      return {employee_id:s.employee_id,name:r.name||s.employee_id,shiftStart:ss,shiftEnd:se,segs};
+    }).filter(a=>a.shiftStart!=null&&a.shiftEnd!=null&&a.shiftEnd>a.shiftStart);
+
+    const step=15;
+    const startBucket=Math.floor(win0/step)*step;
+    const rows=[];
+    let trainEvents=0;
+    agents.forEach(a=>a.segs.forEach(seg=>{
+      if(/train|pull|offline|meeting|coach/i.test(seg.label)) trainEvents++;
+    }));
+    for(let t=startBucket;t<win1;t+=step){
+      const t1=Math.min(t+step, win1);
+      if(t1<=t) continue;
+      let scheduled=0, on=0;
+      const offDetail=[];
+      let trainingN=0;
+      agents.forEach(a=>{
+        if(a.shiftEnd<=t||a.shiftStart>=t1) return;
+        scheduled++;
+        const labels=[];
+        let isOff=false, isTrain=false;
+        a.segs.forEach(seg=>{
+          if(seg.end>t && seg.start<t1){
+            isOff=true;
+            labels.push(`${a.name} (${seg.label})`);
+            if(/train|pull|offline|meeting|coach/i.test(seg.label)) isTrain=true;
+          }
+        });
+        if(isOff){
+          offDetail.push(...labels);
+          if(isTrain) trainingN++;
+        } else on++;
+      });
+      if(!scheduled) continue;
+      const schedOff=scheduled-on;
+      // Manual training/other: additional off-phone not on published activities (capped by on-floor)
+      const manual=Math.min(manualOff, on);
+      const offN=schedOff+manual;
+      const available=Math.max(0, scheduled-offN);
+      const trainingShow=trainingN+manual;
+      const need=minAvail==null?0:Math.min(minAvail, scheduled, voiceTotal);
+      const maxOff=Math.max(0, scheduled-need);
+      const allocatable=Math.floor(maxOff/2)*2;
+      const health=minAvail==null?DS_NEUTRAL:dispHealth(available, minAvail);
+      let detail=offDetail.slice(0,12).join("; ")+(offDetail.length>12?` (+${offDetail.length-12} more)`:"");
+      if(manual) detail=(detail&&detail!==""?detail+"; ":"")+`Manual training/other ×${manual}`;
+      rows.push({health, t0:t, t1, scheduled, off:offN, training:trainingShow, available, need, allocatable,
+        detail:detail||"—"});
+    }
+    dispersionRows=rows;
+    const g=rows.filter(r=>r.health.level==="green").length;
+    const a=rows.filter(r=>r.health.level==="amber").length;
+    const r=rows.filter(r=>r.health.level==="red").length;
+    if($("dispStats")) $("dispStats").style.display="";
+    // Without an explicit coverage threshold, interval health is unknown, not zero.
+    let cg=null, ca=null, cr=null;
+    if(minAvail==null && dsScan && dsScan.results){
+      cg=0; ca=0; cr=0;
+      dsScan.results.forEach(x=>{ if(x.summary){ cg+=x.summary.cGreen||0; ca+=x.summary.cAmber||0; cr+=x.summary.cRed||0; } });
+    }
+    const byClash=cg!==null;
+    if($("dispStatGreen")) $("dispStatGreen").textContent=minAvail==null?(byClash?String(cg):"—"):String(g);
+    if($("dispStatAmber")) $("dispStatAmber").textContent=minAvail==null?(byClash?String(ca):"—"):String(a);
+    if($("dispStatRed")) $("dispStatRed").textContent=minAvail==null?(byClash?String(cr):"—"):String(r);
+    if($("dispStatTrain")) $("dispStatTrain").textContent=String(trainEvents);
+    const statLabels=$("dispStats")?.querySelectorAll(".cov-stat span");
+    if(statLabels?.length>=4){
+      statLabels[0].textContent=minAvail==null?(byClash?"Green · no clash":"Green intervals · set target"):"Green intervals";
+      statLabels[1].textContent=minAvail==null?(byClash?"Amber · 2-3 off, or back-to-back":"Amber intervals · set target"):"Amber intervals";
+      statLabels[2].textContent=minAvail==null?(byClash?"Red · 4+ off, or an overlap":"Red intervals · set target"):"Red intervals";
+    }
+    if(body){
+      if(!rows.length) body.innerHTML='<tr><td colspan="9" class="muted">No intervals in this window.</td></tr>';
+      else body.innerHTML=rows.map(row=>{
+        const badge=row.health.level==="green"
+          ? '<span class="cov-badge ok">GREEN</span>'
+          : row.health.level==="amber"
+            ? '<span class="cov-badge" style="background:#fff4e5;color:#b54708">AMBER</span>'
+            : row.health.level==="red"
+            ? '<span class="cov-badge risk">RED</span>'
+            : '<span class="cov-badge" style="background:#e8f2ff;color:#1d4f91">OBSERVED</span>';
+        const cls=row.health.level==="red"?"risk":"ok";
+        return `<tr class="${cls}">
+          <td>${badge}</td>
+          <td>${covFmtMin(row.t0)} – ${covFmtMin(row.t1)}</td>
+          <td>${row.scheduled}</td>
+          <td>${row.off}</td>
+          <td class="col-extra">${row.training}</td>
+          <td><strong>${row.available}</strong></td>
+          <td class="col-extra">${row.allocatable}</td>
+          <td class="col-extra" style="white-space:normal;min-width:160px">${escapeHtml(row.health.outlook)}</td>
+          <td style="white-space:normal;min-width:260px;max-width:420px;line-height:1.45">${escapeHtml(row.detail||"—")}</td>
+        </tr>`;
+      }).join("");
+    }
+    if(exp) exp.disabled=!rows.length;
+    if(msg){
+      if(minAvail==null) msg.innerHTML=`<div class="banner info"><strong>Schedule scan complete.</strong> ${rows.length} intervals analyzed automatically. Availability counts are shown without requiring a minimum-on-phone input; dispersion recommendations focus on reducing overlapping activities · v${versions[0].version_number}${manualOff?` · manual off-phone ${manualOff}`:""}.</div>`;
+      else if(r) msg.innerHTML=`<div class="banner err"><strong>Dispersion heads-up.</strong> ${r} red / ${a} amber / ${g} green in window · minimum on phone ${minAvail}${manualOff?` · manual off-phone ${manualOff}`:""} · v${versions[0].version_number}. Focus red intervals first.</div>`;
+      else if(a) msg.innerHTML=`<div class="banner warn"><strong>Dispersion review.</strong> ${a} amber / ${g} green · no red · minimum on phone ${minAvail}${manualOff?` · manual off-phone ${manualOff}`:""} · v${versions[0].version_number}.</div>`;
+      else msg.innerHTML=`<div class="banner ok"><strong>Healthy window.</strong> All ${g} intervals green · minimum on phone ${minAvail}${manualOff?` · manual off-phone ${manualOff}`:""} · v${versions[0].version_number}.</div>`;
+    }
+  }catch(err){
+    console.error(err);
+    if(msg) msg.innerHTML=`<div class="banner err">Analysis failed: ${escapeHtml(err.message||String(err))}</div>`;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="Analyze day"; }
+  }
+}
+function exportDispersionCsv(){
+  if(!dispersionRows.length){ toast("Run analysis first."); return; }
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const header=["health","date","time_start","time_end","scheduled","off_phone","training","available","allocatable_step2","sl_outlook","detail"];
+  const lines=[header.join(",")];
+  dispersionRows.forEach(r=>{
+    lines.push([
+      r.health.label, date, covFmtMin(r.t0), covFmtMin(r.t1),
+      r.scheduled, r.off, r.training, r.available, r.allocatable,
+      `"${String(r.health.outlook||"").replace(/"/g,'""')}"`,
+      `"${String(r.detail||"").replace(/"/g,'""')}"`
+    ].join(","));
+  });
+  const blob=new Blob([lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`WorkSync_Break_Dispersion_CCAC_${date}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("Dispersion export ready.");
+}
+
+let dispersionProposal=[];
+let dispersionProposalOriginal=[];
+/** Standard voice activity template (minutes). */
+const DISP_TEMPLATE=[
+  {key:"break1", label:"Break 1", duration:15},
+  {key:"lunch1", label:"Lunch 1", duration:30},
+  {key:"break2", label:"Break 2", duration:15},
+  {key:"lunch2", label:"Lunch 2", duration:30},
+  {key:"bop", label:"BOP", duration:60}
+];
+function dispFmtRange(a,b){
+  if(a==null||b==null) return "—";
+  return covFmtMin(a)+" – "+covFmtMin(b);
+}
+/* DISP_REDISPERSE_BEGIN -- re-disperse the EXISTING schedule held by the scan; pure compute, no database call */
+function dispScanKind(label){
+  const t=String(label||"").trim().toLowerCase().replace(/\s+/g," ");
+  if(/^break ?1$/.test(t)) return "break1";
+  if(/^lunch ?1$/.test(t)) return "lunch1";
+  if(/^break ?2$/.test(t)) return "break2";
+  if(/^lunch ?2$/.test(t)) return "lunch2";
+  if(t==="bop") return "bop";
+  return null;
+}
+function dispEngineAgentsFromScan(scanAgents){
+  return (scanAgents||[]).map(a=>{
+    const ea={employee_id:a.employee_id,name:a.name,shiftStart:a.shiftStart,shiftEnd:a.shiftEnd,
+      activities:{break1:null,lunch1:null,break2:null,lunch2:null},bop:null,fixed:[],rawProblems:[]};
+    (a.segs||[]).forEach(sg=>{
+      const k=dispScanKind(sg.label);
+      if(k==="bop"){ if(!ea.bop) ea.bop={start:sg.start,end:sg.end}; else ea.fixed.push({start:sg.start,end:sg.end,label:"BOP"}); }
+      else if(k){ if(ea.activities[k]) ea.rawProblems.push("DUPLICATE_"+k.toUpperCase()); else ea.activities[k]={start:sg.start,end:sg.end}; }
+      else ea.fixed.push({start:sg.start,end:sg.end,label:sg.label});   // training / other: never moved
+    });
+    return ea;
+  });
+}
+function dispProposalRowsFromEngine(agents){
+  return agents.map(a=>({employee_id:a.employee_id,name:a.name,shiftStart:a.shiftStart,shiftEnd:a.shiftEnd,
+    break1:a.activities.break1||null,lunch1:a.activities.lunch1||null,break2:a.activities.break2||null,lunch2:a.activities.lunch2||null,bop:a.bop||null}));
+}
+/* DISP_REDISPERSE_END */
+async function proposeBreakDispersion(){
+  if (!WorkSyncModules.isEnabled('break-dispersion')) { toast('Break Dispersion is disabled in this development session.'); return; }
+  const msg=$("dispMsg"), btn=$("dispProposeBtn");
+  const E=window.WorkSyncDispersionEngine;
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const bad=t=>{ if(msg) msg.innerHTML='<div class="banner err">'+t+'</div>'; };
+  if(!E) return bad("The dispersion engine did not load. Reload the page.");
+  if(!date) return bad("Pick a date.");
+  if(!dsScan||dsScan.date!==date||!dsScan.results?.length) return bad("Press <strong>Run whole day</strong> first. The plan is built from the schedule that scan loads.");
+  const res=dsScan.results.find(r=>r.lob==="CCAC")||dsScan.results[0];
+  if(!res.agents?.length) return bad("No working CIT voice agents were found for this date.");
+  if(btn){ btn.disabled=true; btn.textContent="Proposing..."; }
+  try{
+    const nowMin=dispNowMinutes();
+    const pulled=Number(dsScan.borrow||0), minAvail=dsScan.minAvail;
+    const out=E.disperse(dispEngineAgentsFromScan(res.agents), nowMin, {pulledOff:pulled, minAvailable:minAvail, clashAt:Number(dsScan.clashAt)||4});
+    dispersionProposal=dispProposalRowsFromEngine(out.agents);
+    dispersionProposalOriginal=JSON.parse(JSON.stringify(dispersionProposal));
+    window.dispEngineResult={nowMin,pulled,minAvail,summary:out.summary,reverted:out.reverted,before:out.before,after:out.after,flagged:out.flagged,
+      changes:out.changes.map(c=>({employee_id:c.employee_id,activity:c.activity,from:c.from.start,to:c.to.start}))};
+    const panel=$("dispProposePanel"), sum=$("dispProposeSummary");
+    if(panel) panel.style.display="";
+    const at=covFmtMin(nowMin), sm=out.summary;
+    const cov=(m)=>`lowest available ${m.lowestAvailable==null?"--":m.lowestAvailable}${minAvail!=null?`, ${m.bucketsBelowMinAvail} slot(s) below the minimum of ${minAvail}`:""}`;
+    if(sum) sum.textContent=`Re-dispersed from ${at} for ${sm.agentsConsidered} agent(s) on ${date} (v${res.version?.version_number??"?"}). ${sm.activitiesMoved} activit${sm.activitiesMoved===1?"y":"ies"} moved across ${sm.agentsMoved} agent(s). Before: ${cov(out.before)}. After: ${cov(out.after)}.${pulled?` Counting ${pulled} agent(s) pulled for training.`:""}`;
+    renderDispersionProposalEditor();
+    const moved=new Map(); out.changes.forEach(c=>moved.set(c.employee_id+"|"+c.activity,c));
+    dispersionProposal.forEach((r,i)=>["break1","lunch1","break2","lunch2"].forEach(k=>{
+      const c=moved.get(r.employee_id+"|"+k); if(!c) return;
+      document.querySelectorAll(`#dispProposeBody tr[data-disp-row="${i}"] input[data-disp-time="${k}"]`).forEach(inp=>{ inp.style.outline="2px solid #2563eb"; inp.title="Moved from "+covFmtMin(c.from.start)+" to "+covFmtMin(c.to.start); });
+    }));
+    const applyBtn=$("dispApplyBtn"); if(applyBtn) applyBtn.disabled=true;   // validate first
+    const flaggedTxt=out.flagged.length?` ${out.flagged.length} agent(s) left exactly as scheduled because their rows are incomplete or inconsistent: ${out.flagged.slice(0,6).map(f=>escapeHtml(f.name||f.employee_id)+" ("+f.problems.join(", ")+")").join("; ")}${out.flagged.length>6?"; ...":""}.`:"";
+    if(msg){
+      if(out.reverted) msg.innerHTML=`<div class="banner warn"><strong>No improvement possible from ${at}.</strong> Every arrangement the engine found would leave coverage the same or worse, so the schedule is shown unchanged. Anything starting before ${at} is frozen.${flaggedTxt}</div>`;
+      else if(!sm.activitiesMoved) msg.innerHTML=`<div class="banner info"><strong>Nothing to move.</strong> From ${at} the remaining breaks are already as spread out as the rules allow.${flaggedTxt}</div>`;
+      else msg.innerHTML=`<div class="banner ok"><strong>Re-dispersion ready.</strong> Breaks and lunches starting before ${at} were left as scheduled; ${sm.activitiesMoved} later one(s) were moved (outlined in blue below). BOP, training and each agent's terminal break were not touched. Nothing is written until you validate and apply.${flaggedTxt}</div>`;
+    }
+    renderStatusCompare();
+    toast("Re-dispersion ready.");
+  }catch(err){
+    console.error(err);
+    if(msg) msg.innerHTML=`<div class="banner err">Re-dispersion failed: ${escapeHtml(err.message||String(err))}</div>`;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="Propose dispersion"; }
+  }
+}
+
+
+const DISP_ACTIVITY_KEYS=["break1","lunch1","break2","lunch2","bop"];
+const DISP_ACTIVITY_LABELS={break1:"Break 1",lunch1:"Lunch 1",break2:"Break 2",lunch2:"Lunch 2",bop:"BOP"};
+function dispTimeInputValue(p,part){
+  // HTML input[type=time] requires a 24-hour HH:MM value; covFmtMin() is display-formatted and may include AM/PM.
+  if(!p || !Number.isFinite(p[part])) return "";
+  const m=((Math.round(p[part])%1440)+1440)%1440;
+  return String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0");
+}
+function renderDispersionProposalEditor(){
+  const body=$("dispProposeBody"); if(!body) return;
+  body.innerHTML=dispersionProposal.map((r,i)=>`<tr data-disp-row="${i}">
+    <td>${escapeHtml(r.employee_id)}</td><td>${escapeHtml(r.name)}</td><td>${dispFmtRange(r.shiftStart,r.shiftEnd)}</td>
+    ${DISP_ACTIVITY_KEYS.map(key=>{const p=r[key];return `<td style="min-width:190px"><div style="display:flex;gap:4px;align-items:center"><input type="time" aria-label="${DISP_ACTIVITY_LABELS[key]} start for ${escapeHtml(r.employee_id)}" data-disp-time="${key}" data-part="start" value="${dispTimeInputValue(p,"start")}" style="min-width:86px;width:86px;padding:5px 3px"><span>–</span><input type="time" aria-label="${DISP_ACTIVITY_LABELS[key]} end for ${escapeHtml(r.employee_id)}" data-disp-time="${key}" data-part="end" value="${dispTimeInputValue(p,"end")}" style="min-width:86px;width:86px;padding:5px 3px"></div></td>`}).join("")}
+  </tr>`).join("");
+  const v=$("dispEditValidation"); if(v) v.innerHTML='<div class="banner info"><strong>Recommendations loaded.</strong> Times are shown in your browser’s local time-field format. Edit any activity below, then validate the full plan.</div>';
+  const exp=$("dispExportEdited"); if(exp) exp.disabled=true;
+}
+// Agent drill-down: filter the existing recommended plan without discarding edits.
+if($("dispAgentSearch")) $("dispAgentSearch").addEventListener("input",()=>{
+  const q=String($("dispAgentSearch").value||"").trim().toLowerCase();
+  document.querySelectorAll("#dispProposeBody tr[data-disp-row]").forEach(tr=>{
+    const r=dispersionProposal[Number(tr.getAttribute("data-disp-row"))];
+    tr.style.display=(!q || `${r?.employee_id||""} ${r?.name||""}`.toLowerCase().includes(q))?"":"none";
+  });
+});
+if($("dispShowAllAgents")) $("dispShowAllAgents").addEventListener("click",()=>{
+  if($("dispAgentSearch")) $("dispAgentSearch").value="";
+  document.querySelectorAll("#dispProposeBody tr[data-disp-row]").forEach(tr=>tr.style.display="");
+});
+
+function dispReadEditorIntoProposal(){
+  document.querySelectorAll("#dispProposeBody tr[data-disp-row]").forEach(tr=>{
+    const idx=Number(tr.getAttribute("data-disp-row")); const r=dispersionProposal[idx]; if(!r)return;
+    DISP_ACTIVITY_KEYS.forEach(key=>{
+      const st=tr.querySelector(`[data-disp-time="${key}"][data-part="start"]`)?.value||"";
+      const en=tr.querySelector(`[data-disp-time="${key}"][data-part="end"]`)?.value||"";
+      const a=dispParseHHMM(st),b=dispParseHHMM(en);
+      r[key]=(a!=null&&b!=null)?{start:a,end:b}:null;
+    });
+  });
+}
+function validateDispersionEdits(){
+  if(!dispersionProposal.length){toast("Generate a recommendation first.");return false;}
+  dispReadEditorIntoProposal();
+  const issues=[]; const occ=new Map();
+  dispersionProposal.forEach(r=>{
+    const blocks=[];
+    DISP_ACTIVITY_KEYS.forEach(key=>{
+      const p=r[key],dur=DISP_TEMPLATE.find(x=>x.key===key).duration;
+      if(!p){ if(key!=="bop") issues.push(`${r.employee_id} · ${DISP_ACTIVITY_LABELS[key]} is missing a start or end time.`); return; }
+      if(p.end<=p.start){issues.push(`${r.employee_id} · ${DISP_ACTIVITY_LABELS[key]} ends before or at its start.`);return;}
+      if(key!=="bop" && p.end-p.start!==dur) issues.push(`${r.employee_id} · ${DISP_ACTIVITY_LABELS[key]} should be ${dur} minutes; current duration is ${p.end-p.start}.`);
+      if(key!=="bop" && (p.start<r.shiftStart||p.end>r.shiftEnd)) issues.push(`${r.employee_id} · ${DISP_ACTIVITY_LABELS[key]} falls outside the shift.`);
+      blocks.push({key,...p});
+      for(let t=Math.floor(p.start/15)*15;t<p.end;t+=15)occ.set(t,(occ.get(t)||0)+1);
+    });
+    blocks.sort((a,b)=>a.start-b.start);
+    for(let i=1;i<blocks.length;i++) if(blocks[i].start<blocks[i-1].end) issues.push(`${r.employee_id} · ${DISP_ACTIVITY_LABELS[blocks[i-1].key]} overlaps ${DISP_ACTIVITY_LABELS[blocks[i].key]}.`);
+  });
+  const high=[...occ.entries()].filter(([,n])=>n>=4).length;
+  const out=$("dispEditValidation");
+  if(out){
+    if(issues.length) out.innerHTML=`<div class="banner err"><strong>${issues.length} validation issue(s).</strong><ul style="margin:6px 0 0 18px">${issues.slice(0,30).map(x=>`<li>${escapeHtml(x)}</li>`).join("")}</ul>${issues.length>30?`<div>And ${issues.length-30} more…</div>`:""}</div>`;
+    else out.innerHTML=`<div class="banner ok"><strong>Plan passed basic validation.</strong> No missing activities, duration errors, shift-boundary violations, or same-agent overlaps. There are ${high} 15-minute interval(s) with 4+ agents off-phone; review coverage before publication.</div>`;
+  }
+  const exp=$("dispExportEdited"); if(exp) exp.disabled=issues.length>0;
+  const applyBtn=$("dispApplyBtn"); if(applyBtn) applyBtn.disabled=issues.length>0;
+  window.dispersionEditValidation={valid:issues.length===0,issues,highOffIntervals:high};
+  return issues.length===0;
+}
+function exportValidatedDispersionPlan(){
+  if(!validateDispersionEdits()) return;
+  const date=($("dispDate")?.value||"").slice(0,10),q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+  const lines=[["date","employee_id","name","shift_start","shift_end","activity_type","start_time","end_time"] .join(",")];
+  dispersionProposal.forEach(r=>DISP_ACTIVITY_KEYS.forEach(key=>{const p=r[key];lines.push([date,q(r.employee_id),q(r.name),q(covFmtMin(r.shiftStart)),q(covFmtMin(r.shiftEnd)),q(DISP_ACTIVITY_LABELS[key]),q(covFmtMin(p.start)),q(covFmtMin(p.end))].join(","))}));
+  const blob=new Blob([lines.join("\n")],{type:"text/csv;charset=utf-8;"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`WorkSync_Validated_Bulk_Break_Plan_${date}.csv`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
+  toast("Validated bulk plan exported. No live schedule has been changed.");
+}
+
+/**
+ * Convert minutes since midnight (0-1439) to HH:MM:SS format for database storage.
+ */
+function minToTimeString(minutes) {
+  if(minutes == null || !Number.isFinite(minutes)) return null;
+  const m = ((Math.round(minutes) % 1440) + 1440) % 1440;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`;
+}
+
+/**
+ * Apply the validated dispersion proposal to the live schedule database.
+ * This writes break/lunch/BOP activity records to schedule_activities for the selected date.
+ */
+async function applyDispersionToSchedule() {
+  if (!WorkSyncModules.isEnabled('break-dispersion')) { toast('Break Dispersion is disabled in this development session.'); return; }
+  const btn = $("dispApplyBtn");
+  // Environment selection is verified by the owner-only backend; sandbox requests use only the Neon router.
+  let environmentState;
+  try { environmentState = await WorkSyncEnvironment.ensureReady(); }
+  catch (error) { const message = error.message || String(error); if ($('dispMsg')) $('dispMsg').innerHTML = `<div class="banner warn"><strong>Environment not verified:</strong> ${escapeHtml(message)}</div>`; toast(message); return; }
+  const date = ($("dispDate")?.value || "").slice(0, 10);
+  
+  if (!dispersionProposal.length) {
+    toast("Generate and validate a proposal first.");
+    return;
+  }
+  
+  // Validate first
+  if (!validateDispersionEdits()) {
+    toast("Cannot apply: plan has validation errors. Fix issues first.");
+    return;
+  }
+  
+  // Confirm with user
+  const targetEnvironment = environmentState.environment;
+  const targetLabel = targetEnvironment === 'sandbox' ? 'NEON SANDBOX' : 'PRODUCTION SUPABASE';
+  const confirmed = confirm(`Apply break dispersion plan to ${targetLabel} for ${date}?\n\nThis will update ${dispersionProposal.length} agents' break, lunch, and BOP activities.\n\nProceed only if this is the intended environment.`);
+  if (!confirmed) return;
+  
+  if (btn) { btn.disabled = true; btn.textContent = "Applying…"; }
+  
+  try {
+    const msg = $("dispMsg");
+    if (msg) msg.innerHTML = '<div class="banner info"><strong>Applying…</strong> Writing break plan to database.</div>';
+    
+    // Resolve the target environment before any schedule reads. Sandbox reads must
+    // come from Neon; production reads use the existing Supabase client.
+    const eids = dispersionProposal.map(r => String(r.employee_id)).filter(Boolean);
+    let versions, existingSchedules;
+    if (targetEnvironment === 'sandbox') {
+      const snapshot = await WorkSyncEnvironment.sandboxRequest('load', { date });
+      versions = snapshot.versions || [];
+      existingSchedules = (snapshot.schedules || []).filter(s => eids.includes(String(s.employee_id)));
+    } else {
+      const { data, error } = await sb.from("schedule_versions")
+        .select("id, version_number")
+        .eq("status", "published").eq("lob", "CCAC")
+        .lte("week_start", date).gte("week_end", date)
+        .order("version_number", { ascending: false }).limit(1);
+      if (error) throw error;
+      versions = data || [];
+      if (versions.length) {
+        const { data: schedules, error: scheduleError } = await sb.from("schedules")
+          .select("id, employee_id, schedule_date")
+          .eq("schedule_version_id", versions[0].id).eq("schedule_date", date).in("employee_id", eids);
+        if (scheduleError) throw scheduleError;
+        existingSchedules = schedules || [];
+      } else existingSchedules = [];
+    }
+    if (!versions?.length) throw new Error("No published CCAC schedule version found for " + date);
+    const versionId = versions[0].id;
+    const scheduleIdMap = new Map();
+    (existingSchedules || []).forEach(s => scheduleIdMap.set(String(s.employee_id), s.id));
+    
+    // Check all agents have a schedule
+    const missing = [];
+    for (const r of dispersionProposal) {
+      if (!scheduleIdMap.has(String(r.employee_id))) {
+        missing.push(r.employee_id);
+      }
+    }
+    if (missing.length) {
+      throw new Error(`Agents without published schedules: ${missing.join(", ")}. Publish schedules for these agents first.`);
+    }
+    
+    // Do not delete through the browser client. Both targets replace activities
+    // atomically inside their database transaction/RPC so failed inserts roll back.
+    
+    // Build activity payloads
+    const activityPayload = [];
+    for (const r of dispersionProposal) {
+      const scheduleId = scheduleIdMap.get(String(r.employee_id));
+      if (!scheduleId) continue;
+      
+      DISP_ACTIVITY_KEYS.forEach(key => {
+        const p = r[key];
+        if (p && typeof p.start === "number" && typeof p.end === "number") {
+          activityPayload.push({
+            schedule_id: scheduleId,
+            activity_type: DISP_ACTIVITY_LABELS[key],
+            start_time: minToTimeString(p.start),
+            end_time: minToTimeString(p.end)
+          });
+        }
+      });
+    }
+    
+    if (!activityPayload.length) {
+      throw new Error("No valid activities to write.");
+    }
+    
+    // Sandbox writes go through the owner-checked server route and one DB transaction.
+    if (WorkSyncEnvironment.current() === 'sandbox') {
+      const result = await WorkSyncEnvironment.sandboxRequest('apply', {
+        date,
+        employeeIds: eids.map(String),
+        activities: activityPayload.map(a => ({ employee_id: String([...scheduleIdMap.entries()].find(([, sid]) => String(sid) === String(a.schedule_id))?.[0] || ''), activity_type: a.activity_type, start_time: a.start_time, end_time: a.end_time }))
+      });
+      if (msg) msg.innerHTML = `<div class="banner ok"><strong>Sandbox success!</strong> Applied ${result.activityCount} activities to Neon for ${date}. Production was not targeted.</div>`;
+      toast(`Sandbox apply complete: ${result.activityCount} activities written to Neon.`);
+      return;
+    }
+    // Production replacement is a single database transaction via the reviewed RPC.
+    const rpcActivities = activityPayload.map(a => {
+      const employee = [...scheduleIdMap.entries()].find(([, scheduleId]) => String(scheduleId) === String(a.schedule_id))?.[0];
+      return { employee_id: employee, activity_type: a.activity_type, start_time: a.start_time, end_time: a.end_time };
+    });
+    const { data: { session } = {} } = await sb.auth.getSession();
+    if (!session?.access_token) throw new Error('WorkSync session expired. Sign in again.');
+    const applyResponse = await fetch(`${SUPABASE_URL}/functions/v1/production-break-dispersion-apply`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${session.access_token}`, apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date, employeeIds: eids.map(String), activities: rpcActivities })
+    });
+    const applyResult = await applyResponse.json().catch(() => ({}));
+    if (!applyResponse.ok) throw new Error(applyResult.error || `Production apply route returned ${applyResponse.status}`);
+    if (applyResult?.success !== true) throw new Error('Atomic production apply did not confirm success.');
+    
+    // Success
+    if (msg) msg.innerHTML = `<div class="banner ok"><strong>Production success!</strong> Applied break dispersion plan to ${applyResult.scheduleCount} agents for ${date}. ${applyResult.activityCount} activities committed atomically to Supabase.</div>`;
+    toast(`Break dispersion applied atomically: ${applyResult.activityCount} activities for ${date}.`);
+    
+    // Refresh the Schedule Management view in background
+    try {
+      await loadScheduleManagement();
+    } catch (e) {
+      console.error("Post-apply refresh failed", e);
+    }
+    
+  } catch (err) {
+    console.error("Apply dispersion failed", err);
+    const msg = $("dispMsg");
+    if (msg) msg.innerHTML = `<div class="banner err"><strong>Apply failed:</strong> ${escapeHtml(err.message || String(err))}</div>`;
+    toast("Apply failed: " + (err.message || String(err)));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Apply to Schedule"; }
+  }
+}
+
+async function exportDispersionProposalExcel(){
+  if(!dispersionProposal.length){ toast("Generate a proposal first."); return; }
+  if(typeof ExcelJS==="undefined"){
+    toast("Excel export library could not load. Refresh WorkSync and try again.");
+    return;
+  }
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const headers=["employee_id","name","shift","break1","lunch1","break2","lunch2","bop"];
+  const fr=(p)=>p?`${covFmtMin(p.start)}-${covFmtMin(p.end)}`:"";
+  const values=dispersionProposal.map(r=>[
+    String(r.employee_id||""), String(r.name||""),
+    `${covFmtMin(r.shiftStart)}-${covFmtMin(r.shiftEnd)}`,
+    fr(r.break1), fr(r.lunch1), fr(r.break2), fr(r.lunch2), fr(r.bop)
+  ]);
+  const longDate=date?new Date(`${date}T12:00:00`).toLocaleDateString("en-PH",{weekday:"long",year:"numeric",month:"long",day:"numeric"}):"Selected date";
+  const workbook=new ExcelJS.Workbook();
+  workbook.creator="WorkSync";
+  workbook.lastModifiedBy="WorkSync Alpha 10";
+  workbook.subject="CCAC CIT Voice suggested break dispersion plan";
+  workbook.title=`WorkSync Break Dispersion — CCAC — ${date}`;
+  workbook.created=new Date();
+  workbook.modified=new Date();
+
+  const ws=workbook.addWorksheet("Break Plan",{
+    properties:{defaultRowHeight:21,tabColor:{argb:"FF2377D8"}},
+    views:[{state:"frozen",ySplit:5,topLeftCell:"A6",showGridLines:false}]
+  });
+  ws.columns=[
+    {key:"employee_id",width:17}, {key:"name",width:29}, {key:"shift",width:23},
+    {key:"break1",width:25}, {key:"lunch1",width:25}, {key:"break2",width:25},
+    {key:"lunch2",width:25}, {key:"bop",width:25}
+  ];
+  ws.mergeCells("A1:H1");
+  ws.getCell("A1").value="WORKSYNC  |  BREAK DISPERSION PLAN";
+  ws.getRow(1).height=34;
+  ws.getCell("A1").fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF0B1D35"}};
+  ws.getCell("A1").font={name:"Aptos Display",size:16,bold:true,color:{argb:"FFFFFFFF"}};
+  ws.getCell("A1").alignment={vertical:"middle",horizontal:"left",indent:1};
+  for(let c=2;c<=8;c++) ws.getRow(1).getCell(c).fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF0B1D35"}};
+
+  ws.mergeCells("A2:H2");
+  ws.getCell("A2").value=`CCAC  •  CIT Voice  •  ${longDate}`;
+  ws.getRow(2).height=25;
+  ws.getCell("A2").fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF173B61"}};
+  ws.getCell("A2").font={name:"Aptos",size:11,bold:true,color:{argb:"FFEAF4FC"}};
+  ws.getCell("A2").alignment={vertical:"middle",horizontal:"left",indent:2};
+  for(let c=2;c<=8;c++) ws.getRow(2).getCell(c).fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF173B61"}};
+
+  ws.mergeCells("A3:H3");
+  ws.getCell("A3").value=`${values.length} proposed agents  •  Suggest-only plan  •  Review before plotting into the official schedule`;
+  ws.getRow(3).height=22;
+  ws.getCell("A3").fill={type:"pattern",pattern:"solid",fgColor:{argb:"FFEAF3FB"}};
+  ws.getCell("A3").font={name:"Aptos",size:10,color:{argb:"FF425A72"},italic:true};
+  ws.getCell("A3").alignment={vertical:"middle",horizontal:"left",indent:2};
+  for(let c=2;c<=8;c++) ws.getRow(3).getCell(c).fill={type:"pattern",pattern:"solid",fgColor:{argb:"FFEAF3FB"}};
+  ws.getRow(4).height=8;
+
+  const headerRow=5;
+  ws.getRow(headerRow).values=headers;
+  ws.getRow(headerRow).height=29;
+  ws.getRow(headerRow).eachCell({includeEmpty:true},cell=>{
+    cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF2377D8"}};
+    cell.font={name:"Aptos",size:10,bold:true,color:{argb:"FFFFFFFF"}};
+    cell.alignment={vertical:"middle",horizontal:"left",wrapText:true};
+    cell.border={bottom:{style:"medium",color:{argb:"FF0B1D35"}}};
+  });
+  values.forEach((row,i)=>{
+    const excelRow=ws.addRow(row);
+    excelRow.height=24;
+    excelRow.eachCell({includeEmpty:true},(cell,colNumber)=>{
+      cell.font={name:"Aptos",size:10,color:{argb:colNumber===1?"FF18304A":"FF243B55"},bold:colNumber===1};
+      cell.alignment={vertical:"middle",horizontal:colNumber===1?"left":"left",wrapText:false};
+      cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:i%2===0?"FFF2F6FA":"FFFFFFFF"}};
+      cell.border={bottom:{style:"hair",color:{argb:"FFD8E2EC"}}};
+    });
+  });
+  const lastRow=Math.max(headerRow,headerRow+values.length);
+  ws.autoFilter={from:`A${headerRow}`,to:`H${lastRow}`};
+  ws.views=[{state:"frozen",ySplit:headerRow,topLeftCell:`A${headerRow+1}`,showGridLines:false}];
+  ws.pageSetup={orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0,paperSize:9};
+  ws.headerFooter.oddFooter="&LWorkSync Alpha 10&CInternal planning copy&RPage &P of &N";
+
+  // Clean machine-friendly sheet: the exact eight-column schema starts in A1.
+  const raw=workbook.addWorksheet("Engine Import",{
+    properties:{defaultRowHeight:20,tabColor:{argb:"FF138A5B"}},
+    views:[{state:"frozen",ySplit:1,topLeftCell:"A2",showGridLines:false}]
+  });
+  raw.columns=ws.columns.map(c=>({key:c.key,width:c.width}));
+  raw.addRow(headers);
+  values.forEach(row=>raw.addRow(row));
+  raw.getRow(1).height=25;
+  raw.getRow(1).eachCell({includeEmpty:true},cell=>{
+    cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF0B1D35"}};
+    cell.font={name:"Aptos",size:10,bold:true,color:{argb:"FFFFFFFF"}};
+    cell.alignment={vertical:"middle",horizontal:"left"};
+    cell.border={bottom:{style:"medium",color:{argb:"FF2377D8"}}};
+  });
+  values.forEach((row,i)=>{
+    const rr=raw.getRow(i+2);
+    rr.eachCell({includeEmpty:true},(cell,colNumber)=>{
+      cell.font={name:"Aptos",size:10,color:{argb:"FF243B55"},bold:colNumber===1};
+      cell.fill={type:"pattern",pattern:"solid",fgColor:{argb:i%2===0?"FFF2F6FA":"FFFFFFFF"}};
+      cell.border={bottom:{style:"hair",color:{argb:"FFD8E2EC"}}};
+      cell.alignment={vertical:"middle",horizontal:"left"};
+    });
+  });
+  raw.autoFilter={from:"A1",to:`H${Math.max(1,values.length+1)}`};
+  raw.pageSetup={orientation:"landscape",fitToPage:true,fitToWidth:1,fitToHeight:0,paperSize:9};
+
+  try{
+    const buf=await workbook.xlsx.writeBuffer();
+    const blob=new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download=`WorkSync_Dispersion_Proposal_CCAC_${date||"date"}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1500);
+    toast("Formatted Excel proposal exported.");
+  }catch(err){
+    console.error("Formatted break-plan export failed",err);
+    toast("Excel export failed: "+(err?.message||String(err)));
+  }
+}
+
+
+/* ===== WorkSync Briefs · Coverage & allocation (CCAC) ===== */
+let coverageBriefRows=[];
+function initCoverageBrief(){
+  const d=$("covDate");
+  if(d && !d.value){
+    try{ d.value=typeof phtDate==="function"?phtDate():new Date().toISOString().slice(0,10); }catch(e){ d.value=new Date().toISOString().slice(0,10); }
+  }
+}
+function covParseTimeToMin(t){
+  if(t==null||t==="") return null;
+  const s=String(t).trim();
+  // HH:MM or HH:MM:SS (24h from DB) or h:mm AM/PM
+  let m=s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if(!m) return null;
+  let h=parseInt(m[1],10), min=parseInt(m[2],10);
+  const ap=(m[3]||"").toUpperCase();
+  if(ap==="PM" && h<12) h+=12;
+  if(ap==="AM" && h===12) h=0;
+  if(!ap && h>23) return null;
+  return h*60+min;
+}
+function covIsOffFloorActivity(type){
+  const t=String(type||"").toLowerCase();
+  if(!t) return false;
+  if(/break|lunch|bop|train|offline|pull|meeting|coaching|nesting|system/.test(t)) return true;
+  if(/working|phone|available|ready/.test(t)) return false;
+  return true; // treat unknown activity as off-floor for safety
+}
+function covBuildIntervals(shiftStartMin, shiftEndMin, acts){
+  // returns list of {start,end,label} off-floor segments clipped to shift
+  const out=[];
+  if(shiftStartMin==null||shiftEndMin==null||shiftEndMin<=shiftStartMin) return out;
+  (acts||[]).forEach(a=>{
+    if(!covIsOffFloorActivity(a.activity_type)) return;
+    let a0=covParseTimeToMin(a.start_time), a1=covParseTimeToMin(a.end_time);
+    if(a0==null||a1==null||a1<=a0) return;
+    const s=Math.max(shiftStartMin,a0), e=Math.min(shiftEndMin,a1);
+    if(e>s) out.push({start:s,end:e,label:String(a.activity_type||"Off")});
+  });
+  return out;
+}
+function covFmtMin(m){
+  const h=Math.floor(m/60), mm=m%60;
+  const ap=h>=12?"PM":"AM";
+  const h12=((h+11)%12)+1;
+  return `${h12}:${String(mm).padStart(2,"0")} ${ap}`;
+}
+// Team-wide minimum available agents for the brief (not user-set).
+const COV_MIN_AVAILABLE=2;
+function covNames(list){
+  if(!list.length) return "—";
+  return list.map(x=>`${x.name} (${x.label} ${covFmtMin(x.start)}–${covFmtMin(x.end)})`).join("; ");
+}
+async function runCoverageBrief(){
+  const msg=$("covMsg"), body=$("covBody"), btn=$("covRunBtn"), exp=$("covExportBtn");
+  const date=($("covDate")?.value||"").slice(0,10);
+  const minAvail=COV_MIN_AVAILABLE;
+  const greenAt=Math.max(minAvail*2, minAvail+2);
+  if(!date){ if(msg) msg.innerHTML='<div class="banner err">Pick a date.</div>'; return; }
+  if(btn){ btn.disabled=true; btn.textContent="Running…"; }
+  if(msg) msg.innerHTML='<div class="banner info">Loading published CCAC schedule for '+escapeHtml(date)+'…</div>';
+  coverageBriefRows=[];
+  if(exp) exp.disabled=true;
+  try{
+    const r=await dsLoadLob("CCAC", date);
+    if(!r.version){
+      if(msg) msg.innerHTML='<div class="banner err">No published CCAC schedule covers '+escapeHtml(date)+'. Publish a week first.</div>';
+      if(body) body.innerHTML='<tr><td colspan="8" class="muted">No data.</td></tr>';
+      return;
+    }
+    if(!r.agents.length){
+      if(msg) msg.innerHTML='<div class="banner warn">No CIT voice agents WORKING on '+escapeHtml(date)+' (voice pool '+CCAC_VOICE_POOL.size+').</div>';
+      if(body) body.innerHTML='<tr><td colspan="8" class="muted">No voice WORKING rows.</td></tr>';
+      return;
+    }
+    const f0=Math.floor(Math.min(...r.agents.map(x=>x.shiftStart))/DS_STEP)*DS_STEP;
+    const f1=Math.max(...r.agents.map(x=>x.shiftEnd));
+    const buckets=dsBuildBuckets(r.agents, f0, f1, minAvail);
+    const flagged=buckets.filter(x=>x.health.level!=="green");
+    const redN=buckets.filter(x=>x.health.level==="red").length;
+    const amberN=buckets.filter(x=>x.health.level==="amber").length;
+    const conflictN=buckets.filter(x=>x.conflict).length;
+    coverageBriefRows=flagged.map(x=>({
+      date, minAvail, greenAt,
+      level:x.health.level, t0:x.t0, t1:x.t1,
+      scheduled:x.scheduled, available:x.available,
+      onBreak:x.breaks,
+      conflicting:x.conflict?x.breaks:[],
+      training:x.training, other:x.other
+    }));
+    if($("covStats")) $("covStats").style.display="";
+    if($("covStatChecked")) $("covStatChecked").textContent=String(buckets.length);
+    if($("covStatRed")) $("covStatRed").textContent=String(redN);
+    if($("covStatAmber")) $("covStatAmber").textContent=String(amberN);
+    if($("covStatConflicts")) $("covStatConflicts").textContent=String(conflictN);
+    const assume=$("covAssume");
+    if(assume){
+      assume.style.display="";
+      assume.innerHTML=`<strong>Basis:</strong> published CCAC schedule v${r.version.version_number} for ${escapeHtml(date)} · CIT voice pool (${r.agents.length} WORKING) · min available ${minAvail==null?"not set":minAvail} · green at ${greenAt}+ · published schedule only, so borrowed and manual off-phone counts are not included.`;
+    }
+    if(body){
+      if(!coverageBriefRows.length) body.innerHTML='<tr><td colspan="8" class="muted">No compromised intervals. Every interval is green.</td></tr>';
+      else body.innerHTML=coverageBriefRows.map(x=>`<tr class="${x.level==="red"?"risk":"ok"}">
+        <td>${dsBadge(x.level)}</td>
+        <td>${covFmtMin(x.t0)} – ${covFmtMin(x.t1)}</td>
+        <td>${x.scheduled}</td>
+        <td><strong>${x.available}</strong></td>
+        <td style="white-space:normal;min-width:200px">${escapeHtml(covNames(x.onBreak))}</td>
+        <td style="white-space:normal;min-width:200px">${escapeHtml(covNames(x.conflicting))}</td>
+        <td style="white-space:normal;min-width:160px">${escapeHtml(covNames(x.training))}</td>
+        <td style="white-space:normal;min-width:160px">${escapeHtml(covNames(x.other))}</td>
+      </tr>`).join("");
+    }
+    if(exp) exp.disabled=!coverageBriefRows.length;
+    if(msg){
+      if(redN) msg.innerHTML=`<div class="banner err"><strong>Coverage brief.</strong> ${redN} red and ${amberN} amber interval(s). ${conflictN} interval(s) have conflicting breaks.</div>`;
+      else if(amberN) msg.innerHTML=`<div class="banner warn"><strong>Coverage brief.</strong> No red intervals. ${amberN} amber interval(s). ${conflictN} interval(s) have conflicting breaks.</div>`;
+      else msg.innerHTML=`<div class="banner ok"><strong>Coverage brief.</strong> All intervals green.</div>`;
+    }
+  }catch(err){
+    console.error(err);
+    if(msg) msg.innerHTML=`<div class="banner err">Brief failed: ${escapeHtml(err.message||String(err))}</div>`;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="Run brief"; }
+  }
+}
+function exportCoverageBriefCsv(){
+  if(!coverageBriefRows.length){ toast("Run the brief first."); return; }
+  const date=coverageBriefRows[0].date;
+  const header=["status","date","time_start","time_end","scheduled","available","min_available","green_at","on_break_lunch_bop","conflicting_breaks","training","other_off_phone"];
+  const q=v=>`"${String(v||"").replace(/"/g,'""')}"`;
+  const names=l=>l.length?covNames(l):"";
+  const lines=[header.join(",")];
+  coverageBriefRows.forEach(x=>{
+    lines.push([
+      x.level.toUpperCase(), date, covFmtMin(x.t0), covFmtMin(x.t1),
+      x.scheduled, x.available, x.minAvail, x.greenAt,
+      q(names(x.onBreak)), q(names(x.conflicting)), q(names(x.training)), q(names(x.other))
+    ].join(","));
+  });
+  const blob=new Blob([lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`WorkSync_Brief_Coverage_CCAC_${date}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("Coverage brief exported.");
+}
+
+if($("lrSubmitBtn")) $("lrSubmitBtn").onclick=()=>submitLeaveRequest();
+
+
+if($("openBreakDispersion")) $("openBreakDispersion").onclick=()=>showView("breakDispersion");
+if($("dispBackSm")) $("dispBackSm").onclick=()=>showView("schedule");
+function renderStatusCompare(){
+  const el=$("cmpBox"); if(!el||!dsScan) return;
+  const sq={slots2:0,slots4:0,overlaps:0,backToBack:0};
+  dsScan.results.forEach(r=>{
+    r.buckets.forEach(b=>{ if(b.breaks.length>=2) sq.slots2++; if(b.breaks.length>=4) sq.slots4++; });
+    (r.consecutive||[]).forEach(e=>{ if(e.overlap) sq.overlaps++; else sq.backToBack++; });
+  });
+  const pr={slots2:0,slots4:0,overlaps:0,backToBack:0};
+  const occ=new Map();
+  (dispersionProposal||[]).forEach(a=>{
+    const blocks=[a.break1,a.lunch1,a.break2,a.lunch2,a.bop].filter(x=>x && typeof x.start==="number" && typeof x.end==="number" && x.end>dsScan.from && x.start<dsScan.to); // same window as the status quo side
+    blocks.sort((x,y)=>x.start-y.start);
+    for(let k=1;k<blocks.length;k++){
+      const gap=blocks[k].start-blocks[k-1].end;
+      if(gap<0) pr.overlaps++; else if(gap<=DS_STEP) pr.backToBack++;
+    }
+    blocks.forEach(x=>{ for(let t=Math.floor(x.start/DS_STEP)*DS_STEP; t<x.end; t+=DS_STEP) occ.set(t,(occ.get(t)||0)+1); });
+  });
+  for(let t=Math.floor(dsScan.from/DS_STEP)*DS_STEP; t<dsScan.to; t+=DS_STEP){
+    const n=occ.get(t)||0; if(n>=2) pr.slots2++; if(n>=4) pr.slots4++;
+  }
+  const line=(label,v)=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eef3f8"><span>${label}</span><b>${v}</b></div>`;
+  const tile=(title,sub,v)=>`<div style="border:1px solid #dbe5ef;border-radius:12px;padding:14px 16px;background:#fff"><div style="font-weight:800">${title}</div><div class="muted" style="font-size:12px;margin:2px 0 8px">${sub}</div>${line("Slots with 2+ off at once",v.slots2)}${line("Slots with 4+ off at once",v.slots4)}${line("Overlaps (double-booked)",v.overlaps)}${line("Back-to-back, same agent",v.backToBack)}</div>`;
+  el.innerHTML='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">'+
+    tile("Status quo","As scheduled in the window",sq)+
+    tile("Proposed", dispersionProposal.length ? "After the break plan" : "No plan yet. Press Run whole day", pr)+
+  '</div>';
+}
+async function runWholeDay(){
+  if (!WorkSyncModules.isEnabled('break-dispersion')) { toast('Break Dispersion is disabled in this development session.'); return; }
+  const btn=$("runWholeDayBtn");
+  if($("dsFrom")) $("dsFrom").value=$("dispFrom")?.value||"06:00";
+  if($("dsTo")) $("dsTo").value=$("dispTo")?.value||"22:00";
+  if($("dsBorrow")) $("dsBorrow").value=$("dispManualOff")?.value||0;
+  if(btn){ btn.disabled=true; btn.textContent="Running…"; }
+  try{
+    try{ await runDaySweep(); }catch(e){ console.error(e); }
+    try{ await runBreakDispersion(); }catch(e){ console.error(e); }
+    try{ await proposeBreakDispersion(); }catch(e){ console.error(e); }
+    renderStatusCompare();
+    const ex=$("dispExportBtn"); if(ex) ex.disabled=false;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="Run whole day"; }
+  }
+}
+function exportWholeDayCsv(){
+  if(!dsScan && !dispersionProposal.length){ toast("Run the whole day first."); return; }
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const q=v=>`"${String(v??"").replace(/"/g,'""')}"`;
+  const lines=[];
+  lines.push("STATUS QUO (breaks as scheduled)");
+  lines.push(["date","group","time_start","time_end","scheduled","off_phone","available","health"].join(","));
+  if(dsScan) dsScan.results.forEach(res=>res.buckets.forEach(b=>lines.push([date,q(res.lob),q(covFmtMin(b.t0)),q(covFmtMin(b.t1)),b.scheduled,b.off,b.available,q(b.health.label)].join(","))));
+  lines.push("");
+  lines.push("PROPOSED BREAKS");
+  lines.push(["date","employee_id","name","shift_start","shift_end","break_1","lunch_1","break_2","lunch_2","bop"].join(","));
+  const fmtP=p=>!p?"":(typeof p.start==="number"&&typeof p.end==="number")?`${covFmtMin(p.start)}-${covFmtMin(p.end)}`:String(p.label||"");
+  dispersionProposal.forEach(r=>lines.push([date,q(r.employee_id),q(r.name),q(covFmtMin(r.shiftStart)),q(covFmtMin(r.shiftEnd)),q(fmtP(r.break1)),q(fmtP(r.lunch1)),q(fmtP(r.break2)),q(fmtP(r.lunch2)),q(fmtP(r.bop))].join(",")));
+  const blob=new Blob([lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="break_dispersion_"+date+".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+if($("dispRunBtn")) $("dispRunBtn").onclick=()=>runBreakDispersion();
+if($("dispProposeBtn")) $("dispProposeBtn").onclick=()=>proposeBreakDispersion();
+if($("dispNow")) $("dispNow").oninput=()=>{ dispNowManual=true; dispUpdateNowNote(); };
+if($("dispNowPcBtn")) $("dispNowPcBtn").onclick=()=>{ dispSyncNow(true); };
+if($("dispNowPhtBtn")) $("dispNowPhtBtn").onclick=()=>{ const el=$("dispNow"); if(el){ el.value=dispPhtClockHHMM(); dispNowManual=true; dispUpdateNowNote(); } };
+if($("dispDate")) $("dispDate").addEventListener("change",()=>dispUpdateNowNote());
+setInterval(()=>{ if(!dispNowManual) dispSyncNow(false); },30000); // keep following the PC clock until someone edits the field
+if($("dispProposeExport")) $("dispProposeExport").onclick=()=>exportDispersionProposalExcel();
+if($("dispValidateEdits")) $("dispValidateEdits").onclick=()=>validateDispersionEdits();
+if($("dispResetEdits")) $("dispResetEdits").onclick=()=>{dispersionProposal=JSON.parse(JSON.stringify(dispersionProposalOriginal));renderDispersionProposalEditor();toast("Editor reset to the generated recommendation.");};
+if($("dispExportEdited")) $("dispExportEdited").onclick=()=>exportValidatedDispersionPlan();
+// Environment control is intentionally fail-closed until the deployed backend confirms routing.
+
+/* ==================== WorkSync Admin Settings & DB Router Controls ==================== */
+async function loadSettingsView() {
+  if (window.WorkSyncDB) {
+    window.WorkSyncDB.updateEnvironmentUI();
+    const cfg = window.WorkSyncDB.getConfig();
+    if ($("cfgSupabaseUrl")) $("cfgSupabaseUrl").value = cfg.supabaseUrl;
+    if ($("cfgSupabaseKey")) $("cfgSupabaseKey").value = cfg.supabaseKey;
+    if ($("cfgNeonDbUrl")) $("cfgNeonDbUrl").value = cfg.neonDbUrl;
+    if ($("cfgNeonHttpEndpoint")) $("cfgNeonHttpEndpoint").value = cfg.neonHttpEndpoint;
+    if ($("cfgSandboxMode")) $("cfgSandboxMode").value = cfg.sandboxMode;
+
+    const sim = sessionStorage.getItem("worksync.simulatedBranch") || "admin";
+    document.querySelectorAll(".role-btn").forEach(b => {
+      b.classList.toggle("active", b.dataset.branch === sim);
+    });
+    if ($("simRoleBadge")) $("simRoleBadge").textContent = (sim.toUpperCase()) + " PERSPECTIVE";
+    if ($("realAuthRoleDisplay")) $("realAuthRoleDisplay").textContent = currentProfile?.role || "admin";
+
+    // Update Diagnostics
+    if ($("diagUser")) $("diagUser").textContent = currentUser?.email || "Dev Sandbox Account";
+    if ($("diagBranch")) $("diagBranch").textContent = effectiveBranch().toUpperCase();
+    if ($("diagDatabase")) $("diagDatabase").textContent = WorkSyncDB.getEnvironment() === 'sandbox' ? 'Neon Sandbox (Safe)' : 'Supabase Production';
+    if ($("diagSandboxChanges")) $("diagSandboxChanges").textContent = WorkSyncDB.getSandboxStore().getMutationCount() + " customized tables";
+    if ($("diagStorage")) {
+      const bytes = new Blob([Object.values(localStorage).join("")]).size;
+      $("diagStorage").textContent = (bytes / 1024).toFixed(1) + " KB";
+    }
+    if ($("diagPhtTime")) $("diagPhtTime").textContent = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
+    verifySettingsConnections();
+  }
+  async function verifySettingsConnections() {
+  const statusEl = document.getElementById('connectionVerifyStatus');
+  const supaBadge = document.getElementById('supaVerifyBadge');
+  const neonBadge = document.getElementById('neonVerifyBadge');
+
+  if (statusEl) statusEl.textContent = 'Pinging databases...';
+  
+  const [supabaseResult, neonResult] = await Promise.all([
+    window.WorkSyncDB.testSupabase(),
+    window.WorkSyncDB.testNeon()
+  ]);
+
+  if (supaBadge) {
+    if (supabaseResult.ok) {
+      supaBadge.textContent = `Connected (${supabaseResult.latency}ms)`;
+      supaBadge.style.background = '#22c55e';
+      supaBadge.style.color = '#fff';
+    } else {
+      supaBadge.textContent = 'Failed';
+      supaBadge.style.background = '#ef4444';
+      supaBadge.style.color = '#fff';
+    }
+  }
+
+  if (neonBadge) {
+    if (neonResult.ok) {
+      neonBadge.textContent = `Connected (${neonResult.latency}ms)`;
+      neonBadge.style.background = '#22c55e';
+      neonBadge.style.color = '#fff';
+    } else {
+      neonBadge.textContent = 'Failed';
+      neonBadge.style.background = '#ef4444';
+      neonBadge.style.color = '#fff';
+    }
+  }
+
+  if (statusEl) statusEl.textContent = 'Diagnostics complete.';
+}
+}
+
+// Environment Switcher Buttons
+$("btnEnvProd")?.addEventListener("click", () => {
+  WorkSyncDB.setEnvironment("production");
+  toast("Switched to Production Supabase Database.");
+  showView("settings");
+});
+$("btnEnvSandbox")?.addEventListener("click", () => {
+  WorkSyncDB.setEnvironment("sandbox");
+  toast("🧪 Switched to Neon Sandbox Database (Safe for testing).");
+  showView("settings");
+});
+$("wsBannerSwitchToProd")?.addEventListener("click", () => {
+  WorkSyncDB.setEnvironment("production");
+  toast("Switched to Production Supabase Database.");
+  const cur = sessionStorage.getItem("worksync.activeView") || "home";
+  showView(cur);
+});
+$("wsBannerOpenSettings")?.addEventListener("click", () => showView("settings"));
+
+// Key Show/Hide
+$("btnToggleSupabaseKey")?.addEventListener("click", () => {
+  const inp = $("cfgSupabaseKey");
+  if (inp) {
+    if (inp.type === "password") {
+      inp.type = "text";
+      $("btnToggleSupabaseKey").textContent = "Hide";
+    } else {
+      inp.type = "password";
+      $("btnToggleSupabaseKey").textContent = "Show";
+    }
+  }
+});
+
+// Test Supabase
+$("btnTestSupabase")?.addEventListener("click", async () => {
+  const st = $("supabaseTestStatus");
+  if (st) st.textContent = "Testing Supabase connection…";
+  const res = await WorkSyncDB.testSupabase();
+  if (res.ok) {
+    if (st) st.textContent = `Connected (${res.latency}ms) · ${res.count} roster rows`;
+    toast(`Supabase connection OK (${res.latency}ms).`);
+  } else {
+    if (st) st.textContent = `Error: ${res.error}`;
+    toast(`Supabase test failed: ${res.error}`);
+  }
+});
+
+// Test Neon
+$("btnTestNeon")?.addEventListener("click", async () => {
+  const st = $("neonTestStatus");
+  if (st) st.textContent = "Testing Neon Sandbox…";
+  const res = await WorkSyncDB.testNeon();
+  if (res.ok) {
+    if (st) st.textContent = `Connected (${res.mode}, ${res.latency}ms) · ${res.count || 'Ready'}`;
+    toast(`Neon Sandbox OK: ${res.mode}`);
+  } else {
+    if (st) st.textContent = `Error: ${res.error}`;
+    toast(`Neon test failed: ${res.error}`);
+  }
+});
+
+// Save DB Settings
+$("btnSaveDbConfig")?.addEventListener("click", () => {
+  WorkSyncDB.saveConfig({
+    supabaseUrl: $("cfgSupabaseUrl")?.value.trim(),
+    supabaseKey: $("cfgSupabaseKey")?.value.trim(),
+    neonDbUrl: $("cfgNeonDbUrl")?.value.trim(),
+    neonHttpEndpoint: $("cfgNeonHttpEndpoint")?.value.trim(),
+    sandboxMode: $("cfgSandboxMode")?.value
+  });
+  toast("Database configuration saved to local storage.");
+  loadSettingsView();
+});
+
+// Reset Supabase
+$("btnResetSupabase")?.addEventListener("click", () => {
+  if ($("cfgSupabaseUrl")) $("cfgSupabaseUrl").value = "https://zjlauzyixseebifyvvvz.supabase.co";
+  if ($("cfgSupabaseKey")) $("cfgSupabaseKey").value = "sb_publishable_cFJ4HQ5nSa3T5GDYJl56sw_OUpXHF7l";
+  toast("Supabase settings restored to baseline defaults.");
+});
+
+// Role Simulator
+document.querySelectorAll(".role-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const branch = btn.dataset.branch;
+    sessionStorage.setItem("worksync.simulatedBranch", branch);
+    applyRoleUI();
+    toast(`Simulating perspective: ${branch.toUpperCase()}`);
+    loadSettingsView();
+  });
+});
+$("btnResetRealRole")?.addEventListener("click", () => {
+  sessionStorage.removeItem("worksync.simulatedBranch");
+  applyRoleUI();
+  toast("Reset perspective to authenticated user profile.");
+  loadSettingsView();
+});
+
+// Navigation buttons
+$("settingsNav")?.addEventListener("click", () => showView("settings"));
+$("databaseSettingsNav")?.addEventListener("click", () => showView("settings"));
+$("openSettingsHome")?.addEventListener("click", () => showView("settings"));
+$("openCommandCenterHome")?.addEventListener("click", () => showView("verintWorkspace"));
+$("openBriefsHome")?.addEventListener("click", () => showView("briefsHub"));
+$("openBreakDispersionHome")?.addEventListener("click", () => showView("breakDispersion"));
+
+// Diagnostics Actions
+$("btnResetSandboxData")?.addEventListener("click", () => {
+  WorkSyncDB.getSandboxStore().resetToFixtures();
+  toast("Sandbox Store reset to fresh CCAC fixtures.");
+  loadSettingsView();
+});
+$("btnClearAllCache")?.addEventListener("click", () => {
+  if (confirm("Clear local storage cache and reload?")) {
+    localStorage.clear();
+    sessionStorage.clear();
+    location.reload();
+  }
+});
+$("btnExportDiagJson")?.addEventListener("click", () => {
+  const diag = {
+    exportedAt: new Date().toISOString(),
+    user: currentUser,
+    profile: currentProfile,
+    effectiveBranch: effectiveBranch(),
+    environment: WorkSyncDB.getEnvironment(),
+    config: WorkSyncDB.getConfig(),
+    sandboxTables: Object.keys(WorkSyncDB.getSandboxStore().tables)
+  };
+  const blob = new Blob([JSON.stringify(diag, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `worksync-diagnostics-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+if($("dispApplyBtn")) $("dispApplyBtn").onclick=()=>applyDispersionToSchedule();
+if($("dispExportBtn")) $("dispExportBtn").onclick=()=>exportWholeDayCsv();
+if($("runWholeDayBtn")) $("runWholeDayBtn").onclick=()=>runWholeDay();
+
+if($("briefsNav")) $("briefsNav").onclick=()=>showView("briefsHub");
+if($("briefOpenCoverage")) $("briefOpenCoverage").onclick=()=>showView("coverageBrief");
+if($("briefOpenAttendance")) $("briefOpenAttendance").onclick=()=>showView("loginBrief");
+if($("coverageBackBriefs")) $("coverageBackBriefs").onclick=()=>showView("briefsHub");
+if($("covRunBtn")) $("covRunBtn").onclick=()=>runCoverageBrief();
+if($("covExportBtn")) $("covExportBtn").onclick=()=>exportCoverageBriefCsv();
+
+
+if($("lrHubMake")) $("lrHubMake").onclick=()=>lrOpenMakeRequest();
+if($("lrHubView")) $("lrHubView").onclick=()=>lrOpenViewRequests();
+if($("lrBackToHubFromForm")) $("lrBackToHubFromForm").onclick=()=>lrBackToHub();
+if($("lrBackToHubFromView")) $("lrBackToHubFromView").onclick=()=>lrBackToHub();
+document.querySelectorAll(".lr-back-hub").forEach(b=>b.onclick=()=>lrBackToHub());
+
+
+if($("homeGoRequests")) $("homeGoRequests").onclick=()=>showView("requestsHub");
+if($("homeGoViewRequests")) $("homeGoViewRequests").onclick=()=>showView("requestsHub");
+
+
+// Refresh notifications after login
+const _origShowAppLeave=typeof showApp==="function"?null:null;
+
+showWorkSyncSplash("Preparing your workspace...");
+loadSession().catch(err => {
+    console.error("WorkSync startup failed", err);
+    $("loginView").classList.remove("hidden");
+    $("appView").classList.add("hidden");
+    const msg = $("loginMsg");
+    if (msg) msg.textContent = "";
+    hideWorkSyncSplash(0);
+});
+</script>
+<style>
+/* Alpha 5 Increment: WFM Intraday Command Center · UI refinement 5 · larger status counts */
+.wfm-status-card h3{font-size:15px;line-height:1.2;align-items:center}
+.wfm-status-pill{width:34px;height:34px;min-width:34px;padding:0;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:15px;line-height:1;font-weight:900;letter-spacing:0}
+.wfm-status-pill.call{background:#d8efe3;color:#0a623f;border-color:#91cdb0}
+.wfm-status-pill.break{background:#f4dfb8;color:#744200;border-color:#d8ae64}
+.wfm-status-pill.lunch{background:#f3d0c0;color:#7f3519;border-color:#d49a80}
+.wfm-status-pill.other{background:#cfdef0;color:#184d88;border-color:#91afd2}
+.wfm-status-pill.off{background:#dce2e8;color:#4d5a68;border-color:#b9c2cc}
+.wfm-status-card{padding:15px;min-height:182px}
+.wfm-person .name{font-size:12.5px}
+.wfm-person .meta{font-size:9.5px}
+</style>
+
+<script>
+/* ===== Alpha 10: Whole-day scan across LOBs ===== */
+const DS_LOBS=[{key:"CCAC",label:"CCAC"}];
+const DS_STEP=15;
+const DS_RANK={red:0,amber:1,green:2};
+const DS_NEUTRAL={level:"neutral",label:"OBSERVED",outlook:"Availability shown; no staffing threshold assumed"};
+function dsHealthFor(avail, min){ return min==null ? DS_NEUTRAL : dispHealth(avail, min); }
+function dsMinOrNull(){ const v=$("dispMinAvail")?.value; if(v===""||v==null) return null; return Math.max(1,Math.min(50,Number(v)||2)); }
+const DS_TRAIN_RE=/train|pull|offline|meeting|coach/i;
+let dsScan=null, dsOpenKey=null;
+const dsManualMap=new Map();
+
+function dsKind(label){
+  const t=String(label||"");
+  if(DS_TRAIN_RE.test(t)) return "training";
+  if(/break|lunch|bop/i.test(t)) return "break";
+  return "other";
+}
+function dsBadge(level){
+  if(level==="green") return '<span class="cov-badge ok">GREEN</span>';
+  if(level==="amber") return '<span class="cov-badge" style="background:#fff4e5;color:#b54708">AMBER</span>';
+  return '<span class="cov-badge risk">RED</span>';
+}
+function dsBuildBuckets(agents, from, to, minAvail, borrow=0, clashAt=4){
+  const out=[];
+  for(let t=from;t<to;t+=DS_STEP){
+    const t1=Math.min(t+DS_STEP,to);
+    let scheduled=0;
+    const offList=[];
+    agents.forEach(a=>{
+      if(a.shiftEnd<=t||a.shiftStart>=t1) return;
+      scheduled++;
+      const hits=a.segs.filter(sg=>sg.end>t && sg.start<t1);
+      if(!hits.length) return;
+      const pick=hits.find(h=>h.kind==="training")||hits.find(h=>h.kind==="break")||hits[0];
+      offList.push({name:a.name, employee_id:a.employee_id, label:pick.label, kind:pick.kind, start:pick.start, end:pick.end});
+    });
+    if(!scheduled) continue;
+    const off=offList.length;
+    const available=Math.max(0, scheduled-off-borrow);
+    const breaks=offList.filter(x=>x.kind==="break");
+    const health=dsHealthFor(available, minAvail);
+    const withoutBreaks=dsHealthFor(available+breaks.length, minAvail);
+    // Conflicting = removing the break/lunch/BOP agents would lift cover to a better level
+    const conflict = minAvail!=null && breaks.length>0 && DS_RANK[withoutBreaks.level] > DS_RANK[health.level];
+    out.push({
+      t0:t, t1, scheduled, off, available, health, conflict,
+      training:offList.filter(x=>x.kind==="training"),
+      breaks, other:offList.filter(x=>x.kind==="other")
+    });
+  }
+  out.forEach(b=>{
+    b.clash=b.breaks.length>=2;
+    b.clashWhy=b.breaks.length>=clashAt?(clashAt+"+ off at once"):(b.breaks.length>=2?"2+ off at once":"");
+  });
+  return out;
+}
+function dsConsecutive(agents, from, to){
+  const out=[];
+  agents.forEach(a=>{
+    const segs=(a.segs||[]).filter(sg=>sg.kind==="break" && sg.end>from && sg.start<to).sort((x,y)=>x.start-y.start);
+    for(let i=1;i<segs.length;i++){
+      const p=segs[i-1], n=segs[i];
+      const gap=n.start-p.end;
+      if(gap<=DS_STEP) out.push({name:a.name, employee_id:a.employee_id, first:p, second:n, gap, overlap:gap<0, at:p.end});
+    }
+  });
+  return out.sort((x,y)=>x.at-y.at);
+}
+function dsConsecutiveHtml(){
+  if(!dsScan) return "";
+  const rows=[];
+  dsScan.results.forEach(r=>(r.consecutive||[]).forEach(e=>rows.push(Object.assign({lob:r.lob}, e))));
+  const people=new Set(rows.map(x=>String(x.employee_id||x.name))).size;
+  const ov=rows.filter(x=>x.overlap).length;
+  const head=`<div class="sm-note" style="margin-top:14px"><strong>Overlaps and back-to-back breaks for the same agent</strong> · ${rows.length} event(s), ${people} agent(s), of which ${ov} overlap(s) (double-booked)</div>`;
+  if(!rows.length) return head+'<div class="muted" style="margin-top:8px">None in this window.</div>';
+  const fmt=p=>`${escapeHtml(p.label||"")} ${covFmtMin(p.start)}–${covFmtMin(p.end)}`;
+  return head+'<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Agent</th><th>Group</th><th>First</th><th>Then</th><th>Gap</th></tr></thead><tbody>'+
+    rows.map(x=>`<tr><td>${escapeHtml(x.name)}</td><td>${escapeHtml(x.lob)}</td><td>${fmt(x.first)}</td><td>${fmt(x.second)}</td><td>${x.overlap?'<span class="cov-badge risk">OVERLAP</span>':(x.gap+" min")}</td></tr>`).join("")+'</tbody></table></div>';
+}
+function dsSimultaneousHtml(){
+  if(!dsScan) return "";
+  const rows=[];
+  dsScan.results.forEach(r=>r.buckets.forEach(b=>{
+    if(b.breaks.length>=2) rows.push({lob:r.lob, b});
+  }));
+  const head=`<div class="sm-note" style="margin-top:14px"><strong>Every slot with 2 or more agents off at once</strong> · ${rows.length} slot(s), of which ${rows.filter(x=>x.b.breaks.length>=dsScan.clashAt).length} with ${dsScan.clashAt}+ off</div>`;
+  if(!rows.length) return head+'<div class="muted" style="margin-top:8px">None in this window.</div>';
+  const body=rows.map(x=>{
+    const n=x.b.breaks.length;
+    const tag=n>=dsScan.clashAt?'<span class="cov-badge risk">'+n+' off</span>':'<span class="cov-badge">'+n+' off</span>';
+    const names=x.b.breaks.map(p=>`${escapeHtml(p.name)} (${escapeHtml(p.label||"")})`).join("; ");
+    return `<tr><td>${escapeHtml(x.lob)}</td><td>${covFmtMin(x.b.t0)} – ${covFmtMin(x.b.t1)}</td><td>${tag}</td><td style="white-space:normal">${names}</td></tr>`;
+  }).join("");
+  return head+'<div class="tablewrap" style="margin-top:8px;max-height:460px;overflow:auto"><table><thead><tr><th>Group</th><th>Slot</th><th>Off at once</th><th>Who</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+}
+const CLASH_LABELS={red:"4+ off at once, or an overlap",amber:"2 or 3 off at once, or back-to-back",green:"No clash"};
+function dsAssignClashLevels(buckets, consecutive){
+  const evBySlot=new Map();
+  (consecutive||[]).forEach(e=>{
+    const k=Math.floor(e.second.start/DS_STEP)*DS_STEP;
+    const cur=evBySlot.get(k)||{overlap:false,b2b:false};
+    if(e.overlap) cur.overlap=true; else cur.b2b=true;
+    evBySlot.set(k,cur);
+  });
+  buckets.forEach(b=>{
+    const n=b.breaks.length, ev=evBySlot.get(b.t0)||{};
+    b.clashLevel = (n>=4||ev.overlap) ? "red" : ((n>=2||ev.b2b) ? "amber" : "green");
+  });
+}
+function dsSummarize(buckets){
+  if(!buckets.length) return {red:0,amber:0,green:0,conflicts:0,clashSlots:0,clashAgents:0,lowest:null,peak:null,maxScheduled:0};
+  return {
+    red:buckets.filter(b=>b.health.level==="red").length,
+    amber:buckets.filter(b=>b.health.level==="amber").length,
+    green:buckets.filter(b=>b.health.level==="green").length,
+    conflicts:buckets.filter(b=>b.conflict).length,
+    cRed:buckets.filter(b=>b.clashLevel==="red").length,
+    cAmber:buckets.filter(b=>b.clashLevel==="amber").length,
+    cGreen:buckets.filter(b=>b.clashLevel==="green").length,
+    clashSlots:buckets.filter(b=>b.clash).length,
+    slots4:buckets.filter(b=>b.breaks.length>=4).length,
+    clashAgents:new Set(buckets.filter(b=>b.clash).flatMap(b=>b.breaks.map(x=>String(x.employee_id||x.name)))).size,
+    lowest:buckets.reduce((m,b)=>b.available<m.available?b:m, buckets[0]),
+    peak:buckets.reduce((m,b)=>b.off>m.off?b:m, buckets[0]),
+    maxScheduled:Math.max(...buckets.map(b=>b.scheduled))
+  };
+}
+async function dsLoadLob(lobKey, date){
+  const {data:versions,error:ve}=await sb.from("schedule_versions")
+    .select("id,lob,version_number,week_start,week_end,status")
+    .eq("status","published").eq("lob",lobKey)
+    .lte("week_start",date).gte("week_end",date)
+    .order("version_number",{ascending:false}).limit(1);
+  if(ve) throw ve;
+  if(!versions?.length) return {lob:lobKey, version:null, agents:[]};
+  const version=versions[0];
+  const {data:schedules,error:se}=await sb.from("schedules")
+    .select("id,employee_id,schedule_status,shift_start,shift_end")
+    .eq("schedule_version_id",version.id).eq("schedule_date",date);
+  if(se) throw se;
+  let working=(schedules||[]).filter(s=>String(s.schedule_status||"").toUpperCase()==="WORKING");
+  working=working.filter(s=>isCcacVoiceAgent(s.employee_id));
+  const sIds=working.map(s=>s.id).filter(Boolean);
+  const eids=[...new Set(working.map(s=>s.employee_id).filter(Boolean))];
+  if(!sIds.length) return {lob:lobKey, version, agents:[]};
+  const [actRes, rosterRes]=await Promise.all([
+    sb.from("schedule_activities").select("schedule_id,activity_type,start_time,end_time")
+      .in("schedule_id",sIds),
+    sb.from("roster").select("employee_id,name").in("employee_id",eids)
+  ]);
+  if(actRes.error) throw actRes.error;
+  if(rosterRes.error) throw rosterRes.error;
+  const actsBy=new Map();
+  (actRes.data||[]).forEach(a=>{
+    if(!actsBy.has(a.schedule_id)) actsBy.set(a.schedule_id,[]);
+    actsBy.get(a.schedule_id).push(a);
+  });
+  const nameBy=new Map((rosterRes.data||[]).map(r=>[r.employee_id,r.name]));
+  const agents=working.map(s=>{
+    const ss=covParseTimeToMin(s.shift_start), sEnd=covParseTimeToMin(s.shift_end);
+    if(ss==null||sEnd==null||sEnd<=ss) return null;
+    const segs=covBuildIntervals(ss,sEnd,actsBy.get(s.id)||[])
+      .map(sg=>Object.assign({}, sg, {kind:dsKind(sg.label)}));
+    return {employee_id:s.employee_id, name:nameBy.get(s.employee_id)||s.employee_id, shiftStart:ss, shiftEnd:sEnd, segs};
+  }).filter(Boolean);
+  return {lob:lobKey, version, agents};
+}
+async function runDaySweep(opts){
+  const single=!!(opts&&opts.single);
+  const msg=$("dsMsg");
+  const btn=$(single?"dsDrillBtn":"dsRunBtn");
+  const btnLabel=btn?btn.textContent:"";
+  const date=($("dispDate")?.value||"").slice(0,10);
+  const minAvail=dsMinOrNull();
+  let f0, f1;
+  if(single){
+    const t=dispParseHHMM($("dsInterval")?.value);
+    if(t==null){ msg.innerHTML='<div class="banner err">Pick an interval start.</div>'; return; }
+    f0=Math.floor(t/DS_STEP)*DS_STEP; f1=f0+DS_STEP;
+  }else{
+    const from=dispParseHHMM($("dsFrom")?.value);
+    const to=dispParseHHMM($("dsTo")?.value);
+    f0=from==null?360:from; f1=to==null?1320:to;
+  }
+  if(!date){ msg.innerHTML='<div class="banner err">Pick a date above.</div>'; return; }
+  if(f1<=f0){ msg.innerHTML='<div class="banner err">Day end must be after day start.</div>'; return; }
+  if(btn){ btn.disabled=true; btn.textContent="Scanning…"; }
+  msg.innerHTML='<div class="banner info">Scanning CCAC published schedule for '+escapeHtml(date)+'…</div>';
+  try{
+    const loads=await Promise.all(DS_LOBS.map(l=>dsLoadLob(l.key,date)));
+    const borrow=Math.max(0,Math.min(50,Number($("dsBorrow")?.value||0)));
+    const clashAt=Math.max(2,Math.min(19,Number($("dispClashAt")?.value||4)));
+    const results=loads.map(r=>{
+      const buckets=dsBuildBuckets(r.agents, f0, f1, minAvail, borrow, clashAt);
+      const consecutive=dsConsecutive(r.agents, f0, f1);
+      dsAssignClashLevels(buckets, consecutive);
+      return Object.assign({}, r, {buckets, summary:dsSummarize(buckets), consecutive});
+    });
+    dsScan={date, from:f0, to:f1, minAvail, borrow, clashAt, results};
+    dsOpenKey=null;
+    dsRenderSummary();
+    dsRenderGrid();
+    dsRenderPairs();
+    $("dsDrill").innerHTML="";
+    if(single){
+      const hit=dsScan.results[0].buckets.some(b=>b.t0===f0);
+      if(!hit){
+        msg.innerHTML=`<div class="banner warn">No CIT voice agents scheduled at ${covFmtMin(f0)} on ${escapeHtml(date)}.</div>`;
+        return;
+      }
+      dsOpenKey={lob:dsScan.results[0].lob, t0:f0};
+      dsRenderDrill();
+      msg.innerHTML=`<div class="banner info"><strong>Interval drill-down.</strong> ${covFmtMin(f0)} – ${covFmtMin(f0+DS_STEP)} on ${escapeHtml(date)}.</div>`;
+      $("dsDrill")?.scrollIntoView({behavior:"smooth", block:"start"});
+      return;
+    }
+    const missing=results.filter(r=>!r.version).map(r=>r.lob);
+    const hasConflicts=results.some(r=>r.summary.clashSlots>0);
+    const noVoice=results.filter(r=>r.version && !r.agents.length).map(r=>r.lob);
+    const note = (missing.length ? ` · no published schedule for ${missing.join(", ")}` : "")
+      + (noVoice.length ? ` · no CIT voice agents WORKING for ${noVoice.join(", ")}` : "");
+    msg.innerHTML = hasConflicts
+      ? `<div class="banner warn"><strong>Day scan.</strong> Clashing breaks found. Click a slot to drill down.${note}</div>`
+      : `<div class="banner ok"><strong>Day scan.</strong> No clashing breaks in the window.${note}</div>`;
+  }catch(err){
+    console.error(err);
+    msg.innerHTML=`<div class="banner err">Day scan failed: ${escapeHtml(err.message||String(err))}</div>`;
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent=btnLabel; }
+  }
+}
+function dsRenderSummary(){
+  const el=$("dsSummary"); if(!el||!dsScan) return;
+  const rows=dsScan.results.map(r=>{
+    if(!r.version) return `<tr><td><strong>${r.lob}</strong></td><td colspan="8" class="muted">No published schedule covers this date.</td></tr>`;
+    if(!r.agents.length) return `<tr><td><strong>${r.lob}</strong></td><td>v${r.version.version_number}</td><td colspan="7" class="muted">No CIT voice agents WORKING on this date.</td></tr>`;
+    const s=r.summary;
+    const low = s.lowest ? `${s.lowest.available} @ ${covFmtMin(s.lowest.t0)}` : "—";
+    const peak = s.peak && s.peak.off ? `${s.peak.off} @ ${covFmtMin(s.peak.t0)}` : "—";
+    return `<tr>
+      <td><strong>${r.lob}</strong></td>
+      <td>v${r.version.version_number}</td>
+      <td>${r.agents.length}</td>
+      <td><span class="cov-badge risk">${dsScan.minAvail==null?s.cRed:s.red}</span></td>
+      <td>${dsScan.minAvail==null?s.cAmber:s.amber}</td>
+      <td>${dsScan.minAvail==null?s.cGreen:s.green}</td>
+      <td><strong>${s.clashSlots}</strong></td>
+      <td><strong>${s.slots4}</strong></td>
+      <td>${s.clashAgents}</td>
+      <td>${new Set((r.consecutive||[]).map(x=>String(x.employee_id||x.name))).size}</td>
+      <td>${low}</td>
+      <td>${peak}</td>
+    </tr>`;
+  }).join("");
+  const weakest=dsScan.results.flatMap(r=>r.buckets.map(b=>({lob:r.lob,b})))
+    .sort((a,b)=>a.b.available-b.b.available || b.b.breaks.length-a.b.breaks.length || b.b.off-a.b.off || a.b.t0-b.b.t0)
+    .slice(0,10);
+  const weakHtml=`<div class="sm-note" style="margin-top:12px"><strong>Lowest-coverage intervals</strong> · ranked by fewest agents available, then most agents on break/lunch/BOP. These are observations, not pass/fail ratings.</div>`+
+    (weakest.length?`<div class="cov-table-wrap" style="margin-top:8px;max-height:340px;overflow:auto"><table class="cov-table"><thead><tr><th>Rank</th><th>LOB</th><th>Interval</th><th>Available</th><th>Scheduled</th><th>Off-phone</th><th>Break / lunch / BOP</th><th>Training / other</th><th>Agents off</th></tr></thead><tbody>${weakest.map((x,i)=>`<tr><td>${i+1}</td><td>${escapeHtml(x.lob)}</td><td>${covFmtMin(x.b.t0)}–${covFmtMin(x.b.t1)}</td><td><strong>${x.b.available}</strong></td><td>${x.b.scheduled}</td><td>${x.b.off}</td><td>${x.b.breaks.length}</td><td>${x.b.training.length+x.b.other.length}</td><td style="white-space:normal">${[...x.b.breaks,...x.b.training,...x.b.other].map(a=>`${escapeHtml(a.name)} (${escapeHtml(a.label||a.kind)})`).join('; ')||'—'}</td></tr>`).join('')}</tbody></table></div>`:'<div class="muted">No staffed intervals found in the selected window.</div>');
+  el.innerHTML=`<div class="cov-table-wrap" style="margin-top:10px"><table class="cov-table">
+    <thead><tr><th>LOB</th><th>Version</th><th>CIT voice WORKING</th><th>Red</th><th>Amber</th><th>Green</th><th>Slots with 2+ off</th><th>Slots with 4+ off</th><th>Agents in clashes</th><th>Back-to-back (same agent)</th><th>Lowest available</th><th>Peak off-phone</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`+weakHtml+dsConsecutiveHtml()+dsSimultaneousHtml();
+}
+function dsRenderGrid(){
+  const body=$("dsGridBody"); if(!body||!dsScan) return;
+  const onlyProblems=!!$("dsOnlyProblems")?.checked;
+  const times=new Set();
+  dsScan.results.forEach(r=>r.buckets.forEach(b=>times.add(b.t0)));
+  const ordered=[...times].sort((a,b)=>a-b);
+  const lines=[];
+  ordered.forEach(t0=>{
+    const cells=dsScan.results.map(r=>r.buckets.find(b=>b.t0===t0)||null);
+    const hasProblem=cells.some(b=>b && b.health.level!=="green");
+    if(onlyProblems && !hasProblem) return;
+    const t1=t0+DS_STEP;
+    const tds=cells.map((b,i)=>{
+      const lob=dsScan.results[i].lob;
+      if(!b) return '<td class="ds-cell none">—</td>';
+      const brk=b.breaks.length;
+      const conflictTxt=b.conflict?'<small>⚠ breaks conflicting</small>':(brk?`<small>${brk} on break · not conflicting</small>`:'<small>no breaks</small>');
+      return `<td class="ds-cell ${b.health.level}" data-ds-lob="${lob}" data-ds-t0="${t0}">
+        ${b.clash?'<span class="cov-badge risk">CLASH'+(b.clashWhy?' · '+b.clashWhy:'')+'</span> ':''}${(dsScan.results[i].consecutive||[]).some(e=>e.at>=t0&&e.at<t0+DS_STEP)?'<span class="cov-badge" style="background:#fff4e5;color:#b54708">BACK-TO-BACK</span> ':''}${dsScan.minAvail==null?'':dsBadge(b.health.level)+' '}<strong>${brk}</strong> off · <strong>${b.available}</strong> of ${b.scheduled} on phone
+        ${conflictTxt}
+      </td>`;
+    }).join("");
+    lines.push(`<tr><td>${covFmtMin(t0)} – ${covFmtMin(t1)}</td>${tds}</tr>`);
+  });
+  body.innerHTML = lines.length ? lines.join("") : '<tr><td colspan="2" class="muted">No intervals to show.</td></tr>';
+  const head=document.querySelector("#dsGridBody")?.closest("table")?.querySelector("thead");
+  if(head) head.innerHTML=`<tr><th>Time</th>${dsScan.results.map(r=>`<th>${r.lob}</th>`).join("")}</tr>`;
+}
+function dsOutlineText(b, avail2, health, manual){
+  const brk=b.breaks.length;
+  if(!brk) return "No break, lunch or BOP in this interval.";
+  const withoutBreaks=dsHealthFor(avail2+brk, dsScan.minAvail);
+  const contributes = DS_RANK[withoutBreaks.level] > DS_RANK[health.level];
+  if(contributes) return `${brk} break/lunch/BOP agent(s) here: CONFLICTING. Without them cover would be ${withoutBreaks.label.toLowerCase()} instead of ${health.label.toLowerCase()}.`;
+  return `${brk} break/lunch/BOP agent(s) here: NOT conflicting. Cover is ${health.label.toLowerCase()} with or without them.`;
+}
+function dsListHtml(title, items){
+  if(!items.length) return `<div class="ds-list"><strong>${title}</strong><span class="muted">None</span></div>`;
+  return `<div class="ds-list"><strong>${title} (${items.length})</strong>${items.map(x=>
+    `${escapeHtml(x.name)} · ${escapeHtml(x.label)} ${covFmtMin(x.start)}–${covFmtMin(x.end)}`).join("<br>")}</div>`;
+}
+function dsPairScan(results){
+  const counts=new Map();
+  results.forEach(res=>res.buckets.forEach(b=>{
+    const people=b.breaks.map(x=>({id:String(x.employee_id||x.name), name:x.name||x.employee_id}));
+    for(let i=0;i<people.length;i++) for(let j=i+1;j<people.length;j++){
+      const [p,q]=[people[i],people[j]].sort((x,y)=>x.id.localeCompare(y.id));
+      const k=p.id+"|"+q.id;
+      if(!counts.has(k)) counts.set(k,{a:p.name,b:q.name,slots:[]});
+      counts.get(k).slots.push(b.t0);
+    }
+  }));
+  return [...counts.values()].filter(x=>x.slots.length>=2).sort((x,y)=>y.slots.length-x.slots.length).slice(0,12);
+}
+function dsRenderPairs(){
+  const el=$("dsPairs"); if(!el||!dsScan) return;
+  const pairs=dsPairScan(dsScan.results);
+  let body;
+  if(!pairs.length){ body='<div class="muted" style="margin-top:8px">No pair was off-phone together in two or more slots.</div>'; }
+  else body='<div class="tablewrap" style="margin-top:8px"><table><thead><tr><th>Agent</th><th>Agent</th><th>Slots together</th><th>First</th><th>Last</th></tr></thead><tbody>'+
+    pairs.map(p=>`<tr><td>${escapeHtml(p.a)}</td><td>${escapeHtml(p.b)}</td><td><b>${p.slots.length}</b></td><td>${covFmtMin(Math.min(...p.slots))}</td><td>${covFmtMin(Math.max(...p.slots)+DS_STEP)}</td></tr>`).join("")+'</tbody></table></div>';
+  el.innerHTML='<details class="ds-pairs"><summary style="cursor:pointer;font-weight:700;color:#1f3550">Who tends to be off-phone together <span style="font-weight:400;color:#53677c">· '+escapeHtml(dsScan.date)+', '+covFmtMin(dsScan.from)+' – '+covFmtMin(dsScan.to)+'</span></summary>'+body+'</details>';
+}
+function dsRenderDrill(){
+  const el=$("dsDrill"); if(!el||!dsScan||!dsOpenKey) return;
+  const res=dsScan.results.find(r=>r.lob===dsOpenKey.lob);
+  const b=res?res.buckets.find(x=>x.t0===dsOpenKey.t0):null;
+  if(!b){ el.innerHTML=""; return; }
+  const mk=`${dsScan.date}|${res.lob}|${b.t0}`;
+  const manual=dsManualMap.get(mk)||0;
+  const avail2=Math.max(0,b.available-manual);
+  const health=dsHealthFor(avail2, dsScan.minAvail);
+  el.innerHTML=`<div class="ds-drill">
+    <h4>${res.lob} · ${covFmtMin(b.t0)} – ${covFmtMin(b.t1)} · ${escapeHtml(dsScan.date)}</h4>
+    <div class="ds-grid">
+      <div class="ds-stat"><span>Scheduled</span><b>${b.scheduled}</b></div>
+      <div class="ds-stat"><span>Off-phone (schedule)</span><b>${b.off}</b></div>
+      <div class="ds-stat"><span>Training (schedule)</span><b>${b.training.length}</b></div>
+      <div class="ds-stat"><span>Break / lunch / BOP</span><b>${b.breaks.length}</b></div>
+      <div class="ds-stat"><span>Available (schedule)</span><b>${b.available}</b></div>
+    </div>
+    <div class="field" style="margin:8px 0"><label>Borrowed / off-phone for this LOB (manual)</label>
+      <input type="number" min="0" max="${b.scheduled}" value="${manual}" data-ds-manual="${escapeHtml(mk)}" style="width:110px"></div>
+    <div style="font-size:13px;margin:6px 0">Available after borrowing: <strong id="dsAfterVal">${avail2}</strong>
+      <span id="dsAfterBadge">${dsBadge(health.level)}</span></div>
+    <div class="ds-outline" id="dsOutline">${escapeHtml(dsOutlineText(b, avail2, health, manual))}</div>
+    ${dsListHtml("On break / lunch / BOP", b.breaks)}
+    ${dsListHtml("On training", b.training)}
+    ${dsListHtml("Other off-phone", b.other)}
+  </div>`;
+}
+function dsUpdateDrillComputed(mk){
+  if(!dsScan||!dsOpenKey) return;
+  const res=dsScan.results.find(r=>r.lob===dsOpenKey.lob);
+  const b=res?res.buckets.find(x=>x.t0===dsOpenKey.t0):null;
+  if(!b) return;
+  const manual=dsManualMap.get(mk)||0;
+  const avail2=Math.max(0,b.available-manual);
+  const health=dsHealthFor(avail2, dsScan.minAvail);
+  const v=$("dsAfterVal"); if(v) v.textContent=String(avail2);
+  const bd=$("dsAfterBadge"); if(bd) bd.innerHTML=dsBadge(health.level);
+  const o=$("dsOutline"); if(o) o.textContent=dsOutlineText(b, avail2, health, manual);
+}
+document.addEventListener("click", e=>{
+  const runBtn=e.target.closest && e.target.closest("#dsRunBtn");
+  if(runBtn){ runDaySweep(); return; }
+  const drillBtn=e.target.closest && e.target.closest("#dsDrillBtn");
+  if(drillBtn){ runDaySweep({single:true}); return; }
+  const cell=e.target.closest && e.target.closest("[data-ds-lob]");
+  if(cell){
+    dsOpenKey={lob:cell.dataset.dsLob, t0:Number(cell.dataset.dsT0)};
+    dsRenderDrill();
+    $("dsDrill")?.scrollIntoView({behavior:"smooth", block:"start"});
+  }
+});
+document.addEventListener("change", e=>{
+  if(e.target && e.target.id==="covDate" && e.target.value) runCoverageBrief();
+});
+document.addEventListener("input", e=>{
+  const t=e.target;
+  if(!t) return;
+  if(t.id==="dsOnlyProblems"){ dsRenderGrid(); return; }
+  if(t.matches && t.matches("[data-ds-manual]")){
+    const v=Math.max(0, Math.min(999, Math.floor(Number(t.value)||0)));
+    dsManualMap.set(t.dataset.dsManual, v);
+    dsUpdateDrillComputed(t.dataset.dsManual);
+  }
+});
+/* ===== end Alpha 10 day scan ===== */
+</script>
+<style>
+/* Alpha 10: Whole-day scan across LOBs */
+.ds-cell{cursor:pointer;white-space:normal;min-width:150px;font-size:12px;vertical-align:top}
+.ds-cell:hover{outline:2px solid #1f6feb;outline-offset:-2px}
+.ds-cell.green{background:#ecfdf3}
+.ds-cell.amber{background:#fff7ed}
+.ds-cell.red{background:#fef3f2}
+.ds-cell.none{color:#9aa8b8;cursor:default}
+.ds-cell small{display:block;color:#53677c;font-size:11px;margin-top:3px}
+.ds-drill{margin-top:14px;background:#fff;border:1px solid #d6e0ea;border-radius:12px;padding:14px 16px}
+.ds-drill h4{margin:0 0 8px;font-size:15px}
+.ds-drill .ds-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:10px 0}
+.ds-drill .ds-stat{background:#f6f9fc;border-radius:10px;padding:8px 10px}
+.ds-drill .ds-stat b{display:block;font-size:18px}
+.ds-drill .ds-stat span{font-size:11px;color:#667a91;text-transform:uppercase;letter-spacing:.04em}
+.ds-outline{font-size:13px;margin:8px 0;padding:8px 10px;border-radius:8px;background:#f6f9fc}
+.ds-list{font-size:12.5px;margin:8px 0;line-height:1.5}
+.ds-list strong{display:block;margin-bottom:2px}
+</style>
+
+
+<script>
+/* ===== Alpha 10: Multi-LOB Intalk Login vs Schedule ===== */
+const LB_LATE_TOL=5, LB_EARLY_TOL=60;
+const LB_LEAVE_CODES=["VL","SL","ML","PTO","LEAVE","HOLIDAY","AL","EL","UPL","LWOP","LOA","BL","PL"];
+// Existing trusted username-to-EID aliases. Unmapped records also use exact normalized Agent name / roster name matching.
+const LB_USER_MAP={
+  "CCAC_Fulache_Carmela_O":"M159760",
+  "Nur_Viejon":"M152227",
+  "CICNISHAOLIVE_SULLEZA":"M151473",
+  "CICLEONELINE_FARO":"M151474",
+  "CICAnna_Tagonera":"M151763",
+  "CICLuis_Buenaflor":"M151768",
+  "CICAnaMarie_Labor":"M151786",
+  "CICMELANIE_ATADERO":"M151993",
+  "CICDONNAVIC_ALCANTARA":"M151995",
+  "CICJUNALIZ_DELACRUZ":"M152005",
+  "CICMICCA_DALIBA":"M152009",
+  "CICJESSICA_ALMIRA":"M152010",
+  "Carl_Consumo":"M152224",
+  "Flordeliza_Ortiz":"M152230",
+  "Joanna_Mae_De_Felipe":"M153178",
+  "CICMa_Eleanor_Rios":"M153182",
+  "CICNorlyn_Epelipsia":"M153188",
+  "Winnie_Cacho":"M153838",
+  "Edriana_Martir":"M153845",
+  "Aubrey_Ocampo":"M153848",
+  "Reymond_Ramirez":"M153850",
+  "Jayson_Taclima":"M153851",
+  "CCAC_Diana_jane_Atadero":"M156257",
+  "CCAC_Kaye_Smith_Amante":"M156260",
+  "CCAC_Melisa_Laurente":"M156262",
+  "CCAC_Cheska_Lorraine_Tallodar":"M156264",
+  "CCAC_John_Cyril_Fulgencio_Abaj":"M156986",
+  "CCAC_Juliene_Kate_Pueto_Chua":"M158130",
+  "CCAC_Marsael_Leonor_Lata":"M158132",
+  "CCAC_Danica_Romey":"M159251",
+  "CCAC_Sittie_Ayonga":"M159257",
+  "CCAC_William_Aragon":"M159261",
+  "CCAC_Lingga_Joyce_Lyn_B":"M159764",
+  "CCAC_Hernalim_Shaine_B":"M159768",
+  "CCAC_Padin_Ma_Charity_F":"M159770",
+  "CCAC_Amacio_Petche_Marie_T":"M159772",
+  "CCAC_Isiderio_Nikka_Marie_H":"M159774",
+  "CCAC_Esco_Lady_Claire":"M159778",
+  // Explicit Intalk aliases where the export omits the Agent Name field.
+  "CCAC_Hannah_Visto":"M159249",
+  "CCAC_Maquiling_Spencer_Jay_A":"M159762",
+  "CCAC_John_Jusayan":"M159259"
+};
+let liState={text:null, fileName:""};
+
+function lbParseCsv(text){
+  const out=[]; let row=[], cell="", q=false;
+  text=String(text||"").replace(/^\uFEFF/,"");
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(q){
+      if(c==='"'){ if(text[i+1]==='"'){ cell+='"'; i++; } else q=false; }
+      else cell+=c;
+    }else{
+      if(c==='"') q=true;
+      else if(c===','){ row.push(cell); cell=""; }
+      else if(c==='\n'||c==='\r'){
+        if(c==='\r'&&text[i+1]==='\n') i++;
+        row.push(cell); out.push(row); row=[]; cell="";
+      }else cell+=c;
+    }
+  }
+  if(cell.length||row.length){ row.push(cell); out.push(row); }
+  return out;
+}
+function lbParseWhen(str){
+  const t=String(str||"").trim();
+  let m=t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if(m) return lbWhenOut(Number(m[1]),Number(m[2]),Number(m[3]),Number(m[4]),Number(m[5]),m[6]);
+  m=t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+  if(m){
+    let a=Number(m[1]), b=Number(m[2]);
+    // Month first (US/Excel default) unless first number can only be a day.
+    const mon=a>12?b:a, day=a>12?a:b;
+    return lbWhenOut(Number(m[3]),mon,day,Number(m[4]),Number(m[5]),m[6]);
+  }
+  return null;
+}
+function lbWhenOut(y,mo,d,h,mi,ap){
+  if(ap){ const u=ap.toUpperCase(); if(u==="PM"&&h<12) h+=12; if(u==="AM"&&h===12) h=0; }
+  if(h>23||mi>59||mo<1||mo>12||d<1||d>31) return null;
+  return {date:y+"-"+String(mo).padStart(2,"0")+"-"+String(d).padStart(2,"0"), min:h*60+mi};
+}
+function lbUserKey(v){return String(v||"").trim().toLowerCase().replace(/\s+/g,"");}
+function lbNormName(v){
+  let s=String(v||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().trim();
+  s=s.replace(/^\s*[a-z]?\d{6,}\s*[,|:-]?\s*/,"");
+  return s.replace(/[^a-z0-9]/g,"");
+}
+function lbNameKeys(v){
+  const raw=String(v||"").trim();
+  if(!raw) return [];
+  const variants=[raw,raw.replace(/^(?:CCAC|CMIP|CDI|CIC|VOICE|AGENT)[\s_.-]*/i,"")];
+  return [...new Set(variants.map(lbNormName).filter(x=>x.length>=5))];
+}
+function lbParseIntalk(text){
+  const rows=lbParseCsv(text);
+  const hi=rows.findIndex(r=>String(r[0]||"").trim().toLowerCase()==="agent name");
+  if(hi<0) throw new Error("Not an Intalk login export: could not find the 'Agent name' header row.");
+  let reportDate="";
+  rows.slice(0,hi).forEach(r=>{ if(String(r[0]||"").trim().toLowerCase()==="report date") reportDate=String(r[1]||"").trim(); });
+  const h=rows[hi].map(x=>String(x).trim().toLowerCase());
+  const iN=h.indexOf("agent name"), iU=h.indexOf("agent username"), iQ=h.indexOf("queue name"), iL=h.indexOf("login time");
+  if(iU<0||iL<0) throw new Error("Export is missing the Agent Username or Login Time column.");
+  const seen=new Map(); let skipped=0, sample="";
+  rows.slice(hi+1).forEach(r=>{
+    const u=String(r[iU]||"").trim(), lt=String(r[iL]||"").trim();
+    if(!u) return;
+    const w=lbParseWhen(lt);
+    if(!w){ skipped++; if(!sample&&lt) sample=lt; return; }
+    // Keep one earliest login per username per calendar day so multi-day exports don't blend attendance.
+    const key=lbUserKey(u)+"|"+w.date;
+    const rec=seen.get(key)||{user:u,name:"",date:w.date,first:null,queues:new Set()};
+    if(rec.first==null||w.min<rec.first) rec.first=w.min;
+    if(iN>=0&&String(r[iN]||"").trim()) rec.name=String(r[iN]).trim();
+    if(iQ>=0&&String(r[iQ]||"").trim()) rec.queues.add(String(r[iQ]).trim());
+    seen.set(key,rec);
+  });
+  return {reportDate,users:[...seen.values()].map(u=>({...u,queues:u.queues})),skipped,sample};
+}
+function lbFmt(m){if(m==null)return "—";return covFmtMin(m);}
+function lbDiffText(d){if(d==null)return "—";return (d>0?"+":"")+d+" min";}
+function lbBranchName(key){return branchLabel(key)||key||"—";}
+function lbGroupText(row){return [row?.group_name,row?.subgroup].filter(x=>String(x||"").trim()).join(" / ")||"—";}
+function lbLeaveLabel(status){
+  const s=String(status||"NO ROW").trim().toUpperCase();
+  if(s==="OFF") return "Scheduled OFF";
+  if(s==="NO ROW") return "No schedule row";
+  if(s==="NO PUBLISHED SCHEDULE") return "No published schedule";
+  if(s==="ML"||s.includes("MATERNITY")) return "On ML";
+  if(s==="SL"||s.includes("SICK LEAVE")) return "On SL";
+  if(s==="VL"||s.includes("VACATION LEAVE")) return "On VL";
+  if(s==="AL"||s.includes("ANNUAL LEAVE")) return "On AL";
+  if(LB_LEAVE_CODES.includes(s)) return "On "+s;
+  if(/TRAIN|TRAINING/.test(s)) return "Training";
+  return s;
+}
+async function lbLoadSchedule(date,lobKey){
+  const {data:versions,error:ve}=await sb.from("schedule_versions")
+    .select("id,version_number,lob,week_start,week_end").eq("status","published").eq("lob",lobKey)
+    .lte("week_start",date).gte("week_end",date)
+    .order("version_number",{ascending:false}).limit(1);
+  if(ve) throw ve;
+  if(!versions?.length) return {lob:lobKey,version:null,schedules:[],training:new Map()};
+  const version=versions[0];
+  const {data:sch,error:se}=await sb.from("schedules")
+    .select("id,employee_id,schedule_status,shift_start,shift_end,schedule_date")
+    .eq("schedule_version_id",version.id).eq("schedule_date",date);
+  if(se) throw se;
+  const ids=(sch||[]).map(s=>s.id).filter(x=>x!=null);
+  const activitiesResult=ids.length
+    ? await sb.from("schedule_activities").select("schedule_id,activity_type,start_time,end_time").in("schedule_id",ids)
+    : {data:[],error:null};
+  if(activitiesResult.error) throw new Error("Could not load schedule activities for "+lbBranchName(lobKey)+": "+activitiesResult.error.message);
+  const training=new Map();
+  (activitiesResult.data||[]).forEach(a=>{
+    const st=covParseTimeToMin(a.start_time), en=covParseTimeToMin(a.end_time);
+    if(st==null||en==null||en<=st) return;
+    const arr=training.get(a.schedule_id)||[];
+    arr.push({label:String(a.activity_type||"Scheduled activity"),kind:dsKind(a.activity_type),start:st,end:en});
+    training.set(a.schedule_id,arr);
+  });
+  return {lob:lobKey,version,schedules:sch||[],training};
+}
+async function lbLoadRosterDirectory(){
+  const {data,error}=await sb.from("roster")
+    .select("employee_id,name,team_leader,group_name,subgroup,lob,active");
+  if(error) throw new Error("Could not load the roster directory for login matching: "+error.message);
+  const best=new Map();
+  (data||[]).forEach(r=>{
+    const eid=String(r.employee_id||"").trim().toUpperCase(); if(!eid) return;
+    const old=best.get(eid);
+    if(!old || (r.active===true && old.active!==true)) best.set(eid,r);
+  });
+  return [...best.values()];
+}
+function lbResolveUsers(users, rosterDirectory, schedulePool, selectedLobs){
+  const rosterByEid=new Map(rosterDirectory.map(r=>[String(r.employee_id||"").trim().toUpperCase(),r]));
+  const usernameMap=new Map([...Object.entries(LB_USER_MAP), ...lbDbAliases.map(x=>[x.username,x.employee_id])].map(([u,eid])=>[lbUserKey(u),String(eid||"").trim().toUpperCase()]));
+  const nameIndex=new Map();
+  rosterDirectory.forEach(r=>lbNameKeys(r.name).forEach(k=>{
+    const arr=nameIndex.get(k)||[];
+    if(!arr.some(x=>String(x.employee_id||"").trim().toUpperCase()===String(r.employee_id||"").trim().toUpperCase())) arr.push(r);
+    nameIndex.set(k,arr);
+  }));
+  const scheduledByEid=new Map();
+  schedulePool.forEach(p=>{
+    const eid=String(p.employee_id||"").trim().toUpperCase();
+    if(eid && !scheduledByEid.has(eid)) scheduledByEid.set(eid,p);
+  });
+  const loginFor=new Map(), resolvedUsers=new Set(), other=[];
+  users.forEach(u=>{
+    let eid=usernameMap.get(lbUserKey(u.user))||"", method=eid?"Username map":"";
+    if(!eid){
+      const keys=[...new Set([...lbNameKeys(u.name),...lbNameKeys(u.user)])];
+      let hit=null;
+      for(const k of keys){
+        const matches=nameIndex.get(k)||[];
+        if(matches.length===1){hit=matches[0];break;}
+      }
+      if(hit){eid=String(hit.employee_id||"").trim().toUpperCase();method="Exact roster name";}
+    }
+    if(eid){
+      resolvedUsers.add(lbUserKey(u.user)+"|"+u.date);
+      const existing=loginFor.get(eid);
+      if(!existing || (u.first!=null && (existing.first==null||u.first<existing.first))) loginFor.set(eid,Object.assign({},u,{matchedEmployeeId:eid,matchMethod:method}));
+      const roster=rosterByEid.get(eid), scheduled=scheduledByEid.get(eid);
+      const rowLob=scheduled?.lob || branchKeyFromLabel(roster?.lob) || "";
+      const inSelected=rowLob && selectedLobs.includes(rowLob);
+      const rosterInSelected=roster && selectedLobs.includes(branchKeyFromLabel(roster.lob));
+      if(!scheduled && !rosterInSelected){
+        other.push({lob:rowLob?lbBranchName(rowLob):"—",user:u.user,name:u.name,first:u.first,queues:[...u.queues].join(", "),schedule:roster?"Rostered under "+lbBranchName(branchKeyFromLabel(roster.lob))+" (outside selected schedule scope)":"Username maps to "+eid+" but no matching roster/schedule row",review:!roster});
+      }
+    }else{
+      other.push({lob:"—",user:u.user,name:u.name,first:u.first,queues:[...u.queues].join(", "),schedule:"Unmatched Intalk login — review username/name mapping",review:true});
+    }
+  });
+  return {loginFor,rosterByEid,resolvedUsers,other};
+}
+function lbClassify(schedulePool, rosterDirectory, scheduleLoads, users, cutoff, selectedLobs){
+  const resolved=lbResolveUsers(users,rosterDirectory,schedulePool,selectedLobs);
+  const attendance=[],leave=[],training=[];
+  const scheduledKeys=new Set();
+  schedulePool.forEach(p=>{
+    const eid=String(p.employee_id||"").trim().toUpperCase();
+    scheduledKeys.add(p.lob+"|"+eid);
+    const rec=resolved.loginFor.get(eid)||null;
+    const status=String(p.status||"").trim().toUpperCase()||"NO ROW";
+    const acts=p.scheduleId!=null?(p.activities||[]):[];
+    acts.filter(a=>a.kind==="training").forEach(a=>training.push({lob:p.lob,name:p.name,employee_id:eid,activity:a.label,start:a.start,end:a.end}));
+    const common={lob:p.lob,name:p.name,employee_id:eid,groupText:lbGroupText(p),teamLeader:p.team_leader||"—",first:rec?rec.first:null,user:rec?rec.user:"",scheduleStatus:status};
+    if(status==="WORKING"){
+      const s=p.shiftStart;
+      let cls,diff=null;
+      if(s==null){cls="No shift time";}
+      else if(rec){
+        diff=rec.first-s;
+        cls=diff< -LB_EARLY_TOL?"Early - outside window":diff>LB_LATE_TOL?"Tardy":"Present - on time";
+      }else if(cutoff==null){cls="No report time";}
+      else cls=cutoff>=s+LB_LATE_TOL?"Absent - no login":"Not yet due";
+      attendance.push(Object.assign({},common,{cls,shift:p.shiftLabel||"",diff,matchMethod:rec?.matchMethod||""}));
+    }else{
+      const label=lbLeaveLabel(status);
+      const flag=rec?"Logged in during scheduled status: "+label:"";
+      leave.push(Object.assign({},common,{status:label,flag}));
+    }
+  });
+  // Active roster employees omitted from a published daily schedule are surfaced separately, never auto-labelled absent.
+  const versionByLob=new Map(scheduleLoads.map(x=>[x.lob,x.version]));
+  rosterDirectory.forEach(r=>{
+    const eid=String(r.employee_id||"").trim().toUpperCase();
+    const lob=branchKeyFromLabel(r.lob);
+    if(!eid||!selectedLobs.includes(lob)||r.active!==true||scheduledKeys.has(lob+"|"+eid)) return;
+    const version=versionByLob.get(lob);
+    const status=version?"No schedule row":"No published schedule";
+    const rec=resolved.loginFor.get(eid)||null;
+    leave.push({lob,name:r.name||eid,employee_id:eid,groupText:lbGroupText(r),teamLeader:r.team_leader||"—",status,first:rec?rec.first:null,flag:rec?"Logged in but absent from the selected day's schedule":"Verify schedule / roster before classifying attendance"});
+  });
+  return {attendance,leave,training,other:resolved.other,loginFor:resolved.loginFor};
+}
+let lbDbAliases=[];
+async function loadIntalkAliases(){
+  const {data,error}=await sb.from("intalk_aliases").select("username,employee_id");
+  if(error){ console.warn("Alias table unavailable:",error); lbDbAliases=[]; return; }
+  lbDbAliases=data||[];
+}
+async function lbSaveAlias(btn){
+  const cell=btn.closest("td");
+  const input=cell.querySelector(".lb-map-input");
+  const eid=(input?.value||"").trim().toUpperCase();
+  const user=btn.dataset.user;
+  if(!eid){ input?.focus(); return; }
+  btn.disabled=true;
+  try{
+    const {data,error}=await sb.from("roster").select("employee_id,name").eq("employee_id",eid).limit(1);
+    if(error) throw error;
+    if(!data||!data.length){ alert("That employee ID is not on the roster."); return; }
+    const {error:e2}=await sb.from("intalk_aliases").upsert({username:user,employee_id:eid,created_by_name:currentProfile?.display_name||null},{onConflict:"username"});
+    if(e2) throw e2;
+    lbDbAliases=[...lbDbAliases.filter(x=>x.username!==user),{username:user,employee_id:eid}];
+    await runLoginBrief();
+  }catch(err){
+    console.error("Alias save failed:",err);
+    alert("Alias not saved: "+(err.message||String(err)));
+  }finally{ btn.disabled=false; }
+}
+async function runLoginBrief(){
+  const msg=$("liMsg"),btn=$("liRunBtn"),exp=$("liExportBtn");
+  const date=($("liDate")?.value||"").slice(0,10);
+  const choice=$("liLob")?.value||"ALL";
+  const allowedLobs=typeof allowedBranchesForProfile==="function"?allowedBranchesForProfile():allBranchKeys();
+  const selectedLobs=choice==="ALL"?allBranchKeys().filter(l=>allowedLobs.includes(l)):[branchKeyFromLabel(choice)];
+  const session=$("liSession")?.value||"";
+  if(!session){msg.innerHTML='<div class="banner warn">Pick the run (AM, PM, or EOS) so it can be archived.</div>';return;}
+  if(!date){msg.innerHTML='<div class="banner err">Pick a date.</div>';return;}
+  if(!liState.text){msg.innerHTML='<div class="banner warn">Upload the Intalk login export (CSV) first.</div>';return;}
+  if(!selectedLobs.length||selectedLobs.some(l=>!allowedLobs.includes(l))){msg.innerHTML='<div class="banner err">Your account is not permitted to view one or more selected LOBs.</div>';return;}
+  if(btn){btn.disabled=true;btn.textContent="Checking…";}
+  msg.innerHTML='<div class="banner info">Matching Intalk logins to the published '+(choice==="ALL"?'CCAC, CMIP, and CDI schedules':escapeHtml(lbBranchName(selectedLobs[0])))+' for '+escapeHtml(date)+'…</div>';
+  try{
+    const parsed=lbParseIntalk(liState.text);
+    const dayUsers=parsed.users.filter(u=>u.date===date);
+    const loads=await Promise.all(selectedLobs.map(lob=>lbLoadSchedule(date,lob)));
+    const roster=await lbLoadRosterDirectory();
+    const rosterByEid=new Map(roster.map(r=>[String(r.employee_id||"").trim().toUpperCase(),r]));
+    const schedulePool=[];
+    loads.forEach(load=>{
+      (load.schedules||[]).forEach(s=>{
+        const eid=String(s.employee_id||"").trim().toUpperCase();
+        if(!eid)return;
+        const r=rosterByEid.get(eid)||{};
+        const shiftStart=covParseTimeToMin(s.shift_start),shiftEnd=covParseTimeToMin(s.shift_end);
+        schedulePool.push({employee_id:eid,lob:load.lob,name:r.name||eid,group_name:r.group_name,subgroup:r.subgroup,team_leader:r.team_leader,status:s.schedule_status,shiftStart,shiftEnd,shiftLabel:shiftStart!=null&&shiftEnd!=null?lbFmt(shiftStart)+" – "+lbFmt(shiftEnd):"",scheduleId:s.id,activities:load.training.get(s.id)||[]});
+      });
+    });
+    // Report cut-off is based on the Intalk report timestamp, or the latest first login from the selected date.
+    let cutoff=null,cutoffNote="";
+    const rd=parsed.reportDate.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})/);
+    if(rd&&rd[1]===date){cutoff=Number(rd[2])*60+Number(rd[3]);cutoffNote="Intalk report time";}
+    else if(dayUsers.length){cutoff=Math.max(...dayUsers.map(u=>u.first).filter(v=>v!=null));cutoffNote="latest first login on selected date (no report timestamp)";}
+    await loadIntalkAliases();
+    const result=lbClassify(schedulePool,roster,loads,dayUsers,cutoff,selectedLobs);
+    const missingLobs=loads.filter(x=>!x.version).map(x=>lbBranchName(x.lob));
+    const offDay=parsed.users.filter(u=>u.date!==date).length;
+    liRender(result,{date,selectedLobs,versions:loads.filter(x=>x.version).map(x=>({lob:x.lob,version:x.version.version_number})),cutoff,cutoffNote,fileName:liState.fileName,offDay,unmatched:result.other.filter(x=>x.review).length,missingLobs,scheduledN:schedulePool.length,loginN:dayUsers.length,skipped:parsed.skipped});
+    if(exp)exp.disabled=false;
+    const archiveNote=await archiveAttendanceRun(result,{date,selectedLobs,versions:loads.filter(x=>x.version).map(x=>({lob:x.lob})),cutoff,cutoffNote,fileName:liState.fileName},session);
+    if(archiveNote) msg.innerHTML+=archiveNote;
+  }catch(err){
+    console.error(err);
+    msg.innerHTML='<div class="banner err">Login brief failed: '+escapeHtml(err.message||String(err))+'</div>';
+  }finally{if(btn){btn.disabled=false;btn.textContent="Run attendance check";}}
+}
+async function archiveAttendanceRun(result,meta,session){
+  const role=String(currentProfile?.role||"").toLowerCase();
+  if(role!=="wfm" && role!=="admin") return "";
+  const fm=m=>m==null?null:String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0");
+  const out=[];
+  for(const lob of meta.selectedLobs){
+    if(!meta.versions.some(v=>v.lob===lob)) continue;
+    const att=result.attendance.filter(x=>x.lob===lob);
+    const lv=result.leave.filter(x=>x.lob===lob);
+    const tr=result.training.filter(x=>x.lob===lob);
+    const ot=result.other.filter(x=>x.lob===lob);
+    const c=cls=>att.filter(x=>x.cls===cls).length;
+    const summary={
+      present:c("Present - on time")+c("Tardy")+c("Early - outside window"),
+      on_time:c("Present - on time"), tardy:c("Tardy"), early:c("Early - outside window"),
+      absent:c("Absent - no login"), not_yet_due:c("Not yet due"),
+      leave_or_exception:lv.length, training:new Set(tr.map(x=>x.employee_id)).size, needs_review:ot.length
+    };
+    const records=[
+      ...att.map(x=>({employee_id:x.employee_id,name:x.name,team_leader:x.teamLeader,group_text:x.groupText,status:x.cls,scheduled_shift:x.shift||null,first_login:fm(x.first),diff_minutes:x.diff==null?null:Math.round(x.diff),detail:{user:x.user||null,schedule_status:x.scheduleStatus||null,match_method:x.matchMethod||null}})),
+      ...lv.map(x=>({employee_id:x.employee_id,name:x.name,team_leader:x.teamLeader||x.team_leader||"",group_text:x.groupText||"",status:x.cls||x.status||"Leave / OFF / exception",detail:x})),
+      ...tr.map(x=>({employee_id:x.employee_id,name:x.name,team_leader:x.teamLeader||"",status:"Training",detail:{activity:x.activity,start:x.start,end:x.end}})),
+      ...ot.map(x=>({employee_id:x.employee_id,name:x.name,team_leader:x.teamLeader||"",group_text:x.groupText||"",status:"Needs review",detail:x}))
+    ];
+    const label=`${lbBranchName(lob)} ${session}`;
+    try{
+      const {error}=await sb.rpc("save_attendance_run",{p_snapshot_date:meta.date,p_session:session,p_lob:lob,p_cutoff:fm(meta.cutoff),p_cutoff_note:meta.cutoffNote||null,p_file_name:meta.fileName||null,p_summary:summary,p_records:records});
+      if(error) throw error;
+      out.push("saved "+label);
+    }catch(err){
+      console.error("Attendance archive failed:",err);
+      out.push(label+" NOT saved: "+(err.message||String(err)));
+    }
+  }
+  if(!out.length) return "";
+  const failed=out.some(x=>x.includes("NOT saved"));
+  return `<div class="banner ${failed?"err":"ok"}"><strong>Archive:</strong> ${escapeHtml(out.join(" · "))}</div>`;
+}
+function liCount(list,cls){return list.filter(x=>x.cls===cls).length;}
+function liRender(r,meta){
+  const onTime=liCount(r.attendance,"Present - on time"),late=liCount(r.attendance,"Tardy"),early=liCount(r.attendance,"Early - outside window"),absent=liCount(r.attendance,"Absent - no login"),notDue=liCount(r.attendance,"Not yet due");
+  const present=onTime+late+early, leaveN=r.leave.length, trainN=new Set(r.training.map(x=>x.employee_id)).size;
+  const msg=$("liMsg");
+  let summary=[];
+  summary.push(`${present} present (${onTime} on time, ${late} tardy, ${early} early)`);
+  summary.push(`${absent} absent`);
+  summary.push(`${leaveN} leave / OFF / schedule exceptions`);
+  if(notDue)summary.push(`${notDue} not yet due`);
+  let warnings=[];
+  if(meta.missingLobs.length)warnings.push("No published schedule for: "+meta.missingLobs.join(", "));
+  if(meta.offDay>0)warnings.push(meta.offDay+" login record(s) from other dates were ignored");
+  if(meta.unmatched>0)warnings.push(meta.unmatched+" Intalk login(s) need mapping review; confirm them before relying on absent counts");
+  if(meta.skipped)warnings.push(meta.skipped+" row(s) had unrecognized login times");
+  if(warnings.length){
+    msg.innerHTML='<div class="banner '+(meta.unmatched||meta.missingLobs.length?'warn':'info')+'"><strong>Attendance check complete — review flags.</strong> '+escapeHtml(summary.join(" · "))+". "+escapeHtml(warnings.join(" · "))+".</div>";
+  }else if(absent||late){
+    msg.innerHTML='<div class="banner '+(absent?'err':'warn')+'"><strong>Attendance check complete.</strong> '+escapeHtml(summary.join(" · "))+'.</div>';
+  }else{
+    msg.innerHTML='<div class="banner ok"><strong>Attendance check complete.</strong> '+escapeHtml(summary.join(" · "))+'.</div>';
+  }
+  $("liStats").style.display="";
+  $("liStatPresent").textContent=String(present);
+  $("liStatOnTime").textContent=String(onTime);
+  $("liStatLate").textContent=String(late);
+  $("liStatEarly").textContent=String(early);
+  $("liStatAbsent").textContent=String(absent);
+  $("liStatLeave").textContent=String(leaveN);
+  $("liStatTraining").textContent=String(trainN);
+  $("liBasis").style.display="";
+  const versionText=meta.versions.length?meta.versions.map(v=>lbBranchName(v.lob)+" v"+v.version).join(" · "):"No matching published versions";
+  $("liBasis").innerHTML='<strong>Basis:</strong> '+escapeHtml(meta.selectedLobs.map(lbBranchName).join(", "))+' · '+escapeHtml(versionText)+' · '+meta.scheduledN+' scheduled rows · '+meta.loginN+' Intalk username/date records · file '+escapeHtml(meta.fileName)+' · cut-off '+(meta.cutoff==null?'unknown':lbFmt(meta.cutoff))+' ('+escapeHtml(meta.cutoffNote||"no report timestamp")+') · on time within '+LB_LATE_TOL+' min after shift start; early if more than '+LB_EARLY_TOL+' min before start. Leave/OFF comes from schedule status, training from schedule activities, login time from Intalk.';
+  const statusClass=c=>c==="Absent - no login"?"risk":c==="Tardy"||c==="Early - outside window"?"warn":"ok";
+  const att=$("liAttBody");
+  att.innerHTML=r.attendance.length?r.attendance.map(x=>`<tr class="${statusClass(x.cls)==='risk'?'risk':''}">
+    <td><span class="cov-badge ${statusClass(x.cls)==='risk'?'risk':statusClass(x.cls)==='warn'?'':'ok'}" ${statusClass(x.cls)==='warn'?'style="background:#fff4e5;color:#b54708"':''}>${escapeHtml(x.cls)}</span></td>
+    <td>${escapeHtml(lbBranchName(x.lob))}</td><td>${escapeHtml(x.name)}</td><td>${escapeHtml(x.groupText)}</td><td>${escapeHtml(x.teamLeader)}</td>
+    <td>${escapeHtml(x.shift||'—')}</td><td>${lbFmt(x.first)}</td><td>${lbDiffText(x.diff)}</td><td>${escapeHtml(x.user||'—')}</td></tr>`).join("")
+    :'<tr><td colspan="9" class="muted">No scheduled WORKING rows in the selected LOB scope.</td></tr>';
+  const lv=$("liLeaveBody");
+  lv.innerHTML=r.leave.length?r.leave.map(x=>`<tr class="${x.flag?'risk':''}">
+    <td>${escapeHtml(lbBranchName(x.lob))}</td><td>${escapeHtml(x.name)}</td><td>${escapeHtml(x.groupText||'—')}</td><td>${escapeHtml(x.status)}</td><td>${x.first==null?'—':lbFmt(x.first)}</td><td>${escapeHtml(x.flag||'—')}</td></tr>`).join("")
+    :'<tr><td colspan="6" class="muted">No leave, OFF, or missing-schedule exceptions.</td></tr>';
+  const tr=$("liTrainBody");
+  tr.innerHTML=r.training.length?r.training.map(x=>`<tr><td>${escapeHtml(lbBranchName(x.lob))}</td><td>${escapeHtml(x.name)}</td><td>${escapeHtml(x.activity)}</td><td>${lbFmt(x.start)} – ${lbFmt(x.end)}</td></tr>`).join("")
+    :'<tr><td colspan="4" class="muted">No training scheduled for the selected LOB scope on this date.</td></tr>';
+  const ot=$("liOtherBody");
+  ot.innerHTML=r.other.length?r.other.map(x=>{
+    const mapCell = x.review && x.user
+      ? `<div style="display:flex;gap:6px;align-items:center"><input class="lb-map-input" placeholder="Employee ID" style="width:120px;padding:6px 8px;border:1px solid #cbd8e6;border-radius:8px"><button type="button" class="secondary lb-map-btn" data-user="${escapeHtml(x.user)}" style="padding:6px 10px;font-size:12px">Save</button></div>`
+      : '';
+    return `<tr class="${x.review?'risk':''}"><td>${escapeHtml(x.user)}</td><td>${escapeHtml(x.name||'—')}</td><td>${lbFmt(x.first)}</td><td>${escapeHtml(x.queues||'—')}</td><td>${escapeHtml(x.schedule)}</td><td>${mapCell}</td></tr>`;
+  }).join("")
+    :'<tr><td colspan="6" class="muted">Every Intalk login in the file matched a roster / schedule record in the selected scope.</td></tr>';
+  ot.querySelectorAll(".lb-map-btn").forEach(btn=>btn.onclick=()=>lbSaveAlias(btn));
+  window.liLast=r;
+  window.liLastMeta=meta;
+}
+function exportLoginBriefCsv(){
+  const r=window.liLast;if(!r){toast("Run the attendance check first.");return;}
+  const date=($("liDate")?.value||"").slice(0,10),scope=$("liLob")?.value||"ALL";
+  const q=v=>'"'+String(v==null?"":v).replace(/"/g,'""')+'"';
+  const lines=["status,lob,agent,employee_id,group_subgroup,team_leader,shift,first_login,minutes_vs_start,intalk_username"];
+  r.attendance.forEach(x=>lines.push([q(x.cls),q(lbBranchName(x.lob)),q(x.name),q(x.employee_id),q(x.groupText),q(x.teamLeader),q(x.shift),q(x.first==null?"":lbFmt(x.first)),q(x.diff==null?"":x.diff),q(x.user)].join(",")));
+  lines.push("");lines.push("lob,agent,employee_id,group_subgroup,schedule_status,first_login,flag");
+  r.leave.forEach(x=>lines.push([q(lbBranchName(x.lob)),q(x.name),q(x.employee_id),q(x.groupText),q(x.status),q(x.first==null?"":lbFmt(x.first)),q(x.flag)].join(",")));
+  lines.push("");lines.push("lob,agent,employee_id,activity,start,end");
+  r.training.forEach(x=>lines.push([q(lbBranchName(x.lob)),q(x.name),q(x.employee_id),q(x.activity),q(lbFmt(x.start)),q(lbFmt(x.end))].join(",")));
+  lines.push("");lines.push("intalk_username,intalk_name,first_login,queues,match_schedule_note");
+  r.other.forEach(x=>lines.push([q(x.user),q(x.name),q(x.first==null?"":lbFmt(x.first)),q(x.queues),q(x.schedule)].join(",")));
+  const blob=new Blob(["\uFEFF"+lines.join("\r\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`WorkSync_Attendance_${scope}_${date}.csv`;a.click();URL.revokeObjectURL(a.href);toast("Attendance report exported.");
+}
+document.addEventListener("click",e=>{
+  const b=e.target.closest&&e.target.closest("#liPickBtn");
+  if(b){const fi=$("liFile");if(fi)fi.click();}
+});
+document.addEventListener("change",e=>{
+  const t=e.target;if(!t)return;
+  if(t.id==="liFile"){
+    const f=t.files&&t.files[0];if(!f)return;
+    if($("liFileName"))$("liFileName").textContent=f.name;
+    const reader=new FileReader();reader.onload=()=>{liState={text:String(reader.result||""),fileName:f.name};t.value="";runLoginBrief();};reader.readAsText(f);
+  }
+  if((t.id==="liDate"||t.id==="liLob")&&liState.text)runLoginBrief();
+});
+/* ===== end Alpha 10 login brief ===== */
+
+
+if($("briefOpenAttendance")) $("briefOpenAttendance").onclick=()=>showView("loginBrief");
+if($("loginBackBriefs")) $("loginBackBriefs").onclick=()=>showView("briefsHub");
+const GROUP_ORDER=["CAT","CET","CIT Voice","CIT Digital","Unassigned"];
+function archiveGroupOf(groupText){
+  const t=String(groupText||"").toUpperCase();
+  if(t.startsWith("CET")) return "CET";
+  if(t.startsWith("CAT")) return "CAT";
+  if(t.startsWith("CIT")){
+    if(t.includes("DIGITAL")) return "CIT Digital";
+    if(t.includes("VOICE")) return "CIT Voice";
+  }
+  return "Unassigned";
+}
+let arRows=[], arFiltered=[], arSnapshots=[];
+async function fetchAllArchiveRecords(ids){
+  let all=[], from=0;
+  while(true){
+    const {data,error}=await sb.from("attendance_records")
+      .select("id,snapshot_id,lob,employee_id,name,team_leader,group_text,status,scheduled_shift,first_login,diff_minutes")
+      .in("snapshot_id",ids).order("id",{ascending:true}).range(from,from+999);
+    if(error) throw error;
+    all=all.concat(data||[]);
+    if(!data || data.length<1000) break;
+    from+=1000;
+  }
+  return all;
+}
+function configureArchiveScope(){
+  const allowed=allowedBranchesForProfile();
+  const sel=$("arBranch"); if(!sel) return;
+  [...sel.options].forEach(o=>{ if(o.value!=="ALL") o.disabled=!allowed.includes(o.value); });
+  if(sel.value!=="ALL" && !allowed.includes(sel.value)) sel.value=allowed[0]||"ALL";
+}
+async function loadAttendanceArchive(){
+  configureArchiveScope();
+  const date=($("arDate")?.value||"").slice(0,10);
+  const body=$("arBody"), sum=$("arSummary"), exp=$("arExportBtn");
+  if(!date){ body.innerHTML='<tr><td colspan="9" class="muted">Pick a date.</td></tr>'; return; }
+  body.innerHTML='<tr><td colspan="9" class="muted">Loading…</td></tr>';
+  try{
+    let q=sb.from("attendance_snapshots")
+      .select("id,snapshot_date,session,lob,version,is_latest,cutoff_text,created_by_name,created_at,summary")
+      .eq("snapshot_date",date).order("created_at",{ascending:true});
+    if(!$("arAllVersions")?.checked) q=q.eq("is_latest",true);
+    const {data:snaps,error}=await q;
+    if(error) throw error;
+    arSnapshots=snaps||[];
+    if(!arSnapshots.length){
+      sum.innerHTML='<div class="banner info">No archived runs for '+escapeHtml(date)+'.</div>';
+      body.innerHTML='<tr><td colspan="9" class="muted">Nothing archived for this date.</td></tr>';
+      arRows=[]; arFiltered=[]; exp.disabled=true; return;
+    }
+    const byId=new Map(arSnapshots.map(x=>[x.id,x]));
+    const recs=await fetchAllArchiveRecords(arSnapshots.map(x=>x.id));
+    arRows=recs.map(r=>{const h=byId.get(r.snapshot_id)||{};return Object.assign({},r,{run:h.session||"",version:h.version||1,group:archiveGroupOf(r.group_text)});});
+    const tls=[...new Set(arRows.map(r=>r.team_leader).filter(Boolean))].sort();
+    const sts=[...new Set(arRows.map(r=>r.status).filter(Boolean))].sort();
+    $("arTl").innerHTML='<option value="">All</option>'+tls.map(t=>`<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
+    $("arStatus").innerHTML='<option value="">All</option>'+sts.map(t=>`<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
+    sum.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px">'+arSnapshots.map(x=>{
+      const m=x.summary||{};
+      return `<div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fff">
+        <div style="font-weight:800">${escapeHtml(lbBranchName(x.lob))} · ${escapeHtml(x.session)} v${x.version}${x.is_latest?'':' <span class="muted">(superseded)</span>'}</div>
+        <div class="muted" style="font-size:11px;margin:2px 0 6px">Cut-off ${escapeHtml(x.cutoff_text||"—")} · saved by ${escapeHtml(x.created_by_name||"—")}</div>
+        <div style="font-size:12px">Present ${m.present??0} · Absent ${m.absent??0} · Tardy ${m.tardy??0} · Leave/OFF ${m.leave_or_exception??0} · Training ${m.training??0} · Review ${m.needs_review??0}</div>
+      </div>`;}).join("")+'</div>';
+    if(String(currentProfile?.role||"").toLowerCase()==="tl") sum.innerHTML="";
+    if($("arSession").value==="ALL"){
+      const have=new Set(arRows.map(r=>r.run));
+      const pick=["EOS","PM","AM"].find(x=>have.has(x));
+      if(pick) $("arSession").value=pick;
+    }
+    renderAttendanceArchive();
+  }catch(err){
+    console.error("Attendance archive failed:",err);
+    sum.innerHTML='<div class="banner err">Archive could not load: '+escapeHtml(err.message||String(err))+'</div>';
+    body.innerHTML=''; arRows=[]; arFiltered=[]; exp.disabled=true;
+  }
+}
+const GROUP_COLOR={CAT:"#6d28d9",CET:"#1d4ed8","CIT Voice":"#0e7490","CIT Digital":"#be185d",Unassigned:"#64748b"};
+const STATUS_COLOR={present:"#16a34a",tardy:"#ea580c",absent:"#dc2626"};
+const GROUP_LEGEND='<div class="grp-legend">Green = present or early · Orange = tardy · Red = absent</div>';
+const GROUP_SUB={CAT:"Operating group",CET:"Operating group","CIT Voice":"CIT · Voice channel","CIT Digital":"CIT · Digital channel",Unassigned:"Missing group or CIT channel"};
+function groupCardsHtml(agg, unit){
+  const tot={scheduled:0,present:0,tardy:0,absent:0};
+  GROUP_ORDER.forEach(g=>{const a=agg.get(g); tot.scheduled+=a.scheduled; tot.present+=a.present; tot.tardy+=a.tardy; tot.absent+=a.absent;});
+  const allTile=`<div class="stf-tile stf-all">
+      <div class="stf-title">All scheduled${unit?" ("+escapeHtml(unit)+")":""}</div>
+      <div class="stf-num">${tot.scheduled}</div>
+      <div class="stf-sub">Absence rate ${pctOf(tot.absent,tot.scheduled)}</div>
+      <div class="stf-split"><span style="color:#86efac">${tot.present} present</span><span style="color:#fdba74">${tot.tardy} tardy</span><span style="color:#fca5a5">${tot.absent} absent</span></div>
+    </div>`;
+  const groupTiles=GROUP_ORDER.filter(g=>g!=="Unassigned" || agg.get(g).scheduled>0).map(g=>{
+    const a=agg.get(g);
+    return `<div class="stf-tile" style="border-top:4px solid ${GROUP_COLOR[g]}">
+      <div class="stf-title" style="color:${GROUP_COLOR[g]}">${escapeHtml(g)}</div>
+      <div class="stf-num" style="color:${GROUP_COLOR[g]}">${a.scheduled}</div>
+      <div class="stf-sub">${escapeHtml(GROUP_SUB[g]||"")}</div>
+      <div class="stf-split"><span style="color:${STATUS_COLOR.present}">${a.present} present</span><span style="color:${STATUS_COLOR.tardy}">${a.tardy} tardy</span><span style="color:${STATUS_COLOR.absent}">${a.absent} absent</span></div>
+      <div class="stf-rate">Absence rate ${pctOf(a.absent,a.scheduled)}</div>
+    </div>`;}).join("");
+  return GROUP_LEGEND+'<div class="stf-row">'+allTile+groupTiles+'</div>';
+}
+function renderArchiveGroupSummary(rows, ses){
+  const el=$("arGroupSummary");
+  if(ses==="ALL"){ el.innerHTML='<div class="muted" style="font-size:12px">Pick one run (AM, PM, or EOS) to see the group breakdown.</div>'; return; }
+  const agg=new Map(GROUP_ORDER.map(g=>[g,{scheduled:0,present:0,tardy:0,absent:0}]));
+  rows.forEach(r=>{
+    if(!AB_SCHEDULED.includes(r.status)) return;
+    const a=agg.get(r.group)||agg.get("Unassigned");
+    a.scheduled++;
+    if(AB_PRESENT.includes(r.status)) a.present++;
+    if(r.status==="Tardy") a.tardy++;
+    if(r.status==="Absent - no login") a.absent++;
+  });
+  el.innerHTML=groupCardsHtml(agg,"");
+}
+function renderArchiveLists(rows){
+  const el=$("arLists");
+  const sections=GROUP_ORDER.map(g=>{
+    const items=rows.filter(r=>r.group===g && (AB_SCHEDULED.includes(r.status)||r.status==="Not yet due"));
+    if(!items.length) return "";
+    const notDue=items.filter(r=>r.status==="Not yet due").length;
+    const col=(title,color,list)=>`<div class="lst-col" style="background:${color}1f"><div class="lst-head" style="color:${color}">${title} · ${list.length}</div>`+
+      (list.length ? list.map(r=>`<div class="lst-item"><span>${escapeHtml(r.name||r.employee_id||"")}</span><small>${escapeHtml(r.team_leader||"—")} · first login ${escapeHtml(r.first_login||"—")}${r.diff_minutes==null?"":" · "+(r.diff_minutes>0?"+":"")+r.diff_minutes+" min"}</small></div>`).join("") : '<div class="muted" style="font-size:12px">None</div>')+'</div>';
+    return `<div class="lst-group" style="border-left:6px solid ${GROUP_COLOR[g]};background:#fff">
+      <div class="lst-title" style="color:${GROUP_COLOR[g]}">${escapeHtml(g)}${notDue?' <span class="muted" style="font-size:12px;font-weight:600">· '+notDue+' not yet due</span>':''}</div>
+      <div class="lst-cols">
+        ${col("Absent",STATUS_COLOR.absent,items.filter(r=>r.status==="Absent - no login"))}
+        ${col("Tardy",STATUS_COLOR.tardy,items.filter(r=>r.status==="Tardy"))}
+        ${col("In / early",STATUS_COLOR.present,items.filter(r=>r.status==="Present - on time"||r.status==="Early - outside window"))}
+      </div></div>`;
+  }).join("");
+  el.innerHTML = sections || '<div class="muted">No scheduled agents match these filters.</div>';
+}
+function renderAttendanceArchive(){
+  const br=$("arBranch").value, ses=$("arSession").value, tl=$("arTl").value, st=$("arStatus").value, gr=$("arGroup")?.value||"";
+  const scope=arRows.filter(r=>(br==="ALL"||r.lob===br)&&(ses==="ALL"||r.run===ses));
+  renderArchiveGroupSummary(scope, ses);
+  arFiltered=scope.filter(r=>(!tl||r.team_leader===tl)&&(!st||r.status===st)&&(!gr||r.group===gr));
+  if(ses==="ALL"){ $("arLists").style.display="none"; $("arTableWrap").style.display=""; }
+  else { renderArchiveLists(arFiltered); $("arLists").style.display=""; $("arTableWrap").style.display="none"; }
+  $("arBody").innerHTML = arFiltered.length ? arFiltered.map(r=>{
+    const d=r.diff_minutes==null?"—":(r.diff_minutes>0?"+":"")+r.diff_minutes+" min";
+    return `<tr><td>${escapeHtml(r.run)} v${r.version}</td><td>${escapeHtml(lbBranchName(r.lob))}</td><td>${escapeHtml(r.group)}</td><td>${escapeHtml(r.name||r.employee_id||"")}</td><td>${escapeHtml(r.team_leader||"—")}</td><td>${escapeHtml(r.status||"")}</td><td>${escapeHtml(r.scheduled_shift||"—")}</td><td>${escapeHtml(r.first_login||"—")}</td><td>${d}</td></tr>`;
+  }).join("") : '<tr><td colspan="9" class="muted">No rows match these filters.</td></tr>';
+  $("arExportBtn").disabled=!arFiltered.length;
+}
+function exportAttendanceArchiveCsv(){
+  const date=($("arDate")?.value||"").slice(0,10);
+  const head=["Date","Run","Version","Branch","Group","Employee ID","Name","Team Leader","Status","Scheduled shift","First login","vs start (min)"];
+  const esc=v=>'"'+String(v??"").replace(/"/g,'""')+'"';
+  const lines=[head.join(",")].concat(arFiltered.map(r=>[date,r.run,r.version,lbBranchName(r.lob),r.group,r.employee_id,r.name,r.team_leader,r.status,r.scheduled_shift,r.first_login,r.diff_minutes].map(esc).join(",")));
+  const blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="attendance_archive_"+date+".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+if($("arLoadBtn")) $("arLoadBtn").onclick=()=>loadAttendanceArchive();
+if($("arExportBtn")) $("arExportBtn").onclick=()=>exportAttendanceArchiveCsv();
+if($("arAllVersions")) $("arAllVersions").onchange=()=>loadAttendanceArchive();
+["arBranch","arSession","arTl","arStatus","arGroup"].forEach(id=>{ if($(id)) $(id).onchange=()=>renderAttendanceArchive(); });
+if($("arDate")){ $("arDate").onchange=()=>loadAttendanceArchive(); if(!$("arDate").value && $("liDate")?.value) $("arDate").value=$("liDate").value; }
+const AB_SCHEDULED=["Present - on time","Tardy","Early - outside window","Absent - no login"];
+const AB_PRESENT=["Present - on time","Tardy","Early - outside window"];
+let abAgentRows=[];
+function downloadCsv(filename, head, rows){
+  const esc=v=>'"'+String(v??"").replace(/"/g,'""')+'"';
+  const lines=[head.map(esc).join(",")].concat(rows.map(r=>r.map(esc).join(",")));
+  const blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function pctOf(a,b){ return b ? ((a/b)*100).toFixed(1)+"%" : "—"; }
+async function loadAbsenteeismReport(){
+  const from=($("abFrom")?.value||"").slice(0,10), to=($("abTo")?.value||"").slice(0,10);
+  const out=$("abSummary");
+  if(!from||!to||from>to){ out.innerHTML='<div class="banner warn">Pick a valid From and To date.</div>'; return; }
+  out.innerHTML='<div class="banner info">Building report…</div>';
+  $("abTlWrap").innerHTML=""; $("abTopWrap").innerHTML=""; $("abGroupWrap").innerHTML=""; $("abMissing").innerHTML="";
+  try{
+    const {data:snaps,error}=await sb.from("attendance_snapshots")
+      .select("id,snapshot_date,lob,session,created_at").eq("is_latest",true)
+      .gte("snapshot_date",from).lte("snapshot_date",to);
+    if(error) throw error;
+    const basis=new Map();
+    (snaps||[]).forEach(x=>{
+      const k=x.snapshot_date+"|"+x.lob, cur=basis.get(k);
+      if(!cur) { basis.set(k,x); return; }
+      const xEos=x.session==="EOS", cEos=cur.session==="EOS";
+      if((xEos && !cEos) || (xEos===cEos && String(x.created_at)>String(cur.created_at))) basis.set(k,x);
+    });
+    const chosen=[...basis.values()];
+    const provisional=chosen.filter(x=>x.session!=="EOS").map(x=>x.snapshot_date+" "+lbBranchName(x.lob)+" ("+x.session+")").sort();
+    const recs=chosen.length ? await fetchAllArchiveRecords(chosen.map(x=>x.id)) : [];
+
+    const agents=new Map();
+    recs.forEach(r=>{
+      if(!AB_SCHEDULED.includes(r.status)) return;
+      const key=r.lob+"|"+(r.employee_id||r.name);
+      if(!agents.has(key)) agents.set(key,{lob:r.lob,employee_id:r.employee_id||"",name:r.name||r.employee_id||"",team_leader:r.team_leader||"—",scheduled:0,present:0,tardy:0,absent:0});
+      const a=agents.get(key);
+      a.group=archiveGroupOf(r.group_text);
+      a.scheduled++;
+      if(AB_PRESENT.includes(r.status)) a.present++;
+      if(r.status==="Tardy") a.tardy++;
+      if(r.status==="Absent - no login") a.absent++;
+    });
+    abAgentRows=[...agents.values()];
+    const grp=new Map();
+    recs.forEach(r=>{
+      if(!AB_SCHEDULED.includes(r.status)) return;
+      const g=archiveGroupOf(r.group_text), k=r.lob+"|"+g;
+      if(!grp.has(k)) grp.set(k,{lob:r.lob,group:g,scheduled:0,present:0,tardy:0,absent:0});
+      const x=grp.get(k);
+      x.scheduled++;
+      if(AB_PRESENT.includes(r.status)) x.present++;
+      if(r.status==="Tardy") x.tardy++;
+      if(r.status==="Absent - no login") x.absent++;
+    });
+    const grpRows=[...grp.values()].sort((x,y)=>x.lob.localeCompare(y.lob)||GROUP_ORDER.indexOf(x.group)-GROUP_ORDER.indexOf(y.group));
+    const aggG=new Map(GROUP_ORDER.map(g=>[g,{scheduled:0,present:0,tardy:0,absent:0}]));
+    grpRows.forEach(x=>{const t=aggG.get(x.group); t.scheduled+=x.scheduled; t.present+=x.present; t.tardy+=x.tardy; t.absent+=x.absent;});
+    $("abGroupWrap").innerHTML = grpRows.length ? '<div class="sm-note"><strong>By group</strong> (across the branches you can see)</div>'+groupCardsHtml(aggG,"agent-days") : "";
+
+    const tlMap=new Map();
+    abAgentRows.forEach(a=>{
+      const k=a.lob+"|"+a.team_leader;
+      if(!tlMap.has(k)) tlMap.set(k,{lob:a.lob,team_leader:a.team_leader,scheduled:0,present:0,tardy:0,absent:0});
+      const t=tlMap.get(k); t.scheduled+=a.scheduled; t.present+=a.present; t.tardy+=a.tardy; t.absent+=a.absent;
+    });
+    const rateOf=t=>t.scheduled?t.absent/t.scheduled:0;
+    const tlRows=[...tlMap.values()].sort((x,y)=>rateOf(y)-rateOf(x));
+
+    const tot=abAgentRows.reduce((t,a)=>({scheduled:t.scheduled+a.scheduled,present:t.present+a.present,tardy:t.tardy+a.tardy,absent:t.absent+a.absent}),{scheduled:0,present:0,tardy:0,absent:0});
+    out.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px">'+
+      [["Scheduled to work",tot.scheduled],["Present",tot.present],["Tardy",tot.tardy],["Absent",tot.absent],["Absence rate",pctOf(tot.absent,tot.scheduled)]]
+      .map(([l,v])=>`<div style="border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:#fff"><div style="font-size:20px;font-weight:800">${escapeHtml(v)}</div><div class="muted" style="font-size:11px">${escapeHtml(l)}</div></div>`).join("")+'</div>';
+
+    $("abTlWrap").innerHTML = tlRows.length ? '<div class="tablewrap"><table><thead><tr><th>Branch</th><th>Team Leader</th><th>Scheduled</th><th>Present</th><th>Tardy</th><th>Absent</th><th>Absence rate</th></tr></thead><tbody>'+
+      tlRows.map(t=>`<tr><td>${escapeHtml(lbBranchName(t.lob))}</td><td>${escapeHtml(t.team_leader)}</td><td>${t.scheduled}</td><td>${t.present}</td><td>${t.tardy}</td><td>${t.absent}</td><td>${pctOf(t.absent,t.scheduled)}</td></tr>`).join("")+'</tbody></table></div>' : '<div class="muted">No EOS records in this range.</div>';
+
+    const top=[...abAgentRows].filter(a=>a.absent>0).sort((x,y)=>y.absent-x.absent || (y.absent/y.scheduled)-(x.absent/x.scheduled)).slice(0,15);
+    $("abTopWrap").innerHTML = top.length ? '<div class="sm-note"><strong>Most absent days</strong></div><div class="tablewrap" style="margin-top:6px"><table><thead><tr><th>Branch</th><th>Agent</th><th>Team Leader</th><th>Absent days</th><th>Scheduled days</th><th>Absence rate</th></tr></thead><tbody>'+
+      top.map(a=>`<tr><td>${escapeHtml(lbBranchName(a.lob))}</td><td>${escapeHtml(a.name)}</td><td>${escapeHtml(a.team_leader)}</td><td>${a.absent}</td><td>${a.scheduled}</td><td>${pctOf(a.absent,a.scheduled)}</td></tr>`).join("")+'</tbody></table></div>' : "";
+
+    $("abMissing").innerHTML = provisional.length ? '<div class="banner warn"><strong>Provisional (no EOS run yet):</strong> '+escapeHtml(provisional.join(" · "))+'. These figures include the latest run for those days and will change once the EOS run is saved.</div>' : '';
+    out.insertAdjacentHTML("afterbegin", '');
+    $("abExportBtn").disabled=!abAgentRows.length;
+  }catch(err){
+    console.error("Absenteeism report failed:",err);
+    out.innerHTML='<div class="banner err">Report could not load: '+escapeHtml(err.message||String(err))+'</div>';
+    abAgentRows=[]; $("abExportBtn").disabled=true;
+  }
+}
+function exportAbsenteeismCsv(){
+  const from=($("abFrom")?.value||"").slice(0,10), to=($("abTo")?.value||"").slice(0,10);
+  const head=["From","To","Branch","Group","Team Leader","Employee ID","Name","Scheduled to work","Present","Tardy","Absent","Absence rate"];
+  const rows=abAgentRows.map(a=>[from,to,lbBranchName(a.lob),a.group,a.team_leader,a.employee_id,a.name,a.scheduled,a.present,a.tardy,a.absent,pctOf(a.absent,a.scheduled)]);
+  downloadCsv("absenteeism_"+from+"_to_"+to+".csv",head,rows);
+}
+async function purgeAttendanceArchive(){
+  const msg=$("arPurgeMsg");
+  msg.innerHTML='<div class="banner info">Checking archive…</div>';
+  try{
+    const {data,error}=await sb.rpc("attendance_archive_retention_preview");
+    if(error) throw error;
+    const p=Array.isArray(data)?data[0]:data;
+    if(!p || !Number(p.snapshot_count)){ msg.innerHTML='<div class="banner ok">Nothing older than 90 days to clear.</div>'; return; }
+    const cutoff=String(p.cutoff_date).slice(0,10);
+    const {data:old,error:e1}=await sb.from("attendance_snapshots")
+      .select("id,snapshot_date,session,lob,version").lt("snapshot_date",cutoff).order("snapshot_date",{ascending:true});
+    if(e1) throw e1;
+    const info=new Map((old||[]).map(x=>[x.id,x]));
+    const recs=await fetchAllArchiveRecords((old||[]).map(x=>x.id));
+    downloadCsv("attendance_archive_before_"+cutoff+".csv",
+      ["Date","Run","Version","Branch","Employee ID","Name","Team Leader","Status","Scheduled shift","First login","vs start (min)"],
+      recs.map(r=>{const h=info.get(r.snapshot_id)||{}; return [h.snapshot_date,h.session,h.version,lbBranchName(r.lob),r.employee_id,r.name,r.team_leader,r.status,r.scheduled_shift,r.first_login,r.diff_minutes];}));
+    if(!confirm("The export has been downloaded. Clear "+p.snapshot_count+" archived run(s) dated before "+cutoff+"? This cannot be undone.")){
+      msg.innerHTML='<div class="banner warn">Clear cancelled. Nothing was deleted.</div>'; return;
+    }
+    const {data:n,error:e2}=await sb.rpc("purge_attendance_archive");
+    if(e2) throw e2;
+    msg.innerHTML='<div class="banner ok">Cleared '+escapeHtml(String(n))+' archived run(s) dated before '+escapeHtml(cutoff)+'.</div>';
+  }catch(err){
+    console.error("Archive clear failed:",err);
+    msg.innerHTML='<div class="banner err">Clear failed: '+escapeHtml(err.message||String(err))+'</div>';
+  }
+}
+if($("archiveNav")) $("archiveNav").onclick=()=>{ configureArchiveScope(); showView("attendanceArchive"); };
+if($("tlArchiveBtn")) $("tlArchiveBtn").onclick=()=>showView("attendanceArchive");
+if($("scheduleChangesNav")) $("scheduleChangesNav").onclick=()=>showView("scheduleChanges");
+if($("openScheduleChanges")) $("openScheduleChanges").onclick=()=>showView("scheduleChanges");
+if($("chgType")) $("chgType").onchange=chgSetSwapFields;
+if($("chgAInput")){ $("chgAInput").oninput=()=>chgResolve("A"); $("chgAInput").onchange=()=>chgResolve("A"); }
+if($("chgBInput")){ $("chgBInput").oninput=()=>chgResolve("B"); $("chgBInput").onchange=()=>chgResolve("B"); }
+if($("chgPreviewBtn")) $("chgPreviewBtn").onclick=()=>chgPreview();
+if($("chgApplyBtn")) $("chgApplyBtn").onclick=()=>chgApply();
+if($("chgLoadBtn")) $("chgLoadBtn").onclick=()=>loadChangeLog();
+if($("chgADate") && !$("chgADate").value){
+  const today=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);
+  $("chgADate").value=today; $("chgBDate").value=today;
+  $("chgTo").value=today; $("chgFrom").value=new Date(Date.now()+8*3600*1000-6*86400*1000).toISOString().slice(0,10);
+}
+document.querySelectorAll(".aa-tab").forEach(btn=>btn.onclick=()=>{
+  const day=btn.dataset.aaTab==="day";
+  document.querySelectorAll(".aa-tab").forEach(b=>b.classList.toggle("active",b===btn));
+  $("aaDayTab").style.display=day?"":"none";
+  $("aaReportTab").style.display=day?"none":"";
+});
+function setAbPreset(kind){
+  const to=($("abTo")?.value||"").slice(0,10) || new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);
+  let from=to;
+  if(kind==="week"){ const d=new Date(to+"T00:00:00Z"); d.setUTCDate(d.getUTCDate()-6); from=d.toISOString().slice(0,10); }
+  if(kind==="month"){ from=to.slice(0,8)+"01"; }
+  $("abFrom").value=from; $("abTo").value=to;
+  loadAbsenteeismReport();
+}
+document.querySelectorAll("[data-ab-preset]").forEach(b=>b.onclick=()=>setAbPreset(b.dataset.abPreset));
+if($("abLoadBtn")) $("abLoadBtn").onclick=()=>loadAbsenteeismReport();
+if($("abExportBtn")) $("abExportBtn").onclick=()=>exportAbsenteeismCsv();
+if($("arPurgeBtn")) $("arPurgeBtn").onclick=()=>purgeAttendanceArchive();
+if($("abTo") && !$("abTo").value){
+  const today=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);
+  $("abTo").value=today;
+  const f=new Date(Date.now()+8*3600*1000-6*86400*1000).toISOString().slice(0,10);
+  $("abFrom").value=f;
+}
+{
+  const role=String(currentProfile?.role||"").toLowerCase();
+  if($("arPurgeBtn") && (role==="wfm"||role==="admin")) $("arPurgeBtn").style.display="";
+}
+if($("liRunBtn")) $("liRunBtn").onclick=()=>runLoginBrief();
+if($("liExportBtn")) $("liExportBtn").onclick=()=>exportLoginBriefCsv();
+if($("liDate") && !$("liDate").value) $("liDate").value=(typeof phtDate==="function"?phtDate():"");
+</script>
+<script>(()=>{const root=document.getElementById('verintScheduleWorkspace');if(!root||root.dataset.initialized)return;root.dataset.initialized='1';
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let rows=[],weekStart='',weekDates=[];const lobKeys=['CCAC','CMIP','CDI'];
+function dayKey(d){return d.toISOString().slice(0,10)}function localDate(){const x=typeof phtDate==='function'?phtDate():new Date().toISOString().slice(0,10);return x}
+function mondayOf(iso){const d=new Date(iso+'T12:00:00');d.setDate(d.getDate()-((d.getDay()+6)%7));return dayKey(d)}
+function timeMin(v){if(v==null)return null;let s=String(v).trim(),m=s.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);if(!m)return null;let h=+m[1],n=+m[2];if(m[3]){if(m[3].toUpperCase()==='PM'&&h<12)h+=12;if(m[3].toUpperCase()==='AM'&&h===12)h=0}return h*60+n}
+function fmt(v){let n=timeMin(v);if(n==null)return v?String(v):'—';let h=Math.floor(n/60),m=n%60;return ((h+11)%12+1)+':'+String(m).padStart(2,'0')+(h>=12?' PM':' AM')}
+function branchOf(r,lob){let g=String(r.group_name||'').toUpperCase(),sub=String(r.subgroup||'').toUpperCase(),name=(g+' '+sub).trim();if(lob==='CMIP')return 'CMIP';if(lob==='CDI')return 'CDI';if(/\bCET\b/.test(name))return 'CET';if(/\bCAT\b/.test(name))return 'CAT';if(/DIGITAL|\bDIG\b/.test(name))return 'CIT Digital';if(/VOICE|\bVOC\b/.test(name))return 'CIT Voice';if(/CIT/.test(name))return 'CIT Voice';return 'UNMAPPED'}
+function kind(a){let x=String(a||'').toUpperCase();if(/BREAK/.test(x))return 'BREAK';if(/LUNCH/.test(x))return 'LUNCH';if(/BOP|TRAIN|MEETING|COACH|OFFLINE|PULL|SYSTEM|OTHER/.test(x))return 'OTHER';return 'WORK'}
+function setNote(msg){root.querySelector('.vsw-preview').textContent=msg;root.querySelector('.vsw-preview').classList.toggle('vsw-live',msg==='LIVE · PUBLISHED DATA')}
+async function load(){setNote('LOADING PUBLISHED SCHEDULE…');for(const id of ['vswActivityBody'])$(id).innerHTML='<tr><td colspan="7" class="vsw-empty">Loading published agent schedules…</td></tr>';try{if(typeof sb==='undefined'||!sb)throw Error('WorkSync database session is unavailable. Sign in and retry.');const today=localDate();weekStart=mondayOf(today);weekDates=Array.from({length:7},(_,i)=>{const d=new Date(weekStart+'T12:00:00');d.setDate(d.getDate()+i);return dayKey(d)});const versions=[];for(const lob of lobKeys){const {data,error}=await sb.from('schedule_versions').select('id,lob,week_start,week_end,version_number,source_file_name').eq('status','published').eq('lob',lob).lte('week_start',weekDates[6]).gte('week_end',weekDates[0]).order('version_number',{ascending:false}).limit(10);if(error)throw error;(data||[]).forEach(v=>versions.push(v))}const byLob=new Map();versions.forEach(v=>{let a=byLob.get(v.lob)||[];a.push(v);byLob.set(v.lob,a)});const chosen=[];for(const lob of lobKeys){const candidates=(byLob.get(lob)||[]).sort((a,b)=>String(b.week_start).localeCompare(String(a.week_start))||Number(b.version_number)-Number(a.version_number));const v=candidates.find(x=>x.week_start<=weekDates[6]&&x.week_end>=weekDates[0]);if(v)chosen.push(v)}if(!chosen.length)throw Error('No published schedules cover '+weekDates[0]+' to '+weekDates[6]+' for CCAC, CMIP, or CDI.');const ids=chosen.map(v=>v.id),vById=new Map(chosen.map(v=>[v.id,v]));const {data:schedules,error:se}=await sb.from('schedules').select('id,schedule_version_id,employee_id,schedule_date,schedule_status,shift_start,shift_end').in('schedule_version_id',ids).gte('schedule_date',weekDates[0]).lte('schedule_date',weekDates[6]);if(se)throw se;const eids=[...new Set((schedules||[]).map(x=>x.employee_id).filter(Boolean))];let roster=[];if(eids.length){const {data,error}=await sb.from('roster').select('employee_id,name,group_name,subgroup,lob,active,site').in('employee_id',eids);if(error)throw error;roster=data||[]}const rmap=new Map(roster.map(r=>[String(r.employee_id).toUpperCase(),r]));const schedIds=(schedules||[]).map(x=>x.id).filter(Boolean);let acts=[];if(schedIds.length){const {data,error}=await sb.from('schedule_activities').select('schedule_id,activity_type,start_time,end_time').in('schedule_id',schedIds).order('start_time');if(error)throw error;acts=data||[]}const amap=new Map();acts.forEach(a=>{let ar=amap.get(a.schedule_id)||[];ar.push(a);amap.set(a.schedule_id,ar)});rows=(schedules||[]).map(s=>{const r=rmap.get(String(s.employee_id||'').toUpperCase())||{},lob=vById.get(s.schedule_version_id)?.lob||r.lob||'';const branch=branchOf(r,lob);const base={id:s.employee_id,name:r.name||s.employee_id,branch,lob,date:s.schedule_date,status:String(s.schedule_status||'').toUpperCase(),start:s.shift_start,end:s.shift_end,activities:amap.get(s.id)||[],group:r.group_name||'',subgroup:r.subgroup||'',site:r.site||'',active:r.active};return base}).filter(x=>x.id);setNote('LIVE · PUBLISHED DATA');const old=root.querySelector('.vsw-note');if(old)old.textContent='Live data source: published schedule snapshots + schedule activities + roster. Unknown branch/channel mappings remain UNMAPPED; no inferred reassignment.';renderAll();}catch(e){rows=[];setNote('DATA UNAVAILABLE');$('vswActivityBody').innerHTML='<tr><td colspan="7" class="vsw-empty">'+esc(e.message||e)+' No sample agents are shown as live data.</td></tr>';$('vswWeekMatrix').innerHTML='<div class="vsw-empty">Published schedule data unavailable.</div>';$('vswTimelineGrid').innerHTML='<div class="vsw-empty">Published schedule data unavailable.</div>';console.error('Command Center schedule load failed',e)}}
+function selectedBranch(id){return $(id).value}function scoped(b){return rows.filter(x=>b==='ALL'||x.branch===b)}function actsFor(r){const out=[];if(r.start&&r.end&&r.status==='WORKING')out.push({start:r.start,end:r.end,activity:'WORK'});else if(r.status&&r.status!=='WORKING')out.push({start:'',end:'',activity:r.status});(r.activities||[]).forEach(a=>out.push({start:a.start_time,end:a.end_time,activity:kind(a.activity_type),label:a.activity_type}));return out}
+function activity(){const b=selectedBranch('vswBranch'),f=$('vswActivityFilter').value,filtered=scoped(b).flatMap(r=>actsFor(r).map(a=>({...r,...a}))).filter(x=>f==='ALL'||x.activity===f);$('vswActivityBody').innerHTML=filtered.length?filtered.map(x=>'<tr><td>'+esc(x.id)+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.branch==='UNMAPPED'?'UNMAPPED · '+x.lob:x.branch)+'</td><td>'+esc(x.date)+'</td><td>'+esc(fmt(x.start))+'</td><td>'+esc(fmt(x.end))+'</td><td><span class="vsw-chip '+(x.activity==='WORK'?'work':x.activity==='BREAK'?'break':x.activity==='LUNCH'?'lunch':'other')+'">'+esc(x.label||x.activity)+'</span></td></tr>').join(''):'<tr><td colspan="7" class="vsw-empty">No published activities match this filter for the selected week.</td></tr>'}
+function matrix(){const b=selectedBranch('vswWeekBranch'),people=[...new Map(scoped(b).map(r=>[r.id,r])).values()],g=$('vswWeekMatrix');g.style.gridTemplateColumns='minmax(170px,1.4fr) repeat(7,minmax(105px,1fr))';g.innerHTML='<div class="mh">Agent / Branch</div>'+weekDates.map(d=>'<div class="mh">'+esc(new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}))+'</div>').join('')+people.map(p=>'<div class="person">'+esc(p.name)+'<br><span>'+esc(p.id)+' · '+esc(p.branch)+'</span></div>'+weekDates.map(d=>{const r=rows.find(x=>x.id===p.id&&x.date===d);return '<div><div class="day" style="background:'+(r?(r.status==='WORKING'?'#dff4e8':r.status==='OFF'?'#e9edf1':'#e4efff'):'#f4f6f8')+'">'+esc(r?(r.status==='WORKING'?fmt(r.start)+'–'+fmt(r.end):r.status):'NO ROW')+'</div></div>'}).join('')).join('')||'<div class="vsw-empty">No published schedule rows in this scope.</div>'}
+function timeline(){const b=selectedBranch('vswTimelineBranch'),people=[...new Map(scoped(b).filter(x=>x.date===localDate()).map(r=>[r.id,r])).values()],hours=Array.from({length:24},(_,i)=>i),g=$('vswTimelineGrid');g.style.gridTemplateColumns='minmax(150px,1.4fr) repeat(24,minmax(30px,1fr))';g.innerHTML='<div class="th">Agent</div>'+hours.map(h=>'<div class="th">'+String(h).padStart(2,'0')+'</div>').join('')+people.map(p=>'<div class="name">'+esc(p.name)+'<br>'+esc(p.branch)+' · '+esc(p.id)+'</div>'+hours.map(h=>{const m=h*60,shift=timeMin(p.start),end=timeMin(p.end),act=(p.activities||[]).find(a=>{const a0=timeMin(a.start_time),a1=timeMin(a.end_time);return a0!=null&&a1!=null&&m<a1&&m+60>a0});let cls='';if(p.status==='WORKING'&&shift!=null&&end!=null&&m<end&&m+60>shift)cls='work';if(act){const k=kind(act.activity_type);cls=k.toLowerCase()}return '<div><div class="block '+cls+'" title="'+esc(act?.activity_type||p.status||'Not scheduled')+'"></div></div>'}).join('')).join('')||'<div class="vsw-empty">No published schedule rows for today. Use the multi-day matrix to inspect the published week.</div>'}
+function renderAll(){activity();matrix();timeline()}root.querySelectorAll('[data-vsw-tab]').forEach(btn=>btn.addEventListener('click',()=>{root.querySelectorAll('[data-vsw-tab]').forEach(x=>{x.classList.toggle('active',x===btn);x.setAttribute('aria-selected',String(x===btn));});root.querySelectorAll('[data-vsw-view]').forEach(v=>v.classList.toggle('active',v.dataset.vswView===btn.dataset.vswTab));}));['vswBranch','vswActivityFilter'].forEach(id=>$(id).addEventListener('change',activity));$('vswWeekBranch').addEventListener('change',matrix);$('vswTimelineBranch').addEventListener('change',timeline);const nav=$('verintWorkspaceNav');if(nav)nav.addEventListener('click',()=>load());load();})();</script>
