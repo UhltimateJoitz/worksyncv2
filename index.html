@@ -32,7 +32,7 @@
 
 <section id="loginView" class="login">
   <div class="hero">
-    <img class="login-logo" src="assets/hinduja-global-solutions-logo.png" alt="HGS">
+    <img class="login-logo" src="assets/HGS-Logo-1.png" alt="HGS">
     <div class="eyebrow">HGS Workforce Operations</div>
     <h1>HGS WorkSync</h1>
     <p>Your schedule. Your day. In sync.</p>
@@ -56,12 +56,6 @@
     </div>
     <button class="primary" id="loginBtn">Sign In</button>
     <div class="msg" id="loginMsg"></div>
-    <div id="loginStatus" class="hidden" style="display:none!important">
-      <div id="statusWelcome"></div>
-      <div id="statusUsername"></div>
-      <div id="statusRole"></div>
-      <div id="statusEmployee"></div>
-    </div>
     <div id="loginStatus" class="hidden" style="display:none!important">
       <div id="statusWelcome"></div>
       <div id="statusUsername"></div>
@@ -904,7 +898,112 @@ const drop=$(&#x27;drop&#x27;);[&#x27;dragenter&#x27;,&#x27;dragover&#x27;].forE
       <div class="heading"><div><h1>My Schedule</h1><p>Your full published schedule for the current Workforce week.</p></div><div class="pill" id="agentScheduleWeekPill">CCAC · MY SCHEDULE</div></div>
       <div id="agentScheduleDetail" class="agent-card"><div class="agent-empty"><strong>Schedule-driven</strong>Your detailed weekly schedule will appear here once Workforce publishes one.</div></div>
     </section>
-    
+    <section id="wfmCommandCenterView" class="view">
+      <div class="wfm-cc-wrap">
+        <div class="wfm-cc-head">
+          <div>
+            <h1>WFM Intraday Command Center</h1>
+            <p>Live scheduled activity view based on the current published workforce week.</p>
+          </div>
+          <div class="wfm-cc-actions">
+            <span class="wfm-source-badge" id="wfmVersionBadge">Published schedule · loading…</span>
+            <span class="wfm-source-badge" id="wfmLastRefresh">Last refreshed —</span>
+          </div>
+        </div>
+        <div class="wfm-branchbar" id="wfmBranchBar">
+          <span class="wfm-branch-label">View</span>
+          <button class="wfm-branch-btn active" data-wfm-branch="ALL">ALL CCAC</button>
+          <button class="wfm-branch-btn" data-wfm-branch="CCAC">CCAC</button>
+          <button class="wfm-branch-btn" data-wfm-branch="CMIP">CMIP</button>
+          <button class="wfm-branch-btn" data-wfm-branch="CDI">CDI</button>
+        </div>
+        <div class="wfm-cmd-layout">
+          <section class="wfm-now-panel" aria-labelledby="wfmNowTitle">
+            <div class="wfm-now-head">
+              <div>
+                <div class="wfm-now-main-title">
+                  <span class="wfm-symbol green" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M6.5 13h3l2-5 3 8 2-4h1"/></svg></span>
+                  <h2 id="wfmNowTitle">NOW</h2>
+                  <span class="wfm-current-badge">Current</span>
+                </div>
+                <div class="wfm-now-detail">
+                  <div class="wfm-current-time" id="wfmCurrentInterval">—</div>
+                  <div class="wfm-now-sub" id="wfmCurrentSub">Current PHT interval · published schedule</div>
+                  <div class="wfm-filter-summary" id="wfmFilterSummary" style="display:none"></div>
+                </div>
+              </div>
+              <div class="wfm-published-meta"><span>Published schedule</span><strong id="wfmCurrentDate">—</strong></div>
+            </div>
+            <div class="wfm-live-kpis" aria-label="Current interval workforce distribution">
+              <section class="wfm-live-kpi calls"><div class="wfm-live-kpi-top"><span class="wfm-live-kpi-num" id="wfmCallsCount">—</span><span class="wfm-kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 13v-2a8 8 0 0 1 16 0v2"/><rect x="3" y="12" width="4" height="7" rx="2"/><rect x="17" y="12" width="4" height="7" rx="2"/><path d="M19 19c0 2-2 3-5 3h-2"/></svg></span></div><div class="wfm-live-kpi-label">Calls</div><div class="wfm-live-kpi-meta" id="wfmCallsMeta">—</div></section>
+              <section class="wfm-live-kpi breaks"><div class="wfm-live-kpi-top"><span class="wfm-live-kpi-num" id="wfmBreakCount">—</span><span class="wfm-kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 8h12v8a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z"/><path d="M17 10h2a3 3 0 0 1 0 6h-2"/><path d="M8 3c-1 1 1 2 0 3M12 3c-1 1 1 2 0 3M16 3c-1 1 1 2 0 3"/></svg></span></div><div class="wfm-live-kpi-label">Break</div><div class="wfm-live-kpi-meta" id="wfmBreakMeta">—</div></section>
+              <section class="wfm-live-kpi lunch"><div class="wfm-live-kpi-top"><span class="wfm-live-kpi-num" id="wfmLunchCount">—</span><span class="wfm-kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 3v7M7 3v7M10 3v7M7 10v11"/><path d="M17 3c-2 2-3 5-3 8h5M18 3v18"/></svg></span></div><div class="wfm-live-kpi-label">Lunch</div><div class="wfm-live-kpi-meta" id="wfmLunchMeta">—</div></section>
+              <section class="wfm-live-kpi other"><div class="wfm-live-kpi-top"><span class="wfm-live-kpi-num" id="wfmOtherCount">—</span><span class="wfm-kpi-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="15" height="16" rx="2"/><path d="M7 2v4M14 2v4M3 9h15"/><circle cx="17" cy="17" r="4"/><path d="M17 15v2l1.5 1"/></svg></span></div><div class="wfm-live-kpi-label">Other</div><div class="wfm-live-kpi-meta" id="wfmOtherMeta">—</div></section>
+            </div>
+            <div class="wfm-agent-section">
+              <div class="wfm-agent-head">
+                <div><h3>Agent activity</h3><span id="wfmStatusHeader" class="wfm-agent-subtitle">Current interval roster</span></div>
+                <span class="wfm-agent-scheduled"><strong id="wfmCurrentScheduled">—</strong> scheduled · <span id="wfmAgentResultsCount">— shown</span></span>
+              </div>
+              <label class="wfm-agent-search" for="wfmAgentSearch">
+                <span class="wfm-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg></span>
+                <input type="search" id="wfmAgentSearch" autocomplete="off" placeholder="Search agent, ID, or LOB…" aria-label="Search agents by name, employee ID, or LOB">
+              </label>
+              <div class="wfm-agent-filters" id="wfmAgentFilters" aria-label="Filter agent activity">
+                <button type="button" class="wfm-agent-filter active" data-wfm-agent-filter="ALL">All · <b id="wfmCountAll">—</b></button>
+                <button type="button" class="wfm-agent-filter" data-wfm-agent-filter="CALL">Calls · <b id="wfmCountCall">—</b></button>
+                <button type="button" class="wfm-agent-filter" data-wfm-agent-filter="BREAK">Break · <b id="wfmCountBreak">—</b></button>
+                <button type="button" class="wfm-agent-filter" data-wfm-agent-filter="LUNCH">Lunch · <b id="wfmCountLunch">—</b></button>
+                <button type="button" class="wfm-agent-filter" data-wfm-agent-filter="OTHER">Other · <b id="wfmCountOther">—</b></button>
+              </div>
+              <div class="wfm-agent-focus" id="wfmAgentFocus" hidden><span id="wfmAgentFocusText">Showing agents in the selected upcoming activity.</span><button type="button" data-wfm-clear-upcoming>Clear selection</button></div>
+              <div class="wfm-agent-table-wrap">
+                <table class="wfm-agent-table" aria-label="Current interval agent activity">
+                  <thead><tr><th>AGENT</th><th>LOB</th><th>STATUS</th></tr></thead>
+                  <tbody id="wfmAgentTableBody"><tr><td colspan="3" class="wfm-agent-empty">Loading published schedule…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+          <aside class="wfm-upnext-panel" aria-labelledby="wfmUpNextTitle">
+            <div class="wfm-upnext-title">
+              <span class="wfm-symbol blue" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="15" height="16" rx="2"/><path d="M7 2v4M14 2v4M3 9h15"/><circle cx="17" cy="17" r="4"/><path d="M17 15v2l1.5 1"/></svg></span>
+              <h2 id="wfmUpNextTitle">UP NEXT</h2>
+            </div>
+            <div class="wfm-upnext-interval">
+              <div class="interval-time" id="wfmNextInterval">—</div>
+              <div class="interval-sub">Next scheduled interval</div>
+            </div>
+            <div class="wfm-distribution-card">
+              <div class="wfm-distribution-eyebrow">WORKFORCE DISTRIBUTION</div>
+              <div class="wfm-distribution-total" id="wfmNextScheduled">—</div>
+              <div class="wfm-distribution-caption">Scheduled agents</div>
+              <div class="wfm-dist-bar" id="wfmNextDistBar" aria-label="Next interval workforce distribution"></div>
+              <div class="wfm-distribution-meta" id="wfmNextMeta">—</div>
+            </div>
+            <div class="wfm-upcoming-area">
+              <div class="wfm-upcoming-head"><h3 id="wfmNextBreaks">Upcoming activities</h3><p id="wfmNextBreaksMeta">Next scheduled transitions</p></div>
+              <div class="wfm-upcoming-list" id="wfmUpcomingList"><div class="wfm-upcoming-empty">Reading upcoming scheduled activities…</div></div>
+            </div>
+            <button type="button" class="wfm-view-schedule" id="wfmViewFullSchedule"><span><strong>View full schedule</strong><small>Explore upcoming agents and activity times</small></span><span class="arrow" aria-hidden="true">→</span></button>
+          </aside>
+        </div>
+        <section class="wfm-map-panel" id="wfmIntradayMapPanel" aria-labelledby="wfmIntradayMapTitle">
+          <div class="wfm-panel-head">
+            <div><h2 id="wfmIntradayMapTitle">Intraday Schedule</h2><span id="wfmIntervalHelp">30-minute scheduled interval view · scroll horizontally for the full day</span></div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><label for="wfmIntervalSize" style="font-size:11px;font-weight:800;color:#53677c">Interval</label><select id="wfmIntervalSize" aria-label="Intraday interval size" style="padding:8px 10px;border:1px solid #cbd8e6;border-radius:9px;background:#fff;color:#18304a;font-weight:800"><option value="30" selected>30 minutes</option><option value="15">15 minutes</option></select><span class="wfm-source-badge" id="wfmCoverageMeta">Loading…</span></div>
+          </div>
+          <div id="wfmExceptions" class="wfm-footer-note" style="margin:0 0 10px"></div>
+          <div class="wfm-timeline-wrap">
+            <table class="wfm-timeline" id="wfmTimelineTable">
+              <thead id="wfmTimelineHead"></thead>
+              <tbody id="wfmTimelineBody"></tbody>
+            </table>
+          </div>
+          <div class="wfm-footer-note">Green = scheduled to take calls · Amber = break · Orange = lunch · Blue = other scheduled activity · Gray = not scheduled / leave. The red marker indicates the current PHT time.</div>
+        </section>
+      </div>
+    </section>
     <section id="requestsHubView" class="view">
       <div class="heading">
         <div><h1>Requests</h1><p id="lrHubSubtitle">Choose an action to continue.</p></div>
