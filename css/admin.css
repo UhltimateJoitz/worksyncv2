@@ -2,7 +2,7 @@
    WORKSYNC ALPHA 10 · ADMIN SETTINGS & SANDBOX
    ========================================================================== */
 
-/* 1. Settings Layout */
+/* 1. Settings Hero Card (Top Banner) */
 .settings-hero-card{background:linear-gradient(135deg,#0d2238,#16375c);color:#fff;border-radius:18px;padding:22px 24px;margin-bottom:20px;border:1px solid #23466f;box-shadow:0 10px 30px rgba(10,28,48,.15);display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}
 .settings-hero-main{display:flex;align-items:center;gap:18px;flex:1;min-width:280px}
 .settings-hero-icon{width:56px;height:56px;border-radius:14px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);display:flex;align-items:center;justify-content:center;font-size:26px;flex-shrink:0}
@@ -11,16 +11,6 @@
 .settings-hero-main p{margin:0;font-size:12px;color:#cbd5e1;line-height:1.45}
 .settings-toggle-wrap{display:flex;flex-direction:column;gap:6px;align-items:flex-end}
 .settings-toggle-label{font-size:9px;letter-spacing:1px;text-transform:uppercase;color:#94a3b8;font-weight:900}
-.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.settings-card-body{padding:18px}
-.field-hint{display:block;font-size:10px;color:#64748b;margin-top:4px}
-.input-with-action{display:flex;gap:8px}
-.input-with-action input{flex:1}
-.settings-actions-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}
-.mini-btn{padding:8px 12px;font-size:11px}
-.status-text{font-size:11px}
-
-/* 2. Environment Switcher */
 .segmented-control{display:inline-flex;padding:4px;background:#061423;border:1px solid #29476b;border-radius:12px;gap:4px}
 .seg-btn{display:flex;align-items:center;gap:8px;padding:9px 15px;background:transparent;border:0;color:#94a3b8;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s ease}
 .seg-btn:hover{color:#fff;background:rgba(255,255,255,.05)}
@@ -31,23 +21,81 @@
 .seg-dot.purple{background:#c084fc;box-shadow:0 0 6px #c084fc}
 .settings-quick-note{font-size:10px;color:#94a3b8}
 
-/* 3. Role Simulator */
-.role-sim-buttons{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-top:10px}
-.role-btn{padding:10px 12px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:10px;font-size:11px;font-weight:700;color:#1e293b;cursor:pointer;transition:all .15s ease;text-align:center}
-.role-btn:hover{background:#f1f5f9;border-color:#94a3b8}
-.role-btn.active{background:#0b2742;color:#fff;border-color:#0b2742;box-shadow:0 3px 8px rgba(11,39,66,.2)}
+/* 2. Settings Grid & Cards */
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.access-card{background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 8px 28px rgba(24,48,80,.05);overflow:hidden}
+.access-card-head{padding:15px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.access-card-head h2{margin:0 0 4px;font-size:17px;color:#18304a}
+.access-card-head p{margin:0;color:#728399;font-size:10px}
+.access-pill{display:inline-block;padding:5px 8px;border-radius:999px;font-size:8px;font-weight:900;border:1px solid #d9e4ee;background:#f7fafc;color:#61748a}
+.access-pill.linked{background:#eaf8f1;color:#15734d;border-color:#cbe9d8}
+.access-pill.unlinked{background:#fff4e2;color:#946112;border-color:#f0dfbe}
+.settings-card-body{padding:18px}
 
-/* 4. Toggles & Diagnostics */
+/* 3. Force Clean Inputs (Overriding Login Styles) */
+#settingsView .field { margin-bottom: 16px !important; }
+#settingsView .field label { color: #5d6d82 !important; font-size: 11px !important; font-weight: 800 !important; text-transform: uppercase !important; margin-bottom: 6px !important; display: block !important; letter-spacing: .5px !important; }
+#settingsView input[type="text"], 
+#settingsView input[type="password"], 
+#settingsView select, 
+#settingsView textarea {
+    width: 100% !important;
+    padding: 10px 12px !important;
+    border: 1px solid #cbd8e6 !important;
+    border-radius: 8px !important;
+    background: #fff !important;
+    color: #142033 !important;
+    font-size: 13px !important;
+    font-family: inherit !important;
+    box-sizing: border-box !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.02) !important;
+    outline: none !important;
+}
+#settingsView input:focus, 
+#settingsView select:focus { border-color: #119bd7 !important; box-shadow: 0 0 0 3px rgba(17,155,215,.15) !important; }
+.input-with-action { display: flex !important; gap: 8px !important; }
+.input-with-action input { flex: 1 !important; }
+
+/* 4. Buttons */
+#settingsView button:not(.primary):not(.seg-btn):not(.role-btn) {
+    background: #fff !important;
+    border: 1px solid #cbd8e6 !important;
+    color: #27405d !important;
+    padding: 9px 14px !important;
+    border-radius: 8px !important;
+    font-weight: 800 !important;
+    font-size: 12px !important;
+    cursor: pointer !important;
+}
+#settingsView button:not(.primary):not(.seg-btn):not(.role-btn):hover { background: #f1f5f9 !important; }
+#settingsView .primary, #settingsView button.primary {
+    background: linear-gradient(135deg, #119bd7, #2377d8) !important;
+    color: #fff !important;
+    border: none !important;
+    padding: 10px 16px !important;
+    border-radius: 8px !important;
+    font-weight: 800 !important;
+    font-size: 13px !important;
+    cursor: pointer !important;
+}
+
+/* 5. Toggles & Diagnostics */
 .settings-toggle-list{display:flex;flex-direction:column;gap:12px}
-.toggle-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;gap:12px}
-.toggle-item strong{display:block;font-size:12px;color:#0f172a;margin-bottom:2px}
-.toggle-item p{margin:0;font-size:10px;color:#64748b}
+.toggle-item{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;gap:12px}
+.toggle-item strong{display:block;font-size:13px;color:#0f172a;margin-bottom:2px}
+.toggle-item p{margin:0;font-size:11px;color:#64748b}
 .diag-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-.diag-item{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 14px}
+.diag-item{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px}
 .diag-item span{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.8px;color:#64748b;font-weight:900}
 .diag-item strong{display:block;margin-top:4px;font-size:13px;color:#0f172a}
 
-/* 5. Global Sandbox Banner */
+/* 6. Role Simulator */
+.role-sim-buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.role-btn{padding:10px 14px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:10px;font-size:12px;font-weight:700;color:#1e293b;cursor:pointer;transition:all .15s ease}
+.role-btn:hover{background:#f1f5f9;border-color:#94a3b8}
+.role-btn.active{background:#0b2742;color:#fff;border-color:#0b2742}
+
+/* 7. Global Sandbox Banner */
 .global-sandbox-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 18px;background:linear-gradient(90deg,#2e1065,#4c1d95,#581c87);color:#f5f3ff;border-bottom:2px solid #a855f7;font-size:12px;z-index:999;box-shadow:0 4px 12px rgba(76,29,149,.25)}
 .global-sandbox-banner.hidden{display:none!important}
 .global-sandbox-banner-content{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -55,180 +103,9 @@
 .global-sandbox-banner-actions{display:flex;gap:8px;align-items:center}
 .banner-btn{padding:5px 11px;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid transparent;transition:all .15s ease}
 .banner-btn.primary{background:#faf5ff;color:#581c87;border-color:#e9d5ff}
-.banner-btn.primary:hover{background:#fff;color:#3b0764}
 .banner-btn.secondary{background:rgba(255,255,255,.15);color:#f5f3ff;border-color:rgba(255,255,255,.25)}
-.banner-btn.secondary:hover{background:rgba(255,255,255,.25)}
 
-/* 6. Mobile Responsiveness */
+/* 8. Mobile */
 @media(max-width:960px){
   .settings-grid{grid-template-columns:1fr}
 }
-
-
-/* 7. Settings Page Inputs & Cards Fix */
-.settings-card{background:#fff !important;color:var(--ink) !important;border:1px solid var(--line) !important;box-shadow:0 8px 30px rgba(24,48,80,.06) !important;padding:24px !important;border-radius:18px !important;}
-.settings-card h3{color:#10233a !important;}
-.settings-card p{color:#5d6d82 !important;}
-.settings-card .field label{color:#64748b !important;}
-
-/* ==========================================================================
-   SETTINGS PAGE SPECIFIC OVERRIDES
-   ========================================================================== */
-
-/* 1. Force white backgrounds on settings cards */
-#settingsView .access-card {
-    background: #fff !important;
-    border: 1px solid var(--line) !important;
-    box-shadow: 0 8px 28px rgba(24,48,80,.05) !important;
-    color: var(--ink) !important;
-}
-
-/* 2. Fix the inputs (override login styles) */
-#settingsView .field label {
-    color: #64748b !important;
-    font-size: 11px !important;
-    font-weight: 800 !important;
-    text-transform: uppercase !important;
-}
-#settingsView .field input,
-#settingsView .field select {
-    background: #fbfcfe !important;
-    color: #142033 !important;
-    border: 1px solid #cbd8e6 !important;
-    padding: 11px 12px !important;
-    font-size: 13px !important;
-    box-shadow: none !important;
-    border-radius: 10px !important;
-}
-#settingsView .field input:focus,
-#settingsView .field select:focus {
-    background: #fff !important;
-    border-color: #119bd7 !important;
-    box-shadow: 0 0 0 3px rgba(17,155,215,.15) !important;
-}
-#settingsView .field input::placeholder {
-    color: #94a3b8 !important;
-}
-
-/* 3. Fix the Feature Flags (Toggles) layout */
-#settingsView .settings-toggle-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-#settingsView .toggle-item {
-    display: flex !important;
-    justify-content: space-between;
-    align-items: center;
-    background: #f8fafc !important;
-    border: 1px solid #e2e8f0 !important;
-    border-radius: 10px !important;
-    padding: 14px 16px !important;
-}
-#settingsView .toggle-item strong {
-    display: block;
-    font-size: 13px;
-    color: #0f172a;
-    margin-bottom: 4px;
-}
-#settingsView .toggle-item p {
-    margin: 0;
-    font-size: 11px;
-    color: #64748b;
-}
-
-/* 4. Fix the Diagnostics layout */
-#settingsView .diag-grid {
-    display: grid !important;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) !important;
-    gap: 12px;
-}
-#settingsView .diag-item {
-    background: #f8fafc !important;
-    border: 1px solid #e2e8f0 !important;
-    border-radius: 10px !important;
-    padding: 12px 14px !important;
-}
-#settingsView .diag-item span {
-    display: block;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: .8px;
-    color: #64748b;
-    font-weight: 900;
-}
-#settingsView .diag-item strong {
-    display: block;
-    margin-top: 4px;
-    font-size: 13px;
-    color: #0f172a;
-}
-
-/* 5. Fix Role Simulator Buttons */
-#settingsView .role-sim-buttons {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-#settingsView .role-btn {
-    padding: 10px 14px;
-    background: #f8fafc;
-    border: 1px solid #cbd5e1;
-    border-radius: 10px;
-    font-size: 12px;
-    font-weight: 700;
-    color: #1e293b;
-    cursor: pointer;
-    transition: all .15s ease;
-}
-#settingsView .role-btn:hover {
-    background: #f1f5f9;
-    border-color: #94a3b8;
-}
-#settingsView .role-btn.active {
-    background: #0b2742;
-    color: #fff;
-    border-color: #0b2742;
-}
-
-/* 6. Fix Environment Switcher Hero Card */
-#settingsView .settings-hero-card {
-    background: linear-gradient(135deg, #0d2238, #16375c);
-    color: #fff;
-    border-radius: 18px;
-    padding: 22px 24px;
-    margin-bottom: 20px;
-    border: 1px solid #23466f;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 20px;
-    flex-wrap: wrap;
-}
-#settingsView .segmented-control {
-    display: inline-flex;
-    padding: 4px;
-    background: #061423;
-    border: 1px solid #29476b;
-    border-radius: 12px;
-    gap: 4px;
-}
-#settingsView .seg-btn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 15px;
-    background: transparent;
-    border: 0;
-    color: #94a3b8;
-    border-radius: 9px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-}
-#settingsView .seg-btn.active {
-    background: #1d4ed8;
-    color: #fff;
-}
-.settings-card .field input, .settings-card .field select {width:100%;padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fbfcfe;color:#243b55;font-size:13px;outline:none;}
-.settings-card .field input:focus, .settings-card .field select:focus {border-color:#119bd7;box-shadow:0 0 0 3px rgba(17,155,215,.15);background:#fff;}
