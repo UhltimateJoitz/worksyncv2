@@ -1173,7 +1173,7 @@ function showView(name){
     omRequests:["omRequestsView","omRequestsNav"],
     omViewRequests:["omViewRequestsView","omRequestsNav"]
   };
-  const pair=map[name]; if(pair){$(pair[0]).classList.add("active");$(pair[1]).classList.add("active");}
+  const pair=map[name]; if(pair && $(pair[0]) && $(pair[1])){$(pair[0]).classList.add("active");$(pair[1]).classList.add("active");}
   updateArchiveNav();
   sessionStorage.setItem("worksync.activeView",name);
   if(name==="attendanceArchive"){
