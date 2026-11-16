@@ -1,0 +1,73 @@
+/* ==========================================================================
+   WORKSYNC ALPHA 10 · AGENT VIEWS
+   ========================================================================== */
+
+/* 1. Agent Dashboard Grid */
+.agent-grid{display:grid;grid-template-columns:2fr 1fr;gap:18px}
+.agent-hero{background:linear-gradient(135deg,#062442,#0b3b62);color:#fff;border-radius:20px;padding:28px;box-shadow:0 14px 40px rgba(8,45,78,.16)}
+.agent-hero-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.live-schedule-card-btn{display:inline-flex;align-items:center;gap:8px;border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.08);color:#fff;border-radius:10px;padding:9px 11px;font-weight:900;font-size:10px;cursor:pointer;white-space:nowrap}
+.live-schedule-card-btn:hover{background:rgba(255,255,255,.14)}
+.live-schedule-card-btn:active{transform:translateY(1px)}
+.live-schedule-launcher-dot{width:7px;height:7px;border-radius:50%;background:#63e3a6;box-shadow:0 0 0 3px rgba(99,227,166,.14)}
+.live-schedule-launcher-timer{padding:3px 6px;border-radius:999px;background:rgba(255,255,255,.12);color:#bfefff;font-size:9px;letter-spacing:.3px}
+.live-schedule-launcher-timer.hidden{display:none!important}
+
+.agent-hero .eyebrow{color:#72d1f4;font-size:11px;font-weight:900;letter-spacing:2px;text-transform:uppercase}
+.agent-hero h2{font-size:31px;margin:10px 0 4px}
+.agent-hero .datepill{display:inline-block;margin-top:12px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.1);font-size:11px;font-weight:800}
+.shiftline{display:flex;align-items:end;justify-content:space-between;gap:15px;margin-top:28px}
+.shiftbig{font-size:29px;font-weight:900}
+.shiftlabel{font-size:10px;color:#9fc2da;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:5px}
+.state{padding:9px 12px;border-radius:999px;background:rgba(39,213,142,.13);color:#63e3a6;border:1px solid rgba(99,227,166,.25);font-size:11px;font-weight:900}
+.activitybar{margin-top:20px;padding:14px 16px;border-radius:13px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1)}
+.activitybar strong{display:block;font-size:13px}
+.activitybar span{display:block;color:#a8c2d8;font-size:11px;margin-top:4px}
+
+/* 2. Agent Details & Cards */
+.agent-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 8px 30px rgba(24,48,80,.06)}
+.agent-card h3{margin:0 0 15px;font-size:18px}
+.detailsgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}
+.detail{padding:11px;border:1px solid var(--line);border-radius:11px;background:#fbfcfe}
+.detail span{display:block;color:#8392a5;font-size:9px;text-transform:uppercase;letter-spacing:1px}
+.detail strong{display:block;margin-top:4px;font-size:12px}
+.weekwrap{margin-top:18px}
+.weektable{width:100%;border-collapse:collapse;font-size:12px}
+.weektable th{background:#f4f7fb;text-align:left;padding:10px;color:#65768b;font-size:10px;text-transform:uppercase;letter-spacing:.7px}
+.weektable td{padding:10px;border-bottom:1px solid #edf1f6}
+.badge{display:inline-block;padding:5px 8px;border-radius:999px;font-size:9px;font-weight:900}
+.badge.work{background:#eaf8f1;color:#116c49}
+.badge.off{background:#f0f3f7;color:#66778b}
+.badge.other{background:#fff3df;color:#9b6417}
+
+/* 3. Agent Home Modules */
+.placeholder-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:18px}
+.mini-feature{background:#fff;border:1px dashed #cbd8e6;border-radius:14px;padding:17px}
+.mini-feature strong{display:block;font-size:13px}
+.mini-feature span{display:block;color:#7a899c;font-size:11px;margin-top:5px}
+.agent-empty{padding:26px;border:1px dashed #b8cce0;border-radius:14px;text-align:center;color:#667a91;background:#fbfdff}
+.agent-empty strong{display:block;color:#263b55;margin-bottom:5px}
+
+/* 4. Agent Weekly Schedule */
+.schedule-week-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.schedule-day-card{border:1px solid var(--line);border-radius:15px;padding:16px;background:#fbfcfe}
+.schedule-day-card.today{border-color:#6bbce6;box-shadow:0 0 0 2px rgba(49,158,211,.08)}
+.schedule-day-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px}
+.schedule-day-name{font-weight:900;color:#263b55;font-size:13px}
+.schedule-day-date{color:#8392a5;font-size:10px;margin-top:3px}
+.schedule-day-shift{font-weight:900;color:#1d3552;font-size:12px;text-align:right}
+.schedule-day-status{margin-top:3px;text-align:right}
+.schedule-activity-list{border-top:1px solid #e8eef4;padding-top:10px}
+.schedule-activity{display:flex;justify-content:space-between;gap:10px;padding:7px 0;font-size:11px}
+.schedule-activity+.schedule-activity{border-top:1px dashed #edf1f6}
+.schedule-activity-name{font-weight:800;color:#42566e}
+.schedule-activity-time{white-space:nowrap;color:#667a91}
+.schedule-no-activity{font-size:10px;color:#94a1b1;padding:4px 0}
+.schedule-section-note{margin-bottom:14px;color:#667a91;font-size:11px}
+
+/* 5. Mobile Responsiveness */
+@media(max-width:900px){
+  .agent-grid{grid-template-columns:1fr}
+  .placeholder-grid{grid-template-columns:1fr}
+  .schedule-week-grid{grid-template-columns:1fr}
+}
