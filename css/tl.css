@@ -1,0 +1,80 @@
+/* ==========================================================================
+   WORKSYNC ALPHA 10 · TEAM LEAD (TL) VIEWS
+   ========================================================================== */
+
+/* 1. TL Dashboard & Hero */
+.team-hero{background:linear-gradient(135deg,#062442,#0b3b62);color:#fff;border-radius:20px;padding:24px;box-shadow:0 14px 40px rgba(8,45,78,.16);margin-bottom:18px}
+.team-hero .eyebrow{color:#72d1f4;font-size:11px;font-weight:900;letter-spacing:2px;text-transform:uppercase}
+.team-hero h2{font-size:30px;margin:9px 0 5px}
+.team-hero p{margin:0;color:#b8cfe2;font-size:13px}
+
+/* 2. TL Stats Grid */
+.tl-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:18px}
+.tl-stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:16px;box-shadow:0 8px 30px rgba(24,48,80,.06)}
+.tl-stat .num{font-size:28px;font-weight:900;line-height:1}
+.tl-stat .label{margin-top:7px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.tl-stat.work .num{color:var(--green)}
+.tl-stat.off .num{color:#6d7d91}
+.tl-stat.leave .num{color:#9b6417}
+.tl-stat.att-in .num{color:#16a34a}
+.tl-stat.att-tardy .num{color:#ea580c}
+.tl-stat.att-absent .num{color:#dc2626}
+.tl-stat.att-due .num{color:#64748b}
+.tl-att-grid{grid-template-columns:repeat(4,1fr);margin-bottom:14px}
+
+/* 3. TL Team Table & Filters */
+.tl-table .team-status{font-weight:900}
+.team-status.WORKING{color:var(--green)}
+.team-status.OFF{color:#6d7d91}
+.team-status.VL,.team-status.ML,.team-status.SL,.team-status.AL{color:#9b6417}
+.tl-filterbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.tl-filterbar button{border:1px solid #cbd8e6;background:#fff;color:#36506d;border-radius:999px;padding:8px 11px;font-size:11px;font-weight:800}
+.tl-filterbar button.active{background:#eaf6fc;color:#1278aa;border-color:#bfe3f4}
+.tl-note{margin-top:14px;padding:12px 14px;border-radius:11px;background:#eef6fb;border:1px solid #cfe5f2;color:#4a627c;font-size:11px;line-height:1.5}
+.tl-att-box{background:#fff;border:1px solid #dbe5ef;border-radius:14px;padding:14px 16px;margin:0 0 14px}
+.tl-team-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.tl-team-head h3{margin:0}
+.tl-att-basis{font-size:12px;color:#5d6d82;margin:6px 0 12px}
+
+/* 4. TL Roster View */
+.tl-roster-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px}
+.tl-roster-head h2{margin:0 0 5px;font-size:22px}
+.tl-roster-head p{margin:0;color:var(--muted);font-size:12px}
+.tl-roster-summary{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tl-roster-summary .count{font-size:10px;font-weight:900;color:#1278aa;background:#eaf6fc;border:1px solid #cfeaf7;border-radius:999px;padding:7px 10px}
+.tl-roster-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:14px}
+.tl-roster-toolbar .field{margin:0;min-width:220px}
+.tl-roster-toolbar label{display:block;color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:800;margin-bottom:6px}
+.tl-roster-toolbar input,.tl-roster-toolbar select{width:100%;padding:10px 11px;border:1px solid #cbd8e6;border-radius:10px;background:#fff;color:#243b55}
+.tl-roster-table th,.tl-roster-table td{white-space:nowrap}
+.tl-roster-table th{background:#f4f7fb}
+.tl-roster-table td{font-size:12px}
+.tl-readonly-badge{display:inline-block;padding:5px 8px;border-radius:999px;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.6px;background:#eef6fb;color:#4a627c;border:1px solid #cfe5f2}
+
+/* 5. TL Schedule View */
+.tl-schedule-toolbar{display:flex;align-items:end;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.tl-schedule-field{display:flex;flex-direction:column;gap:5px;min-width:260px}
+.tl-schedule-field label{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#667a91;font-weight:900}
+.tl-schedule-field select{padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fff;color:#213b56;font-size:12px;font-weight:800}
+.tl-schedule-context{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.tl-schedule-context .detail{min-height:52px}
+.tl-schedule-status{display:inline-flex;align-items:center;padding:7px 10px;border-radius:999px;font-size:10px;font-weight:900}
+.tl-schedule-status.work{background:#eaf8f1;color:#116c49}
+.tl-schedule-status.off{background:#f0f3f7;color:#66778b}
+.tl-schedule-status.other{background:#fff3df;color:#9b6417}
+
+/* 6. Mobile Responsiveness */
+@media(max-width:1000px){
+  .tl-grid{grid-template-columns:repeat(3,1fr)}
+}
+@media(max-width:850px){
+  .tl-schedule-context{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:650px){
+  .tl-grid{grid-template-columns:repeat(2,1fr)}
+  .tl-att-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:520px){
+  .tl-schedule-context{grid-template-columns:1fr}
+  .tl-schedule-field{min-width:100%}
+}
