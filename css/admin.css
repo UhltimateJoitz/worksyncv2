@@ -63,3 +63,12 @@
 @media(max-width:960px){
   .settings-grid{grid-template-columns:1fr}
 }
+
+
+/* 7. Settings Page Inputs & Cards Fix */
+.settings-card{background:#fff !important;color:var(--ink) !important;border:1px solid var(--line) !important;box-shadow:0 8px 30px rgba(24,48,80,.06) !important;padding:24px !important;border-radius:18px !important;}
+.settings-card h3{color:#10233a !important;}
+.settings-card p{color:#5d6d82 !important;}
+.settings-card .field label{color:#64748b !important;}
+.settings-card .field input, .settings-card .field select {width:100%;padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fbfcfe;color:#243b55;font-size:13px;outline:none;}
+.settings-card .field input:focus, .settings-card .field select:focus {border-color:#119bd7;box-shadow:0 0 0 3px rgba(17,155,215,.15);background:#fff;}
