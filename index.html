@@ -30,6 +30,67 @@
   </div>
 </div>
 
+<section id="loginView" class="login">
+  <div class="hero">
+    <img class="login-logo" src="assets/hgs-logo.png" alt="HGS">
+    <div class="eyebrow">HGS Workforce Operations</div>
+    <h1>HGS WorkSync</h1>
+    <p>Your schedule. Your day. In sync.</p>
+    <div class="values">
+      <span><i></i>Integrity</span>
+      <span><i></i>Service</span>
+      <span><i></i>Innovation</span>
+      <span><i></i>People</span>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Welcome Back</h2>
+    <p class="sub">Sign in with your HGS email and password to continue.</p>
+    <div class="field">
+      <label>HGS EMAIL</label>
+      <input id="email" type="email" placeholder="name@hgsbs.com" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>PASSWORD</label>
+      <input id="password" type="password" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button class="primary" id="loginBtn">Sign In</button>
+    <div class="msg" id="loginMsg"></div>
+    <div class="note">Authorized WorkSync team members only.</div>
+  </div>
+</section>
+
+<div id="appView" class="app hidden">
+  <header class="top">
+    <div class="brand">
+      <img class="ccacLogo" src="assets/hgs-logo.png" alt="CCAC logo" style="filter:none; object-fit:contain;">
+      <div class="brandmark"></div>
+      <div>
+        <strong>WorkSync</strong>
+        <small id="brandContext">CONCEPCION CARRIER · ALPHA 10</small>
+      </div>
+    </div>
+    <div class="userbox">
+      <div class="clockbox">
+        <img class="phflag" src="assets/phflag.png" alt="Philippines flag">
+        <span class="clocklabel">PHT</span>
+        <span id="liveClock">--:--:--</span>
+      </div>
+      <span id="who">Signed in as …</span>
+      <div class="lr-notif" id="lrNotifWrap">
+        <button type="button" class="lr-notif-btn" id="lrNotifBtn" title="Notifications">🔔 Alerts</button>
+        <span class="lr-notif-count" id="lrNotifCount">0</span>
+        <div class="lr-notif-panel" id="lrNotifPanel"><div class="lr-empty" style="margin:6px">No notifications yet.</div></div>
+      </div>
+      <span class="sep">|</span>
+      <span class="title" id="headerTitle">—</span>
+      <span class="sep">|</span>
+      <span class="active">Active</span>
+      <button class="refresh-dashboard" id="refreshDashboardBtn" title="Refresh dashboard data">↻ Refresh Dashboard</button>
+      <button class="logout" id="logoutBtn">Sign out</button>
+    </div>
+  </header>
+
 <div id="smEditModal" class="sm-modal hidden" aria-hidden="true">
   <div class="sm-modal-backdrop"></div>
   <section class="sm-modal-card" role="dialog" aria-modal="true" aria-labelledby="smEditTitle">
