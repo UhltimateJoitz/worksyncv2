@@ -1,0 +1,110 @@
+/* ==========================================================================
+   WORKSYNC ALPHA 10 · OPS MANAGER (OM) VIEWS
+   ========================================================================== */
+
+/* 1. OM Dashboard & Hero */
+.om-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:18px}
+.om-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 8px 30px rgba(24,48,80,.06)}
+.om-card h2{margin:0 0 3px;font-size:20px}
+.om-card .muted{color:var(--muted);font-size:11px;margin-bottom:14px}
+.om-statgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+.om-stat{background:#f7f9fc;border:1px solid #e5ebf2;border-radius:10px;padding:8px 6px;text-align:center}
+.om-stat b{display:block;font-size:18px;line-height:1.05}
+.om-stat span{font-size:8px;text-transform:uppercase;letter-spacing:.5px;color:#738196}
+.om-stat.work b{color:var(--green)}
+.om-stat.leave b{color:#9b6417}
+.om-stat.off b{color:#6d7d91}
+.om-total{display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid #edf1f6;font-size:11px;color:var(--muted)}
+.om-total strong{font-size:18px;color:#17324f}
+.om-hero{background:linear-gradient(135deg,#062442,#0b3b62);color:#fff;border-radius:20px;padding:24px;margin-bottom:18px;box-shadow:0 14px 40px rgba(8,45,78,.16)}
+.om-hero .eyebrow{color:#72d1f4;font-size:11px;font-weight:900;letter-spacing:2px;text-transform:uppercase}
+.om-hero h2{font-size:30px;margin:9px 0 5px}
+.om-hero p{margin:0;color:#b8cfe2;font-size:13px}
+.om-drill{margin-top:8px;border:1px solid #cbd8e6;background:#fff;color:#27405d;border-radius:10px;padding:9px 12px;font-weight:800}
+.om-drill:hover{border-color:#9fcfe7;color:#1278aa}
+.om-subnav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.om-subnav button{border:1px solid #cbd8e6;background:#fff;color:#36506d;border-radius:999px;padding:8px 12px;font-size:11px;font-weight:800}
+.om-subnav button.active{background:#eaf6fc;color:#1278aa;border-color:#bfe3f4}
+.om-team-detail-head{display:flex;justify-content:space-between;gap:14px;align-items:end;margin-bottom:14px}
+.om-team-detail-head h2{margin:0;font-size:24px}
+.om-team-detail-head p{margin:5px 0 0;color:var(--muted);font-size:12px}
+
+/* 2. OM Roster Controls */
+.roster-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:16px}
+.roster-toolbar .field{margin:0;min-width:220px}
+.roster-toolbar label{display:block;color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:800;margin-bottom:6px}
+.roster-toolbar input,.roster-toolbar select{width:100%;padding:10px 11px;border:1px solid #cbd8e6;border-radius:10px;background:#fff;color:#243b55}
+.roster-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.roster-kpi{background:#f8fafc;border:1px solid #e5ebf2;border-radius:12px;padding:12px}
+.roster-kpi b{font-size:22px}
+.roster-kpi span{display:block;color:#738196;font-size:9px;text-transform:uppercase;letter-spacing:.7px;margin-top:3px}
+.roster-kpi.warn b{color:#a36a11}
+.roster-table select{min-width:170px;padding:7px 9px;border:1px solid #cbd8e6;border-radius:8px;background:#fff;color:#243b55}
+.roster-save{border:0;border-radius:8px;padding:7px 10px;background:linear-gradient(135deg,#119bd7,#2377d8);color:#fff;font-size:11px;font-weight:800}
+.roster-note{margin-top:12px;padding:12px 14px;background:#eef6fb;border:1px solid #cfe5f2;border-radius:11px;color:#4a627c;font-size:11px;line-height:1.5}
+
+/* 3. OM Staffing Dashboard */
+.om-dashboard-section{background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:16px;box-shadow:0 8px 26px rgba(24,48,80,.045)}
+.om-dashboard-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:13px}
+.om-dashboard-section-head h2{margin:0;font-size:18px;color:#10223a}
+.om-dashboard-section-head p{margin:4px 0 0;color:var(--muted);font-size:11px}
+.om-small-action{border:1px solid #cbd8e6;border-radius:9px;padding:8px 11px;background:#fff;color:#17416c;font-size:11px;font-weight:850;cursor:pointer}
+.om-small-action:hover{background:#eef6fb;border-color:#a9cce3}
+.om-staffing-kpis{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:12px}
+.om-staffing-kpi{background:#fff;border:1px solid #d8e4f0;border-radius:14px;padding:16px 14px;min-width:0;text-align:left;cursor:pointer;transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px rgba(16,40,70,.04)}
+.om-staffing-kpi:hover{border-color:#8ebfdf;box-shadow:0 4px 14px rgba(24,80,120,.08)}
+.om-staffing-kpi.is-active{border-color:#119bd7;box-shadow:0 0 0 3px rgba(17,155,215,.15)}
+.om-staffing-kpi .kpi-name{display:block;font-size:15px;font-weight:900;color:#0f2744;line-height:1.2;margin:0 0 8px;letter-spacing:-.2px}
+.om-staffing-kpi strong{display:block;font-size:32px;line-height:1;color:#10233d;font-weight:900;margin:0}
+.om-staffing-kpi .sub{margin-top:8px;color:#6b7c90;font-size:11px;line-height:1.35}
+.om-staffing-kpi.total{background:#102a4d;border-color:#102a4d}
+.om-staffing-kpi.total .kpi-name,.om-staffing-kpi.total .sub{color:#b9cfe6}
+.om-staffing-kpi.total strong{color:#fff}
+.om-staffing-kpi.cet strong{color:#2167d5}
+.om-staffing-kpi.cat strong{color:#7652c7}
+.om-staffing-kpi.voice strong{color:#07805b}
+.om-staffing-kpi.digital strong{color:#087ea4}
+.om-staffing-kpi.review strong{color:#b7791f}
+.om-staffing-meta{font-size:12px;line-height:1.55;color:#3d5268;margin-top:12px;padding:11px 13px;background:#f0f7fc;border:1px solid #d5e8f5;border-radius:10px;white-space:normal;overflow:visible;word-break:break-word}
+.om-staffing-note-err{background:#fff7e9;border-color:#f0d6a3;color:#6b4a12;font-weight:600}
+.om-staffing-count{display:inline-flex;align-items:center;justify-content:center;min-width:28px;padding:2px 8px;border-radius:999px;background:#eef4fb;color:#1e3a5f;font-weight:800;font-size:12px}
+
+/* 4. OM Agent List Panel */
+.om-agent-list-panel{margin-top:14px;border:1px solid #d8e4f0;border-radius:12px;background:#fff;overflow:hidden}
+.om-agent-list-panel.hidden{display:none!important}
+.om-agent-list-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;background:#f4f8fc;border-bottom:1px solid #e2eaf3}
+.om-agent-list-head strong{font-size:13px;color:#15304f}
+.om-agent-list-head button{border:1px solid #cbd8e6;background:#fff;border-radius:8px;padding:6px 10px;font-size:11px;font-weight:800;color:#27405d;cursor:pointer}
+.om-agent-list-body{max-height:260px;overflow:auto}
+.om-agent-list-body table{width:100%;border-collapse:collapse;font-size:12px}
+.om-agent-list-body th{text-align:left;padding:8px 12px;background:#fafcfe;color:#5a6f84;font-size:10px;text-transform:uppercase;letter-spacing:.04em;position:sticky;top:0;border-bottom:1px solid #e8eef4}
+.om-agent-list-body td{padding:8px 12px;border-bottom:1px solid #eef2f6;color:#1e334d}
+.om-agent-list-body tr:last-child td{border-bottom:0}
+.om-team-countline{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:#53677c}
+.om-team-countline span{color:#7a8b9f}
+.om-team-countline strong{color:#15304f;margin-left:4px}
+.om-staffing-toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:14px}
+.om-staffing-toolbar .field{margin:0;flex:1 1 200px;min-width:0}
+.om-staffing-toolbar label{display:block;color:#5d6d82;font-size:10px;text-transform:uppercase;letter-spacing:.8px;font-weight:800;margin-bottom:6px}
+.om-staffing-toolbar input,.om-staffing-toolbar select{width:100%;padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fff;color:#243b55;font-size:13px;outline:none}
+.om-staffing-toolbar input:focus,.om-staffing-toolbar select:focus{border-color:#119bd7;box-shadow:0 0 0 3px rgba(17,155,215,.15)}
+.om-dashboard-section .om-card{box-shadow:none;background:#f9fbfd;border-radius:14px}
+.om-card .secondary{padding:8px 12px;font-size:11px;margin-top:10px}
+.om-stat span{font-size:9px;line-height:1.2}
+
+/* 5. Mobile Responsiveness */
+@media(max-width:1200px){
+  .om-staffing-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(max-width:1000px){
+  .om-grid{grid-template-columns:1fr}
+  .om-statgrid{grid-template-columns:repeat(5,1fr)}
+}
+@media(max-width:800px){
+  .roster-kpis{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:650px){
+  .om-staffing-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .om-team-countline{flex-direction:column;gap:6px}
+  .om-statgrid{grid-template-columns:repeat(2,1fr)}
+}
