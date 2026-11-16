@@ -161,3 +161,19 @@ html{scroll-behavior:auto}
 .admin-mode .settings-only{display:inline-block!important}
 .admin-card-only{display:none}
 .admin-mode .admin-card-only{display:flex!important}
+
+/* 8. Home Page Grid */
+.homegrid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+.feature{background:#fff;border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 8px 30px rgba(24,48,80,.06)}
+.feature.real{border-color:#b9dff0}
+.feature .icon{font-size:28px;margin-bottom:14px}
+.feature h2{margin:0 0 7px;font-size:20px}
+.feature p{margin:0 0 18px;color:var(--muted);font-size:13px;line-height:1.55}
+.tag{display:inline-block;font-size:10px;font-weight:900;letter-spacing:1.2px;text-transform:uppercase;padding:6px 9px;border-radius:999px;background:#f0f3f7;color:#6b7a90}
+.real .tag{background:#eaf8f1;color:#116c49}
+.feature button{margin-top:18px;border:1px solid #cbd8e6;background:#fff;border-radius:10px;padding:10px 14px;font-weight:800;color:#27405d}
+.real button{border:0;color:#fff;background:linear-gradient(135deg,#119bd7,#2377d8)}
+.subgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:18px}
+.subcard{border:1px solid var(--line);border-radius:12px;padding:13px;background:#fbfcfe}
+.subcard strong{font-size:12px;display:block}
+.subcard span{font-size:11px;color:var(--muted)}
