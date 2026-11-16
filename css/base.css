@@ -1,0 +1,163 @@
+/* ==========================================================================
+   WORKSYNC ALPHA 10 · FOUNDATION (BASE & LOGIN)
+   ========================================================================== */
+
+/* 1. Design Tokens & Reset */
+:root{
+  --navy:#061326;--navy2:#0b1d35;--blue:#119bd7;--blue2:#2377d8;
+  --ink:#142033;--muted:#6b7a90;--line:#dce5ef;--bg:#f4f7fb;
+  --green:#138a5b;--orange:#c97716;--red:#c33c3c;
+}
+*{box-sizing:border-box} 
+body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--bg);overflow-x:hidden}
+.hidden{display:none!important}
+button,input,select,textarea{font:inherit}
+button{cursor:pointer}
+html{scroll-behavior:auto}
+
+/* 2. Login Screen */
+.login{min-height:100vh;display:grid;grid-template-columns:1.05fr .95fr;align-items:center;gap:5vw;padding:60px 7vw;color:#f4f8ff;background:radial-gradient(circle at 15% 15%,rgba(25,155,215,.18),transparent 34%),radial-gradient(circle at 90% 85%,rgba(35,119,216,.16),transparent 35%),linear-gradient(135deg,#030b17,#09213d 55%,#03101f)}
+.hero{max-width:650px}
+.login-logo{width:min(300px,62vw);height:auto;display:block;margin-bottom:28px;filter:drop-shadow(0 8px 20px rgba(0,0,0,.22))}
+.eyebrow{color:#69c9f2;text-transform:uppercase;letter-spacing:3px;font-size:12px;font-weight:700}
+.hero h1{font-size:clamp(42px,5vw,70px);line-height:.98;margin:14px 0 22px;letter-spacing:-2px}
+.hero p{max-width:560px;color:#a9bdd4;font-size:17px;line-height:1.65}
+.values{display:flex;gap:24px;flex-wrap:wrap;margin-top:36px;color:#8fa8c3;font-size:11px;letter-spacing:2.5px}
+.values span{display:flex;align-items:center;gap:10px}
+.values i{width:4px;height:4px;border-radius:50%;background:#149bd8}
+.card{width:100%;max-width:500px;justify-self:end;background:rgba(7,23,42,.82);border:1px solid rgba(117,184,239,.28);border-radius:24px;padding:38px;box-shadow:0 30px 90px rgba(0,0,0,.42);backdrop-filter:blur(18px)}
+.card h2{font-size:32px;margin:0 0 8px}
+.sub{color:#9fb2c9;margin:0 0 30px}
+.field{margin-bottom:19px}
+.field label{display:block;color:#b9c9da;font-size:12px;font-weight:700;margin-bottom:8px;letter-spacing:.5px}
+.field input,.field select{width:100%;padding:14px 15px;border:1px solid rgba(130,178,219,.3);border-radius:12px;background:rgba(2,12,24,.55);color:#fff;outline:none}
+.field input:focus,.field select:focus{border-color:#3aaee6}
+.primary{width:100%;border:0;border-radius:12px;padding:14px 18px;color:#fff;font-weight:800;background:linear-gradient(135deg,var(--blue),var(--blue2));box-shadow:0 10px 25px rgba(17,155,215,.25)}
+.msg{margin-top:14px;font-size:13px;color:#ffb7b7}
+.note{margin-top:22px;color:#8196ae;font-size:11px;line-height:1.5;text-align:center}
+
+/* 3. Splash Screen */
+#workSyncSplash{position:fixed;inset:0;z-index:99999;display:grid;place-items:center;overflow:hidden;color:#f2f8ff;background:radial-gradient(ellipse at 18% 18%,rgba(18,155,215,.19),transparent 36%),radial-gradient(ellipse at 82% 78%,rgba(49,105,220,.19),transparent 38%),linear-gradient(135deg,#030b17 0%,#07192e 48%,#04101f 100%);opacity:1;visibility:visible;transition:opacity .45s ease,visibility .45s ease}
+#workSyncSplash.ws-splash-hidden{opacity:0;visibility:hidden;pointer-events:none}
+#workSyncSplash:before,#workSyncSplash:after{content:"";position:absolute;width:min(54vw,620px);aspect-ratio:1;border-radius:50%;filter:blur(70px);opacity:.25;pointer-events:none;animation:wsAuraFloat 8s ease-in-out infinite alternate}
+#workSyncSplash:before{left:-15%;top:-28%;background:radial-gradient(circle,rgba(22,174,231,.72),rgba(22,174,231,0) 68%)}
+#workSyncSplash:after{right:-20%;bottom:-35%;background:radial-gradient(circle,rgba(70,103,242,.65),rgba(70,103,242,0) 68%);animation-delay:-4s}
+.ws-splash-content{position:relative;z-index:1;width:min(92vw,460px);padding:34px 26px 28px;text-align:center}
+.ws-splash-mark{width:68px;height:68px;margin:0 auto 20px;border:1px solid rgba(126,205,245,.35);border-radius:21px;display:grid;place-items:center;background:linear-gradient(145deg,rgba(26,173,228,.22),rgba(50,105,210,.12));box-shadow:0 0 0 8px rgba(56,159,220,.045),0 16px 50px rgba(0,0,0,.24);position:relative}
+.ws-splash-mark:before{content:"";position:absolute;inset:-7px;border:1px solid rgba(92,196,241,.12);border-radius:25px;animation:wsMarkPulse 2.5s ease-out infinite}
+.ws-splash-mark span{font-size:30px;font-weight:900;letter-spacing:-2px;color:#ecfaff;text-shadow:0 0 22px rgba(69,191,242,.38)}
+.ws-splash-name{font-size:29px;line-height:1.1;font-weight:850;letter-spacing:-.8px;color:#f4f9ff}
+.ws-splash-name span{color:#4fc4f0}
+.ws-splash-kicker{margin-top:9px;font-size:9px;line-height:1.6;letter-spacing:2.2px;text-transform:uppercase;font-weight:800;color:#86a9c8}
+.ws-splash-loader{width:170px;height:3px;margin:34px auto 17px;border-radius:99px;overflow:hidden;background:rgba(156,198,229,.14);box-shadow:0 0 0 1px rgba(156,198,229,.04)}
+.ws-splash-loader span{display:block;width:42%;height:100%;border-radius:99px;background:linear-gradient(90deg,#168bd5,#62dcf2);box-shadow:0 0 16px rgba(49,190,239,.5);animation:wsLoaderSweep 1.35s ease-in-out infinite}
+#workSyncSplashStatus{min-height:18px;font-size:11px;font-weight:700;letter-spacing:.15px;color:#d4e9f7}
+.ws-splash-foot{margin-top:38px;font-size:9px;letter-spacing:1.15px;text-transform:uppercase;color:#67849f}
+.ws-splash-foot b{color:#42bce9;font-weight:900;padding:0 7px}
+@keyframes wsLoaderSweep{0%{transform:translateX(-110%)}100%{transform:translateX(350%)}}
+@keyframes wsMarkPulse{0%{transform:scale(.96);opacity:.8}100%{transform:scale(1.23);opacity:0}}
+@keyframes wsAuraFloat{0%{transform:translate3d(0,0,0) scale(1)}100%{transform:translate3d(5%,7%,0) scale(1.12)}}
+
+/* 4. App Shell (Header & Nav) */
+.app{min-height:100vh}
+.top{height:76px;background:#07172b;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 32px;box-shadow:0 2px 18px rgba(0,0,0,.12)}
+.brand{display:flex;align-items:center;gap:14px}
+.ccacLogo{width:88px;height:42px;object-fit:contain;object-position:left center;filter:brightness(0) invert(1);opacity:.96}
+.brandmark{width:10px;height:34px;border-radius:8px;background:linear-gradient(#21b6ed,#2377d8)}
+.brand strong{font-size:17px}
+.brand small{display:block;color:#8fa8c3;font-size:10px;letter-spacing:1.8px;text-transform:uppercase;margin-top:3px}
+.refresh-dashboard{display:none;border:1px solid #2f4c6b;background:#0b2742;color:#e8f4ff;border-radius:10px;padding:8px 12px;font-size:11px;font-weight:800;cursor:pointer}
+.refresh-dashboard:hover{border-color:#61c6ef;color:#fff}
+.refresh-dashboard:disabled{opacity:.65;cursor:wait}
+.tl-mode .refresh-dashboard,.om-mode .refresh-dashboard{display:inline-block}
+.userbox{display:flex;align-items:center;gap:12px}
+.clockbox{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid rgba(180,210,235,.18);border-radius:9px;background:rgba(255,255,255,.035);color:#dce8f4;font-size:12px;font-variant-numeric:tabular-nums}
+.phflag{width:26px;height:17px;object-fit:contain;object-position:center;display:inline-block;vertical-align:middle;background:transparent}
+.clocklabel{color:#73c8ef;font-size:10px;font-weight:800;letter-spacing:1px}
+#liveClock{min-width:66px;text-align:center;font-weight:800}
+.userbox span{font-size:13px;color:#c6d5e5}
+.logout{background:transparent;color:#d7e5f3;border:1px solid rgba(180,210,235,.3);border-radius:9px;padding:8px 12px}
+.nav{background:#fff;border-bottom:1px solid var(--line);padding:0 34px;display:flex;gap:8px}
+.nav button{border:0;background:transparent;padding:15px 14px;color:#5d6d82;font-weight:800;font-size:13px}
+.nav button.active{color:#1676a8;border-bottom:3px solid #169bd8}
+
+/* 5. UI7 Fixed Shell (Sidebar Layout) */
+#appView .top{position:fixed;top:0;left:0;right:0;height:72px;z-index:1000;box-sizing:border-box}
+#appView .nav{position:fixed;top:72px;left:0;bottom:0;width:196px;z-index:999;box-sizing:border-box;display:flex;flex-direction:column;align-items:stretch;gap:2px;padding:14px 8px 22px;background:#fff;border-right:1px solid var(--line);border-bottom:0;overflow-y:auto;overflow-x:hidden;box-shadow:3px 0 14px rgba(24,48,80,.045)}
+#appView .nav button{width:100%;box-sizing:border-box;text-align:left;padding:10px 12px;border:1px solid transparent;border-radius:9px;color:#5d6d82;font-weight:800;font-size:12px;white-space:nowrap}
+#appView .nav button:hover{background:#f5f9fc;color:#17324f}
+#appView .nav button.active{color:#1676a8;background:#eef8fd;border-bottom:0;border-left:3px solid #169bd8;padding-left:9px}
+#appView > .wrap{box-sizing:border-box;max-width:none;width:calc(100% - 196px);margin:0 0 0 196px;padding:96px 24px 32px;min-height:100vh}
+#appView .view{min-height:calc(100vh - 96px)}
+#appView .view > .heading{margin-bottom:16px}
+#appView .panel,#appView .agent-card,#appView .om-hero,#appView .wfm-cc-wrap{max-width:none}
+#appView #rosterAdminView .panel{margin-bottom:12px}
+#appView #rosterAdminView .roster-kpis{margin-bottom:12px}
+#appView .tablewrap{overscroll-behavior:contain}
+#appView .tablewrap th{top:0}
+#appView .wfm-timeline th{top:0}
+
+@media(max-width:1000px){
+  #appView .nav{width:174px}
+  #appView > .wrap{width:calc(100% - 174px);margin-left:174px;padding:92px 18px 28px}
+}
+@media(max-width:760px){
+  #appView .top{height:64px;padding:0 14px}
+  #appView .nav{top:64px;width:72px;padding:12px 7px}
+  #appView .nav button{font-size:0;text-align:center;padding:10px 6px}
+  #appView .nav button::first-letter{font-size:16px}
+  #appView > .wrap{width:calc(100% - 72px);margin-left:72px;padding:84px 12px 24px}
+  #appView .view{min-height:calc(100vh - 84px)}
+}
+@media(max-width:620px){
+  #appView .brand small{display:none}
+  #appView .brand strong{font-size:14px}
+  #appView .userbox span:not(.clocklabel),#appView .clockbox{display:none}
+}
+
+/* 6. Base Layout & Shared Components */
+.wrap{max-width:1250px;margin:0 auto;padding:34px}
+.heading{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:24px}
+.heading h1{margin:0;font-size:32px;letter-spacing:-.7px}
+.heading p{margin:7px 0 0;color:var(--muted)}
+.pill{background:#e8f5fc;color:#1676a8;border:1px solid #cbe9f7;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800}
+.view{display:none}
+.view.active{display:block}
+.panel{background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 30px rgba(24,48,80,.06);padding:24px;margin-bottom:20px}
+.actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.secondary,.publish{border-radius:10px;padding:11px 17px;font-weight:800}
+.secondary{background:#fff;border:1px solid #cbd8e6;color:#27405d}
+.publish{border:0;color:#fff;background:linear-gradient(135deg,#119bd7,#2377d8)}
+.publish:disabled{opacity:.45;cursor:not-allowed}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}
+.tablewrap table{width:100%;border-collapse:collapse;font-size:12px}
+.tablewrap th{background:#f4f7fb;text-align:left;padding:10px;border-bottom:1px solid var(--line);position:sticky;top:0}
+.tablewrap td{padding:9px 10px;border-bottom:1px solid #edf1f6;white-space:nowrap}
+.banner{padding:12px 14px;border-radius:10px;margin-top:14px;font-size:13px}
+.ok{background:#eaf8f1;color:#116c49;border:1px solid #c8eadb}
+.warn{background:#fff7e8;color:#8a5a13;border:1px solid #f0ddb0}
+.err{background:#fff0f0;color:#9b3030;border:1px solid #efcaca}
+
+/* 7. Role Visibility (The "Doors") */
+.tl-only{display:none}
+.om-only{display:none}
+.om-mode .admin-only,.om-mode .agent-only,.om-mode .tl-only{display:none!important}
+.om-mode .om-only{display:inline-block!important}
+.tl-mode .admin-only,.tl-mode .agent-only{display:none!important}
+.tl-mode .tl-only{display:inline-block!important}
+.wfm-mode .agent-only{display:none!important}
+.wfm-mode .admin-only{display:inline-block!important}
+.wfm-mode .tl-only,.wfm-mode .om-only{display:none!important}
+.role-nav{display:none}
+.agent-mode .admin-only{display:none!important}
+.agent-mode .agent-only{display:inline-block!important}
+.admin-mode .agent-only{display:none!important}
+.admin-mode .admin-only{display:inline-block!important}
+.wfm-mode .roster-access,.om-mode .roster-access,.tl-mode .roster-access{display:inline-block!important}
+.agent-mode .roster-access{display:none!important}
+.admin-mode .wfm-only{display:inline-block!important}
+.admin-mode .admin-only{display:inline-block!important}
+.settings-only{display:none}
+.admin-mode .settings-only,.wfm-mode .settings-only{display:inline-block!important}
+.admin-card-only{display:none}
+.admin-mode .admin-card-only{display:flex!important}
