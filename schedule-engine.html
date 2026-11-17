@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>WorkSync | WFM Schedule Ingestion A2</title>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+:root{--navy:#061326;--navy2:#0b1d35;--blue:#119bd7;--blue2:#2377d8;--ink:#142033;--muted:#6b7a90;--line:#dce5ef;--bg:#f4f7fb;--green:#138a5b;--orange:#c97716;--red:#c33c3c}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--bg)}button,input,select{font:inherit}button{cursor:pointer}
+.top{background:var(--navy);color:#fff;padding:18px 28px;display:flex;justify-content:space-between;gap:20px;align-items:center;box-shadow:0 2px 18px rgba(0,0,0,.13)}
+.brand strong{font-size:18px;display:block}.brand small{display:block;color:#8fa8c3;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-top:4px}.scope{padding:7px 10px;border:1px solid rgba(255,255,255,.18);border-radius:999px;color:#d9ecf7;font-size:10px;font-weight:900}
+.wrap{max-width:1400px;margin:0 auto;padding:28px}.hero{margin-bottom:18px}.hero h1{margin:0 0 6px;font-size:32px}.hero p{margin:0;color:var(--muted);font-size:13px;line-height:1.5}.grid{display:grid;grid-template-columns:360px 1fr;gap:18px}.panel{background:#fff;border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 8px 30px rgba(24,48,80,.06);margin-bottom:18px}.panel h2{font-size:18px;margin:0 0 5px}.panel p.note{color:var(--muted);font-size:11px;line-height:1.5;margin:0 0 16px}
+.field{margin-bottom:15px}.field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:900;color:#5d6d82;margin-bottom:6px}.field select,.field input[type=date]{width:100%;padding:11px 12px;border:1px solid #cbd8e6;border-radius:10px;background:#fff;color:#243b55}
+.drop{border:2px dashed #bfd0e3;border-radius:15px;padding:25px;text-align:center;background:#f9fbfe}.drop.drag{border-color:#2a9dd4;background:#eef9fd}.drop h3{margin:0 0 5px;font-size:15px}.drop p{margin:0 0 15px;color:var(--muted);font-size:11px}.filebtn{display:inline-flex;border:1px solid #cbd8e6;background:#fff;border-radius:10px;padding:10px 14px;font-weight:900;color:#27405d}.file-meta{margin-top:10px;font-size:11px;color:#667a91;word-break:break-word}.actions{display:flex;gap:9px;flex-wrap:wrap}.primary,.secondary{border-radius:10px;padding:10px 14px;font-weight:900}.primary{border:0;color:#fff;background:linear-gradient(135deg,var(--blue),var(--blue2))}.secondary{background:#fff;border:1px solid #cbd8e6;color:#27405d}.primary:disabled{opacity:.45;cursor:not-allowed}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{border:1px solid var(--line);border-radius:12px;padding:13px;background:#fbfcfe}.stat .n{font-size:24px;font-weight:900}.stat .l{font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);margin-top:3px}.ok{color:var(--green)}.warn{color:var(--orange)}.err{color:var(--red)}
+.banner{padding:12px 14px;border-radius:11px;font-size:12px;line-height:1.5;margin-top:12px}.banner.info{background:#eef6fb;color:#365a76;border:1px solid #d2e6f2}.banner.ok{background:#eaf8f1;border:1px solid #c8eadb}.banner.warn{background:#fff7e8;border:1px solid #f0ddb0}.banner.err{background:#fff0f0;border:1px solid #efcaca}
+.chip{display:inline-block;padding:5px 8px;border-radius:999px;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.6px}.chip.pass{background:#eaf8f1;color:#116c49}.chip.review{background:#fff3df;color:#9b6417}.chip.block{background:#fff0f0;color:#9b3030}.chip.ocr{background:#eef6fb;color:#245f82}.chip.pending{background:#fff4df;color:#8a5a00}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}.tablewrap table{width:100%;border-collapse:collapse;font-size:11px}.tablewrap th{background:#f4f7fb;text-align:left;padding:9px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:1;white-space:nowrap}.tablewrap td{padding:8px 9px;border-bottom:1px solid #edf1f6;white-space:nowrap;vertical-align:top}.muted{color:var(--muted)}
+.sectionhead{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap;margin-bottom:12px}.sectionhead h2{margin:0}.sectionhead p{margin:4px 0 0;color:var(--muted);font-size:11px}
+.kpi-line{font-size:12px;color:#42566e;margin-top:10px}.kpi-line strong{color:#17324f}.progress{height:9px;border-radius:999px;background:#edf2f7;overflow:hidden;margin-top:10px}.progress > div{height:100%;width:0;background:linear-gradient(135deg,var(--blue),var(--blue2));transition:width .2s}
+pre{margin:0;padding:12px;background:#0b1727;color:#d8e6f2;border-radius:11px;white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.45;max-height:280px;overflow:auto}
+.roster-list{max-height:210px;overflow:auto;border:1px solid var(--line);border-radius:11px}.roster-list div{padding:7px 9px;border-bottom:1px solid #edf1f6;font-size:10px;display:flex;justify-content:space-between;gap:10px}.roster-list div:last-child{border-bottom:0}.roster-list b{font-size:10px}
+@media(max-width:1000px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header class="top"><div class="brand"><strong>Concepcion-Carrier | WorkSync</strong><small>WFM Schedule Ingestion A2</small></div><div class="scope">WFM ONLY · 3 BRANCHES · A2</div></header>
+<main class="wrap">
+  <div class="hero"><div><div class="eyebrow" style="font-size:10px;letter-spacing:1.8px;color:#1579aa;font-weight:900;margin-bottom:6px;">WFM · CONCEPCION CARRIER</div><h1>Schedule Ingestion</h1><p>Upload the scheduler file, validate it against the WorkSync roster, review exceptions, then export the ready schedule.</p></div><div class="hero-pill">WFM ONLY</div></div>
+  <div class="grid">
+    <section>
+      <div class="panel">
+        <h2>1 · Import Setup</h2>
+        <p class="note">Select the branch first. The parser is source-specific, while the output is always the same WorkSync canonical schedule structure.</p>
+        <div class="field"><label>Branch</label><select id="branch"><option value="CCAC CCAC">CCAC CCAC</option><option value="CCAC CMIP">CCAC CMIP</option><option value="CCAC CDI">CCAC CDI</option></select></div>
+        <div class="field"><label>Week Start</label><input id="weekStart" type="date" value="2026-10-05" /></div>
+        <div class="field"><label>Week End</label><input id="weekEnd" type="date" value="2026-10-11" /></div>
+        <div class="drop" id="drop">
+          <div class="upload-icon" style="width:34px;height:34px;border-radius:10px;background:#eaf6fc;color:#177daf;display:flex;align-items:center;justify-content:center;margin:0 auto 9px;font-weight:900;font-size:18px;">↑</div>
+          <h3>Upload scheduler file</h3>
+          <p>XLSX, XLS, CSV, PNG, JPG or JPEG</p>
+          <label class="filebtn" for="file" style="display:inline-flex;align-items:center;justify-content:center;min-width:180px;padding:10px 16px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;border:0;box-shadow:0 6px 16px rgba(17,155,215,.18)">Choose scheduler file</label>
+          <input id="file" type="file" accept=".xlsx,.xls,.csv,.png,.jpg,.jpeg" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none" />
+          <div class="file-meta" id="fileMeta">No file selected</div>
+        </div>
+        <div class="actions" style="margin-top:14px"><button id="process" class="primary" disabled>Process Source</button><button id="publishWorkSync" class="primary" disabled>Publish to WorkSync</button><button id="clear" class="secondary">Clear</button></div>
+      </div>
+    </section>
+    <section>
+      <div class="panel" id="statusPanel">
+        <div class="sectionhead"><div><h2>2 · Validation Summary</h2><p id="statusText">No source processed yet.</p></div><div id="overallChip"></div></div>
+        <div class="stats"><div class="stat"><div id="rowsN" class="n">—</div><div class="l">Rows Parsed</div></div><div class="stat"><div id="passN" class="n ok">—</div><div class="l">Ready</div></div><div class="stat"><div id="reviewN" class="n warn">—</div><div class="l">Review</div></div><div class="stat"><div id="blockN" class="n err">—</div><div class="l">Blocked</div></div></div>
+        <div id="summaryBanner"></div>
+      </div>
+      <div class="panel">
+        <div class="sectionhead"><div><h2>3 · Exception Queue</h2></div><div class="actions"><button id="download" class="secondary" disabled>Download Workbook</button></div></div>
+        <div class="tablewrap"><table id="issues"><thead><tr><th>Status</th><th>Employee ID</th><th>Name</th><th>Reason</th></tr></thead><tbody><tr><td colspan="4" class="muted">No validation results yet.</td></tr></tbody></table></div>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+const BRANCH_LOB={'CCAC CCAC':'CCAC','CCAC CMIP':'CMIP','CCAC CDI':'CDI'};
+const ROSTER=[];
+function addRoster(eid,name,branch,tl,active=true){ROSTER.push({employee_id:eid,name,branch,tl,active});}
+// Note: Roster hardcoded for sandbox testing. In production, this fetches from DB.
+const ccac=[['M156260','Kaye Smith Amante','Mari Jone Fernandez'],['M156262','Melisa Laurente','Mari Jone Fernandez'],['M153188','Norlyn Epelipsia','Mari Jone Fernandez'],['M158126','Nieva, Jeremiah','Mari Jone Fernandez'],['M151995','Donna Vic Alcantara','Mari Jone Fernandez'],['M153192','Mark Stephen Brillo','Janine Sirdoncillo'],['M152227','Nur Owen R. Viejon','Janine Sirdoncillo'],['M153178','Joanna Mae De Felipe','Mari Jone Fernandez'],['M153845','Edriana Martir','Mari Jone Fernandez'],['M151476','Reema Subhi M.M. Al Kurd','Janine Sirdoncillo'],['M156264','Cheska Lorraine Tallodar','Janine Sirdoncillo'],['M153180','Myla Pañada','Janine Sirdoncillo'],['M151994','Klaire Joyce Alamo','Mari Jone Fernandez'],['M151473','Nisha Olive Sulleza','Mari Jone Fernandez'],['M152005','Ma Junaliz Dela Cruz','Mari Jone Fernandez'],['M151993','Melanie Atadero','Mari Jone Fernandez'],['M152224','Carl Louie P. Consumo','Mari Jone Fernandez'],['M151768','Luis Narciso Buenaflor','Edelyn Acocon'],['M151763','Anna Patricia Tagonera','Edelyn Acocon'],['M152230','Flordeliza B. Ortiz','Edelyn Acocon'],['M156257','Diana Jane Atadero','Edelyn Acocon'],['M153850','Reymond Ramirez','Edelyn Acocon'],['M151474','Leoneline Faro','Edelyn Acocon'],['M151786','Ana Marie Labor','Edelyn Acocon'],['M152009','Micca Daliba','Edelyn Acocon'],['M153838','Winnie Rose Cacho','Edelyn Acocon'],['M153848','Aubrey Rose Ocampo','Edelyn Acocon'],['M158132','Lata, Marsael','Mari Jone Fernandez'],['M152004','Erica Jean Cortez','Edelyn Acocon'],['M153182','Ma Eleanor Rios','Edelyn Acocon'],['M153851','Jayson Taclima','Edelyn Acocon'],['M151475','Connie Lea Sion Tabilla','Edelyn Acocon'],['M152010','Jessica Almira','Janine Sirdoncillo'],['M158130','Chua, Juliene Kate','Mari Jone Fernandez'],['M159261','William Jr. Aragon','Janine Sirdoncillo'],['M159257','Sittie Ainah Ayonga','Janine Sirdoncillo'],['M159259','John Ezra Jusayan','Janine Sirdoncillo'],['M159253','Jonalyn Grace Legaste','Janine Sirdoncillo'],['M159251','Danica Romey','Janine Sirdoncillo'],['M159255','Maricel Trocho','Janine Sirdoncillo'],['M159249','Hannah Lance Nastine Visto','Janine Sirdoncillo'],['M156986','John Cyril Abajeto','Janine Sirdoncillo'],['M159760','Carmela O. Fulache','Concepcion Ko'],['M159764','Joyce Lyn B. Lingga','Concepcion Ko'],['M159778','Lady Claire Esco','Concepcion Ko'],['M159770','Ma. Charity F. Padin','Concepcion Ko'],['M159774','Nikka Marie H. Isiderio','Concepcion Ko'],['M159772','Petche Marie T. Amacio','Concepcion Ko'],['M159768','Shaine B. Hernalim','Concepcion Ko'],['M159776','Shella Mae Garotche','Concepcion Ko'],['M159762','Spencer Jay A. Maquiling','Concepcion Ko']];
+ccac.forEach(x=>addRoster(x[0],x[1],'CCAC',x[2]));
+[[ 'M131436','Haydee Kris Aguilar'],['M131462','Christian Gloria'],['M132418','Mary Joy Hernando'],['M151312','Edmark Raguindin'],['M151591','Karen Geaga'],['M153446','Ronalyn Corella'],['M149802','Annalyn Barrozo'],['M151310','John Paul Lachica'],['M150702','Beverly Granada'],['M154355','Nathaniel Bonavente'],['M127354','Anna Luiza Langgamin']].forEach(x=>addRoster(x[0],x[1],'CMIP','Jerry Serfajuan'));
+[[ 'M149796','John Paul Cabaltea'],['M127036','Giraldine Opigan'],['M153444','Camille Caande'],['M153442','Tarcila Cernero'],['M150700','Jhanine Cruz']].forEach(x=>addRoster(x[0],x[1],'CDI','Jerry Serfajuan'));
+const rosterById=new Map(ROSTER.map(r=>[r.employee_id,r]));
+const $=id=>document.getElementById(id);
+let currentFile=null,currentResult=null;
+function norm(s){return String(s??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ')}
+function eidFrom(s){const m=String(s??'').match(/M\d{5,7}/i);return m?m[0].toUpperCase():'';}
+function cleanName(s){return String(s??'').replace(/^M\d{5,7}\s*,\s*/i,'').replace(/^\s+|\s+$/g,'').replace(/\s+/g,' ').trim()}
+function rowStrings(row){return (row||[]).map(v=>String(v??'').trim())}
+function findHeaderRow(data,required){for(let i=0;i<Math.min(data.length,15);i++){const rs=rowStrings(data[i]);if(required.every(x=>rs.includes(x))) return i;}return -1;}
+function findCol(row,label){const rs=rowStrings(row);return rs.findIndex(x=>x===label)}
+function parseRowsForCCAC(data){
+  const header=findHeaderRow(data,['Agent Group','Agent Name']); if(header<0) throw new Error('Header not found');
+  const groupCol=findCol(data[header],'Agent Group'), nameCol=findCol(data[header],'Agent Name');
+  const dayCols=[3,4,5,6,7,8,9]; const blocks={}; for(let d=0;d<7;d++) blocks[d]=11+d*5;
+  const rows=[];
+  for(let i=header+1;i<data.length;i++){
+    const r=data[i]||[]; if(!r.some(v=>String(v??'').trim())) continue;
+    const raw=String(r[nameCol>=0?nameCol:2]??'').trim(); if(!raw) continue;
+    const eid=eidFrom(raw),name=cleanName(raw); if(!eid) continue;
+    const rec={employee_id:eid,agent_name:name,branch:'CCAC CCAC',lob:'CCAC',agent_group:String(r[groupCol>=0?groupCol:1]??'').trim(),days:[],source_row:i+1};
+    for(let d=0;d<7;d++){const base=blocks[d],day={shift:String(r[dayCols[d]]??'').trim()};['break1','lunch1','break2','lunch2','bop'].forEach((key,j)=>day[key]=String(r[base+j]??'').trim());rec.days.push(day);}
+    rows.push(rec);
+  }
+  return rows;
+}
+function parseRowsForMulti(data,selectedBranch){
+  const header=findHeaderRow(data,['Name']); if(header<0) throw new Error('Header not found');
+  const groupCol=findCol(data[header],'Agent Group'), nameCol=findCol(data[header],'Name');
+  const shiftStart=(nameCol>=0?nameCol:2)+1, dayCols=Array.from({length:7},(_,i)=>shiftStart+i);
+  const blocks={}; for(let d=0;d<7;d++) blocks[d]=11+d*4;
+  const out=[];
+  for(let i=header+1;i<data.length;i++){
+    const r=data[i]||[]; if(!r.some(v=>String(v??'').trim())) continue;
+    const raw=String(r[nameCol>=0?nameCol:2]??'').trim(); if(!raw) continue;
+    const eid=eidFrom(raw);
+    const rec={employee_id:eid,agent_name:cleanName(raw),branch:selectedBranch,lob:BRANCH_LOB[selectedBranch],agent_group:String(r[groupCol>=0?groupCol:1]??'').trim(),days:[],source_row:i+1};
+    for(let d=0;d<7;d++){const base=blocks[d],day={shift:String(r[dayCols[d]]??'').trim(),bop:''};['break1','lunch1','break2','lunch2'].forEach((key,j)=>day[key]=String(r[base+j]??'').trim());rec.days.push(day);}
+    out.push(rec);
+  }
+  return out;
+}
+function render(result,selectedBranch){
+  $('rowsN').textContent=result.recordsCount; $('passN').textContent=result.ready.length; $('reviewN').textContent=result.reviews.length; $('blockN').textContent=result.blocks.length;
+  $('summaryBanner').innerHTML=`<div class="banner info"><strong>Processed.</strong> ${result.ready.length} rows ready to publish.</div>`;
+  $('download').disabled=result.ready.length===0; $('publishWorkSync').disabled=result.ready.length===0;
+}
+async function process(){
+  if(!currentFile)return;
+  try{
+    $('process').disabled=true;
+    const buf=await currentFile.arrayBuffer(); const wb=XLSX.read(buf,{type:'array'});
+    const data=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:null});
+    const records=$('branch').value==='CCAC CCAC'?parseRowsForCCAC(data):parseRowsForMulti(data,$('branch').value);
+    currentResult={ready:records,reviews:[],blocks:[],recordsCount:records.length,fileName:currentFile.name};
+    render(currentResult,$('branch').value);
+  }catch(e){ alert(e.message); } finally { $('process').disabled=false; }
+}
+function buildPublishPackage(){ return {format:'WorkSync v1',roster:currentResult.ready,schedules:[],activities:[]}; }
+$('publishWorkSync').addEventListener('click',()=>{ const payload=buildPublishPackage(); window.parent.postMessage({type:'WORKSYNC_SCHEDULE_INGEST_READY_TO_PUBLISH',payload},'*'); });
+$('file').addEventListener('change',e=>{ currentFile=e.target.files[0]||null; $('fileMeta').textContent=currentFile?currentFile.name:'No file selected.'; $('process').disabled=!currentFile; });
+$('process').addEventListener('click',process);
+$('clear').addEventListener('click',()=>location.reload());
+</script>
+</body>
+</html>
