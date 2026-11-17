@@ -319,7 +319,37 @@
 
 
 <!-- Schedule Management visible surface: exact A2 Refined v5 WFM ingestion engine, isolated in an iframe to preserve its working UI/logic. -->
-<section id="scheduleEngineView" class="view">
+    <section id="scheduleView" class="view">
+      <div class="heading">
+        <div><h1>Schedule Management</h1><p>Choose how you want to work with the workforce schedule.</p></div>
+        <div class="pill">CCAC · WFM CONTROL CENTER</div>
+      </div>
+      <div class="sm-hub-grid">
+        <button id="openScheduleIngester" class="sm-hub-card" type="button">
+          <span class="sm-hub-icon">↥</span>
+          <span><strong>Schedule Ingester</strong><small>Upload, validate, preview, and publish the scheduler file.</small></span>
+          <span class="sm-hub-arrow">→</span>
+        </button>
+        <button id="openScheduleManager" class="sm-hub-card sm-hub-card-primary" type="button">
+          <span class="sm-hub-icon">▣</span>
+          <span><strong>View &amp; Manage Schedule</strong><small>Browse LOB → Team Leader → Agent → Week, then open a day to inspect the schedule.</small></span>
+          <span class="sm-hub-arrow">→</span>
+        </button>
+        <button id="openBreakDispersion" class="sm-hub-card" type="button">
+          <span class="sm-hub-icon">⟳</span>
+          <span><strong>Break dispersion</strong><small>CCAC · Check interval health (red / amber / green), training pull-outs, and who is left to cover calls.</small></span>
+          <span class="sm-hub-arrow">→</span>
+        </button>
+        <button id="openScheduleChanges" class="sm-hub-card" type="button">
+          <span class="sm-hub-icon">⇄</span>
+          <span><strong>Schedule Changes</strong><small>Make approved edits and swaps, and review the change log.</small></span>
+          <span class="sm-hub-arrow">→</span>
+        </button>
+      </div>
+      <div class="sm-note"><strong>Flow:</strong> Ingester flags consecutive/conflicting breaks → open <strong>Break dispersion</strong> to inspect SL risk by interval → adjust allocation. Coverage Briefs export the same health view for leadership.</div>
+    </section>
+    
+    <section id="scheduleEngineView" class="view">
   <iframe id="scheduleEngineFrame" class="schedule-engine-frame" title="WorkSync WFM Schedule Ingestion" src="schedule-engine.html"></iframe>
   <div id="legacyScheduleManagement" style="display:none !important">
 
