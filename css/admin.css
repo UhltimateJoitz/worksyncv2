@@ -107,5 +107,18 @@
 
 /* 8. Mobile */
 @media(max-width:960px){
+   /* Roster: Match V1 active status appearance */
+#currentRosterBadge.access-badge.linked {
+    display: inline-block;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: #142033;
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: normal;
+    text-transform: uppercase;
+}
   .settings-grid{grid-template-columns:1fr}
 }
