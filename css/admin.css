@@ -107,7 +107,9 @@
 
 /* 8. Mobile */
 @media(max-width:960px){
-   /* Roster: Match V1 active status appearance */
+    .settings-grid{grid-template-columns:1fr}
+}
+
 /* Roster status badges - V1 visual parity */
 .access-badge {
     display: inline-block;
