@@ -105,20 +105,14 @@
 .banner-btn.primary{background:#faf5ff;color:#581c87;border-color:#e9d5ff}
 .banner-btn.secondary{background:rgba(255,255,255,.15);color:#f5f3ff;border-color:rgba(255,255,255,.25)}
 
-/* 8. Mobile */
-@media(max-width:960px){
-    .settings-grid{grid-template-columns:1fr}
-}
-
-/* Roster status badges - V1 visual parity */
 .access-badge {
     display: inline-block;
-    padding: 5px 8px;
+    padding: 6px 11px;
     border-radius: 999px;
-    font-size: 9px;
+    font-size: 11px;
     font-weight: 900;
     text-transform: uppercase;
-    letter-spacing: .6px;
+    letter-spacing: .5px;
 }
 
 .access-badge.linked {
