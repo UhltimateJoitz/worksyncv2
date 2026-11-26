@@ -2239,7 +2239,7 @@ async function loadChangeLog(){
 function chgSetSwapFields(){
   $("chgBWrap").style.display = $("chgType").value==="SWAP" ? "" : "none";
 }
-document.getElementById("verintWorkspaceNav")?.addEventListener("click",()=>showView("verintWorkspace"));
+document.getElementById("verintWorkspaceNav")?.addEventListener("click",()=>showView("wfmCommandCenter"));
 function showView(name){
   const branch=effectiveBranch();
   // Administrative Roster is not a TL workspace. TLs use the read-only team snapshot.
@@ -7353,7 +7353,7 @@ $("btnResetRealRole")?.addEventListener("click", () => {
 $("settingsNav")?.addEventListener("click", () => showView("settings"));
 $("databaseSettingsNav")?.addEventListener("click", () => showView("settings"));
 $("openSettingsHome")?.addEventListener("click", () => showView("settings"));
-$("openCommandCenterHome")?.addEventListener("click", () => showView("verintWorkspace"));
+$("openCommandCenterHome")?.addEventListener("click", () => showView("wfmCommandCenter"));
 $("openBriefsHome")?.addEventListener("click", () => showView("briefsHub"));
 $("openBreakDispersionHome")?.addEventListener("click", () => showView("breakDispersion"));
 
