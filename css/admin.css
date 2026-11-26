@@ -105,14 +105,18 @@
 .banner-btn.primary{background:#faf5ff;color:#581c87;border-color:#e9d5ff}
 .banner-btn.secondary{background:rgba(255,255,255,.15);color:#f5f3ff;border-color:rgba(255,255,255,.25)}
 
+/* Roster status badges */
 .access-badge {
-    display: inline-block;
-    padding: 6px 11px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 7px 12px;
     border-radius: 999px;
-    font-size: 11px;
+    font-size: 12px;
+    line-height: 1;
     font-weight: 900;
     text-transform: uppercase;
-    letter-spacing: .5px;
+    letter-spacing: .4px;
 }
 
 .access-badge.linked {
