@@ -177,3 +177,32 @@ html{scroll-behavior:auto}
 .subcard{border:1px solid var(--line);border-radius:12px;padding:13px;background:#fbfcfe}
 .subcard strong{font-size:12px;display:block}
 .subcard span{font-size:11px;color:var(--muted)}
+
+
+/* WorkSync V2 - Home dashboard sidebar alignment */
+#appView > #homeView {
+    box-sizing: border-box;
+    max-width: none;
+    width: calc(100% - 196px);
+    margin: 0 0 0 196px;
+    padding: 96px 24px 32px;
+    min-height: 100vh;
+}
+
+/* Tablet */
+@media (max-width: 1000px) {
+    #appView > #homeView {
+        width: calc(100% - 174px);
+        margin-left: 174px;
+        padding: 92px 18px 28px;
+    }
+}
+
+/* Mobile */
+@media (max-width: 760px) {
+    #appView > #homeView {
+        width: calc(100% - 72px);
+        margin-left: 72px;
+        padding: 84px 12px 24px;
+    }
+}
