@@ -2716,6 +2716,7 @@ function effectiveBranch(){
   if(r==="wfm") return "wfm";
   return "admin";
 }
+  
 function applyRoleUI(){
   const branch=effectiveBranch();
   document.body.classList.toggle("agent-mode",branch==="agent");
@@ -2727,9 +2728,31 @@ function applyRoleUI(){
 $("homeHeading").textContent="WorkSync Home";
 $("homeSubheading").textContent="Concepcion Carrier workforce management and operations dashboard.";
 $("homePill").textContent="CCAC · WORKSPACE";
-showView("home");
+if (branch === "admin" || branch === "wfm") {
+  showView("wfmCommandCenter");
+} else if (branch === "agent") {
+  loadAgentHome();
+  showView("agentHome");
+} else if (branch === "tl") {
+  loadTLHome();
+  showView("tlHome");
+} else if (branch === "om") {
+  loadOMHome();
+  showView("omHome");
+} else {
+  showView("home");
 }
-$("homeNav").onclick=()=>showView("home");
+}
+  
+$("homeNav").onclick=()=>{
+  const branch=effectiveBranch();
+  if(branch==="admin" || branch==="wfm") showView("wfmCommandCenter");
+  else if(branch==="agent") showView("agentHome");
+  else if(branch==="tl") showView("tlHome");
+  else if(branch==="om") showView("omHome");
+  else showView("home");
+};
+  
 $("scheduleNav").onclick=()=>{showView("schedule");};
 $("openUpload").onclick=()=>showView("schedule");
 $("openScheduleIngester")?.addEventListener("click",()=>showView("scheduleEngine"));
@@ -4771,7 +4794,7 @@ async function wfmFetchBranch(branch){
   return {version,rows};
 }
 async function loadWFMCommandCenter(force=false){
-  if(effectiveBranch()!=="wfm")return;
+  if(!["admin","wfm"].includes(effectiveBranch()))return;
   const head=document.getElementById("wfmCommandCenterView"); if(!head)return;
   try{
     if(force || !wfmCommandState.loadedAt){
