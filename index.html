@@ -2724,23 +2724,12 @@ function applyRoleUI(){
   document.body.classList.toggle("om-mode",branch==="om");
   document.body.classList.toggle("wfm-mode",branch==="wfm");
   $("headerTitle").textContent=roleTitle(currentProfile?.role,currentProfile?.display_name);
-  if(branch==="wfm"){
-    $("homeHeading").textContent="WFM Home";
-    $("homeSubheading").textContent="Concepcion Carrier workforce management and schedule control center.";
-    $("homePill").textContent="CCAC · WFM";
-    showView("wfmCommandCenter");
-  }else if(branch==="admin"){
-    $("homeHeading").textContent="Admin Console & System Control";
-    $("homeSubheading").textContent="Concepcion Carrier administrative operations, database environment, and system control center.";
-    $("homePill").textContent="CCAC · ADMIN";
-    showView("home");
-  }
-  else if(branch==="agent"){loadAgentHome();showView("agentHome");}
-  else if(branch==="tl"){loadTLHome();showView("tlHome");}
-  else if(branch==="om"){loadOMHome();showView("omHome");}
-  else{showView("home");}
+$("homeHeading").textContent="WorkSync Home";
+$("homeSubheading").textContent="Concepcion Carrier workforce management and operations dashboard.";
+$("homePill").textContent="CCAC · WORKSPACE";
+showView("home");
 }
-$("homeNav").onclick=()=>showView(effectiveBranch()==="agent"?"agentHome":effectiveBranch()==="tl"?"tlHome":effectiveBranch()==="om"?"omHome":effectiveBranch()==="wfm"?"wfmCommandCenter":"home");
+$("homeNav").onclick=()=>showView("home");
 $("scheduleNav").onclick=()=>{showView("schedule");};
 $("openUpload").onclick=()=>showView("schedule");
 $("openScheduleIngester")?.addEventListener("click",()=>showView("scheduleEngine"));
