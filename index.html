@@ -862,248 +862,282 @@
 </section>
 
      <section id="settingsView" class="view">
-      <div class="heading">
-        <div>
-          <h1>Admin Settings & Database Environment</h1>
-          <p>Configure database connectivity (Supabase Production vs Neon Sandbox), manage system parameters, and simulate branch perspectives.</p>
-        </div>
-        <div class="pill" id="settingsActiveEnvBadge">PRODUCTION · SUPABASE</div>
-      </div>
+  <div class="heading settings-hub-heading">
+    <div>
+      <h1>Settings</h1>
+      <p>Manage WorkSync configuration, operational controls, and system health.</p>
+    </div>
+  </div>
 
-      <div class="card settings-card admin-card-only mb-4" style="margin-top: 20px; padding: 20px; border: 1px solid #ccc; border-radius: 8px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-          <h3 style="margin: 0; font-size: 1.1rem; font-weight: bold;">Database & Environment Diagnostics</h3>
-          <button class="btn btn-sm btn-outline" onclick="verifySettingsConnections()" style="padding: 6px 12px; cursor: pointer;">
+  <div id="settingsMenu" class="settings-menu-grid" aria-label="Settings categories">
+    <button type="button" class="settings-menu-card" data-settings-open="database" data-settings-admin-only="true" hidden>
+      <span class="settings-menu-icon" aria-hidden="true">▤</span>
+      <span class="settings-menu-copy"><strong>Database &amp; Environment</strong><span>Supabase Production, Neon Sandbox, environment controls, and connection diagnostics.</span></span>
+      <span class="settings-menu-arrow" aria-hidden="true">→</span>
+    </button>
+    <button type="button" class="settings-menu-card" data-settings-open="roles" data-settings-admin-only="true" hidden>
+      <span class="settings-menu-icon" aria-hidden="true">♙</span>
+      <span class="settings-menu-copy"><strong>Role &amp; Access Simulator</strong><span>Test Admin, WFM, Ops OM, Team Leader, and Agent perspectives.</span></span>
+      <span class="settings-menu-arrow" aria-hidden="true">→</span>
+    </button>
+    <button type="button" class="settings-menu-card" data-settings-open="operations">
+      <span class="settings-menu-icon" aria-hidden="true">☷</span>
+      <span class="settings-menu-copy"><strong>Operational Settings</strong><span>Break dispersion, roster publishing lock, auto-refresh, and interval granularity.</span></span>
+      <span class="settings-menu-arrow" aria-hidden="true">→</span>
+    </button>
+    <button type="button" class="settings-menu-card" data-settings-open="diagnostics">
+      <span class="settings-menu-icon" aria-hidden="true">⌁</span>
+      <span class="settings-menu-copy"><strong>System Diagnostics</strong><span>Account context, active environment, local storage, and system status.</span></span>
+      <span class="settings-menu-arrow" aria-hidden="true">→</span>
+    </button>
+  </div>
+
+  <section class="settings-panel" data-settings-panel-view="database" hidden>
+    <div class="settings-panel-head">
+      <div><h2>Database &amp; Environment</h2><p>Manage database destinations and verify connectivity. Admin access only.</p></div>
+      <span class="pill" id="settingsActiveEnvBadge">PRODUCTION · SUPABASE</span>
+    </div>
+    <button type="button" class="settings-back" data-settings-back>← Back to Settings</button>
+<div class="card settings-card mb-4" style="margin-top: 20px; padding: 20px; border: 1px solid #ccc; border-radius: 8px;">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+<h3 style="margin: 0; font-size: 1.1rem; font-weight: bold;">Database &amp; Environment Diagnostics</h3>
+<button class="btn btn-sm btn-outline" id="btnRunDbDiagnostics" style="padding: 6px 12px; cursor: pointer;">
             🔄 Run Diagnostics
           </button>
-        </div>
-        <p style="font-size: 0.9rem; color: #666; margin-bottom: 16px;">
+</div>
+<p style="font-size: 0.9rem; color: #666; margin-bottom: 16px;">
           Check the live latency and connection status of your Supabase Production database and Neon Sandbox instance.
         </p>
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
-          <!-- Supabase Card -->
-          <div style="padding: 12px; border: 1px solid #eee; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;">
-            <div>
-              <div style="font-weight: 500; font-size: 0.9rem;">Supabase Production</div>
-              <div id="connectionVerifyStatus" style="font-size: 0.75rem; color: #888;">Ready</div>
-            </div>
-            <div>
-              <span id="supaVerifyBadge" class="badge" style="padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; background: #ddd;">Checking...</span>
-            </div>
-          </div>
-          <!-- Neon / Sandbox Card -->
-          <div style="padding: 12px; border: 1px solid #eee; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;">
-            <div>
-              <div style="font-weight: 500; font-size: 0.9rem;">Neon Sandbox</div>
-              <div style="font-size: 0.75rem; color: #888;">Local Fixture / HTTP Endpoint</div>
-            </div>
-            <div>
-              <span id="neonVerifyBadge" class="badge" style="padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; background: #ddd;">Checking...</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Environment Switcher Hero Card -->
-      <div class="settings-hero-card">
-        <div class="settings-hero-main">
-          <div class="settings-hero-icon" id="settingsEnvIcon">⚡</div>
-          <div>
-            <div class="settings-hero-label">ACTIVE DATABASE DESTINATION</div>
-            <h2 id="settingsActiveEnvTitle">Supabase Production (Live DB)</h2>
-            <p id="settingsActiveEnvDesc">All schedule operations, roster records, and agent activities are interacting with the live production Supabase instance.</p>
-          </div>
-        </div>
-        <div class="settings-toggle-wrap">
-          <label class="settings-toggle-label">TOGGLE ENVIRONMENT</label>
-          <div class="segmented-control" id="envSegmentedControl">
-            <button type="button" class="seg-btn active" data-env="production" id="btnEnvProd">
-              <span class="seg-dot green"></span> Production (Supabase)
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+<!-- Supabase Card -->
+<div style="padding: 12px; border: 1px solid #eee; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;">
+<div>
+<div style="font-weight: 500; font-size: 0.9rem;">Supabase Production</div>
+<div id="connectionVerifyStatus" style="font-size: 0.75rem; color: #888;">Ready</div>
+</div>
+<div>
+<span class="badge" id="supaVerifyBadge" style="padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; background: #ddd;">Checking...</span>
+</div>
+</div>
+<!-- Neon / Sandbox Card -->
+<div style="padding: 12px; border: 1px solid #eee; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;">
+<div>
+<div style="font-weight: 500; font-size: 0.9rem;">Neon Sandbox</div>
+<div style="font-size: 0.75rem; color: #888;">Local Fixture / HTTP Endpoint</div>
+</div>
+<div>
+<span class="badge" id="neonVerifyBadge" style="padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; background: #ddd;">Checking...</span>
+</div>
+</div>
+</div>
+</div>
+<div class="settings-hero-card">
+<div class="settings-hero-main">
+<div class="settings-hero-icon" id="settingsEnvIcon">⚡</div>
+<div>
+<div class="settings-hero-label">ACTIVE DATABASE DESTINATION</div>
+<h2 id="settingsActiveEnvTitle">Supabase Production (Live DB)</h2>
+<p id="settingsActiveEnvDesc">All schedule operations, roster records, and agent activities are interacting with the live production Supabase instance.</p>
+</div>
+</div>
+<div class="settings-toggle-wrap">
+<label class="settings-toggle-label">TOGGLE ENVIRONMENT</label>
+<div class="segmented-control" id="envSegmentedControl">
+<button class="seg-btn active" data-env="production" id="btnEnvProd" type="button">
+<span class="seg-dot green"></span> Production (Supabase)
             </button>
-            <button type="button" class="seg-btn" data-env="sandbox" id="btnEnvSandbox">
-              <span class="seg-dot purple"></span> Sandbox (Neon DB)
+<button class="seg-btn" data-env="sandbox" id="btnEnvSandbox" type="button">
+<span class="seg-dot purple"></span> Sandbox (Neon DB)
             </button>
-          </div>
-          <span class="settings-quick-note">Instant client switch · Persists across reloads</span>
-        </div>
-      </div>
+</div>
+<span class="settings-quick-note">Instant client switch · Persists across reloads</span>
+</div>
+</div>
+<div class="settings-grid">
+<div class="access-card">
+<div class="access-card-head">
+<div>
+<h2>Production Database · Supabase</h2>
+<p>Main operational database storing official CCAC rosters and published schedules.</p>
+</div>
+<span class="access-pill linked" id="supabaseConnBadge">ONLINE · PRIMARY</span>
+</div>
+<div class="settings-card-body">
+<div class="field">
+<label>Supabase Project URL</label>
+<input autocomplete="off" id="cfgSupabaseUrl" spellcheck="false" type="text" value="https://zjlauzyixseebifyvvvz.supabase.co"/>
+</div>
+<div class="field">
+<label>Publishable Anon Key</label>
+<div class="input-with-action">
+<input autocomplete="off" id="cfgSupabaseKey" spellcheck="false" type="password" value="sb_publishable_cFJ4HQ5nSa3T5GDYJl56sw_OUpXHF7l"/>
+<button class="secondary mini-btn" id="btnToggleSupabaseKey" type="button">Show</button>
+</div>
+</div>
+<div class="settings-actions-row">
+<button class="secondary" id="btnTestSupabase" type="button">↻ Test Connection</button>
+<button class="secondary" id="btnResetSupabase" type="button">Reset Default</button>
+<span class="status-text muted" id="supabaseTestStatus">Connected to production</span>
+</div>
+</div>
+</div>
+<div class="access-card">
+<div class="access-card-head">
+<div>
+<h2>Sandbox Database · Neon DB</h2>
+<p>Isolated development database for testing new projects, algorithms, and features safely.</p>
+</div>
+<span class="access-pill unlinked" id="neonConnBadge">SANDBOX READY</span>
+</div>
+<div class="settings-card-body">
+<div class="banner info" style="margin-bottom:12px;font-size:11px;">
+<strong>Sandbox Isolation:</strong> When Sandbox is selected, operations read/write to the Neon sandbox environment. Even if cloud credentials are not yet configured, the built-in isolated CCAC sandbox store ensures seamless testing!
+            </div>
+<div class="field">
+<label>Neon PostgreSQL Connection String</label>
+<input autocomplete="off" id="cfgNeonDbUrl" placeholder="postgresql://user:pass@ep-cool-fog-123456.us-east-2.aws.neon.tech/neondb?sslmode=require" spellcheck="false" type="text"/>
+<span class="field-hint">Used for backend migration/routing. Format: postgresql://...neon.tech/neondb</span>
+</div>
+<div class="field">
+<label>Neon Serverless SQL / HTTP Endpoint URL</label>
+<input autocomplete="off" id="cfgNeonHttpEndpoint" placeholder="https://ep-cool-fog-123456.us-east-2.aws.neon.tech/sql" spellcheck="false" type="text"/>
+<span class="field-hint">Optional direct HTTP query endpoint for client-side sandbox operations.</span>
+</div>
+<div class="field">
+<label>Sandbox Adapter Execution Mode</label>
+<select id="cfgSandboxMode">
+<option value="auto">Automatic (Neon Cloud if configured, else Built-in Sandbox Store)</option>
+<option value="fixture">Built-in CCAC Sandbox Store (Offline / Safe Local Sandbox)</option>
+<option value="neon_http">Direct Neon Serverless HTTP API</option>
+<option value="edge_router">Supabase Edge Router (/functions/v1/break-dispersion-router)</option>
+</select>
+</div>
+<div class="settings-actions-row">
+<button class="secondary" id="btnTestNeon" type="button">↻ Test Neon Connection</button>
+<button class="primary" id="btnSaveDbConfig" type="button">Save Database Settings</button>
+<span class="status-text muted" id="neonTestStatus">Sandbox store initialized (50 agents, Sched v56)</span>
+</div>
+</div>
+</div>
+</div>
+  </section>
 
-      <div class="settings-grid">
-        <!-- Card 1: Production (Supabase) Configuration -->
-        <div class="access-card">
-          <div class="access-card-head">
-            <div>
-              <h2>Production Database · Supabase</h2>
-              <p>Main operational database storing official CCAC rosters and published schedules.</p>
-            </div>
-            <span class="access-pill linked" id="supabaseConnBadge">ONLINE · PRIMARY</span>
-          </div>
-          <div class="settings-card-body">
-            <div class="field">
-              <label>Supabase Project URL</label>
-              <input type="text" id="cfgSupabaseUrl" value="https://zjlauzyixseebifyvvvz.supabase.co" autocomplete="off" spellcheck="false">
-            </div>
-            <div class="field">
-              <label>Publishable Anon Key</label>
-              <div class="input-with-action">
-                <input type="password" id="cfgSupabaseKey" value="sb_publishable_cFJ4HQ5nSa3T5GDYJl56sw_OUpXHF7l" autocomplete="off" spellcheck="false">
-                <button type="button" class="secondary mini-btn" id="btnToggleSupabaseKey">Show</button>
-              </div>
-            </div>
-            <div class="settings-actions-row">
-              <button type="button" class="secondary" id="btnTestSupabase">↻ Test Connection</button>
-              <button type="button" class="secondary" id="btnResetSupabase">Reset Default</button>
-              <span id="supabaseTestStatus" class="status-text muted">Connected to production</span>
-            </div>
-          </div>
-        </div>
+  <section class="settings-panel" data-settings-panel-view="roles" hidden>
+    <div class="settings-panel-head"><div><h2>Role &amp; Access Simulator</h2><p>Test application perspectives without changing the authenticated account.</p></div></div>
+    <button type="button" class="settings-back" data-settings-back>← Back to Settings</button>
+<div class="access-card">
+<div class="access-card-head">
+<div>
+<h2>Role &amp; Branch Testing Simulator</h2>
+<p>Simulate any branch perspective instantly to test permissions, navigation, and user experience.</p>
+</div>
+<span class="access-pill linked" id="simRoleBadge">ADMIN PERSPECTIVE</span>
+</div>
+<div class="settings-card-body">
+<p style="font-size:12px;color:#53677f;margin-top:0;">Switch between application personas with a single click. This updates navigation and role permissions in-place without needing to re-login.</p>
+<div class="role-sim-buttons">
+<button class="role-btn active" data-branch="admin" type="button">⚙ Admin (Full + Settings)</button>
+<button class="role-btn" data-branch="wfm" type="button">▦ WFM (Command Center)</button>
+<button class="role-btn" data-branch="om" type="button">♟ Ops OM (Daily Staffing)</button>
+<button class="role-btn" data-branch="tl" type="button">♟ Team Leader (TL)</button>
+<button class="role-btn" data-branch="agent" type="button">▣ Agent (My Schedule)</button>
+</div>
+<div style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+<span class="muted" style="font-size:11px;">Current authenticated role: <strong id="realAuthRoleDisplay">admin</strong></span>
+<button class="secondary mini-btn" id="btnResetRealRole" type="button">Reset to Authenticated Profile</button>
+</div>
+</div>
+</div>
+  </section>
 
-        <!-- Card 2: Sandbox (Neon DB) Configuration -->
-        <div class="access-card">
-          <div class="access-card-head">
-            <div>
-              <h2>Sandbox Database · Neon DB</h2>
-              <p>Isolated development database for testing new projects, algorithms, and features safely.</p>
-            </div>
-            <span class="access-pill unlinked" id="neonConnBadge">SANDBOX READY</span>
-          </div>
-          <div class="settings-card-body">
-            <div class="banner info" style="margin-bottom:12px;font-size:11px;">
-              <strong>Sandbox Isolation:</strong> When Sandbox is selected, operations read/write to the Neon sandbox environment. Even if cloud credentials are not yet configured, the built-in isolated CCAC sandbox store ensures seamless testing!
-            </div>
-            <div class="field">
-              <label>Neon PostgreSQL Connection String</label>
-              <input type="text" id="cfgNeonDbUrl" placeholder="postgresql://user:pass@ep-cool-fog-123456.us-east-2.aws.neon.tech/neondb?sslmode=require" autocomplete="off" spellcheck="false">
-              <span class="field-hint">Used for backend migration/routing. Format: postgresql://...neon.tech/neondb</span>
-            </div>
-            <div class="field">
-              <label>Neon Serverless SQL / HTTP Endpoint URL</label>
-              <input type="text" id="cfgNeonHttpEndpoint" placeholder="https://ep-cool-fog-123456.us-east-2.aws.neon.tech/sql" autocomplete="off" spellcheck="false">
-              <span class="field-hint">Optional direct HTTP query endpoint for client-side sandbox operations.</span>
-            </div>
-            <div class="field">
-              <label>Sandbox Adapter Execution Mode</label>
-              <select id="cfgSandboxMode">
-                <option value="auto">Automatic (Neon Cloud if configured, else Built-in Sandbox Store)</option>
-                <option value="fixture">Built-in CCAC Sandbox Store (Offline / Safe Local Sandbox)</option>
-                <option value="neon_http">Direct Neon Serverless HTTP API</option>
-                <option value="edge_router">Supabase Edge Router (/functions/v1/break-dispersion-router)</option>
-              </select>
-            </div>
-            <div class="settings-actions-row">
-              <button type="button" class="secondary" id="btnTestNeon">↻ Test Neon Connection</button>
-              <button type="button" class="primary" id="btnSaveDbConfig">Save Database Settings</button>
-              <span id="neonTestStatus" class="status-text muted">Sandbox store initialized (50 agents, Sched v56)</span>
-            </div>
-          </div>
-        </div>
+  <section class="settings-panel" data-settings-panel-view="operations" hidden>
+    <div class="settings-panel-head"><div><h2>Operational Settings</h2><p>Configure the operational controls used across WorkSync.</p></div></div>
+    <button type="button" class="settings-back" data-settings-back>← Back to Settings</button>
+<div class="access-card">
+<div class="access-card-head">
+<div>
+<h2>Operational Settings &amp; Feature Flags</h2>
+<p>Global parameters governing workforce management algorithms and interface behaviors.</p>
+</div>
+<span class="access-pill linked">CCAC RULES</span>
+</div>
+<div class="settings-card-body">
+<div class="settings-toggle-list">
+<div class="toggle-item">
+<div>
+<strong>Break Dispersion Module</strong>
+<p>Enable the automated break and lunch dispersion optimization engine.</p>
+</div>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input checked="" id="cfgOptBreakDispersion" type="checkbox"/> Enabled</label>
+</div>
+<div class="toggle-item">
+<div>
+<strong>Master Roster Publishing Lock</strong>
+<p>Strictly restrict master roster publishing to Admin and WFM roles.</p>
+</div>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input checked="" id="cfgOptRosterLock" type="checkbox"/> Enforced</label>
+</div>
+<div class="toggle-item">
+<div>
+<strong>Command Center Live Auto-Refresh</strong>
+<p>Periodically refresh agent interval rosters and live attendance counters.</p>
+</div>
+<select id="cfgOptAutoRefresh" style="width:130px;height:34px;">
+<option value="0">Off (Manual)</option>
+<option value="30">Every 30s</option>
+<option selected="" value="60">Every 60s</option>
+<option value="300">Every 5m</option>
+</select>
+</div>
+<div class="toggle-item">
+<div>
+<strong>Intraday Interval Granularity</strong>
+<p>Interval slicing used across command center and schedules.</p>
+</div>
+<select id="cfgOptGranularity" style="width:130px;height:34px;">
+<option selected="" value="15">15-Minute</option>
+<option value="30">30-Minute</option>
+</select>
+</div>
+</div>
+<div style="margin-top:14px;">
+<button class="primary" id="btnSaveAppSettings" type="button">Save Operational Settings</button>
+</div>
+</div>
+</div>
+  </section>
 
-        <!-- Card 3: Role & Branch Simulator (Developer Testing Tool) -->
-        <div class="access-card">
-          <div class="access-card-head">
-            <div>
-              <h2>Role & Branch Testing Simulator</h2>
-              <p>Simulate any branch perspective instantly to test permissions, navigation, and user experience.</p>
-            </div>
-            <span class="access-pill linked" id="simRoleBadge">ADMIN PERSPECTIVE</span>
-          </div>
-          <div class="settings-card-body">
-            <p style="font-size:12px;color:#53677f;margin-top:0;">Switch between application personas with a single click. This updates navigation and role permissions in-place without needing to re-login.</p>
-            <div class="role-sim-buttons">
-              <button type="button" class="role-btn active" data-branch="admin">⚙ Admin (Full + Settings)</button>
-              <button type="button" class="role-btn" data-branch="wfm">▦ WFM (Command Center)</button>
-              <button type="button" class="role-btn" data-branch="om">♟ Ops OM (Daily Staffing)</button>
-              <button type="button" class="role-btn" data-branch="tl">♟ Team Leader (TL)</button>
-              <button type="button" class="role-btn" data-branch="agent">▣ Agent (My Schedule)</button>
-            </div>
-            <div style="margin-top:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-              <span class="muted" style="font-size:11px;">Current authenticated role: <strong id="realAuthRoleDisplay">admin</strong></span>
-              <button type="button" class="secondary mini-btn" id="btnResetRealRole">Reset to Authenticated Profile</button>
-            </div>
-          </div>
-        </div>
+  <section class="settings-panel" data-settings-panel-view="diagnostics" hidden>
+    <div class="settings-panel-head"><div><h2>System Diagnostics</h2><p>Review account, environment, browser storage, and system context.</p></div><span class="access-pill linked">STATUS</span></div>
+    <button type="button" class="settings-back" data-settings-back>← Back to Settings</button>
+    <p class="settings-readonly-note" data-settings-wfm-note hidden>WFM access is read-only. System maintenance and diagnostic export actions are restricted to Admin.</p>
+<div class="access-card" style="grid-column: 1 / -1;">
+<div class="access-card-head">
+<div>
+<h2>System Diagnostics &amp; Data Maintenance</h2>
+<p>Inspect active session tokens, local storage allocation, and maintenance actions.</p>
+</div>
+<span class="access-pill">SYSTEM STATUS</span>
+</div>
+<div class="settings-card-body">
+<div class="diag-grid">
+<div class="diag-item"><span>Current Account</span><strong id="diagUser">—</strong></div>
+<div class="diag-item"><span>Effective Branch</span><strong id="diagBranch">Admin</strong></div>
+<div class="diag-item"><span>Database Routing</span><strong id="diagDatabase">Production (Supabase)</strong></div>
+<div class="diag-item"><span>Local Storage Cache</span><strong id="diagStorage">0 KB</strong></div>
+<div class="diag-item"><span>Sandbox Modified Rows</span><strong id="diagSandboxChanges">0</strong></div>
+<div class="diag-item"><span>Manila Local Time</span><strong id="diagPhtTime">—</strong></div>
+</div>
+<div class="settings-actions-row" style="margin-top:16px;">
+<button class="secondary" data-settings-admin-only="true" id="btnExportDiagJson" type="button">⤓ Export Diagnostics JSON</button>
+<button class="secondary" data-settings-admin-only="true" id="btnResetSandboxData" type="button">Reset Sandbox Store to Fixtures</button>
+<button class="secondary" data-settings-admin-only="true" id="btnClearAllCache" type="button">Clear Local Cache &amp; Reload</button>
+</div>
+</div>
+</div>
+  </section>
+</section>
 
-        <!-- Card 4: Operations & Governance Settings -->
-        <div class="access-card">
-          <div class="access-card-head">
-            <div>
-              <h2>Operational Settings & Feature Flags</h2>
-              <p>Global parameters governing workforce management algorithms and interface behaviors.</p>
-            </div>
-            <span class="access-pill linked">CCAC RULES</span>
-          </div>
-          <div class="settings-card-body">
-            <div class="settings-toggle-list">
-              <div class="toggle-item">
-                <div>
-                  <strong>Break Dispersion Module</strong>
-                  <p>Enable the automated break and lunch dispersion optimization engine.</p>
-                </div>
-                <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="cfgOptBreakDispersion" checked> Enabled</label>
-              </div>
-              <div class="toggle-item">
-                <div>
-                  <strong>Master Roster Publishing Lock</strong>
-                  <p>Strictly restrict master roster publishing to Admin and WFM roles.</p>
-                </div>
-                <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="cfgOptRosterLock" checked> Enforced</label>
-              </div>
-              <div class="toggle-item">
-                <div>
-                  <strong>Command Center Live Auto-Refresh</strong>
-                  <p>Periodically refresh agent interval rosters and live attendance counters.</p>
-                </div>
-                <select id="cfgOptAutoRefresh" style="width:130px;height:34px;">
-                  <option value="0">Off (Manual)</option>
-                  <option value="30">Every 30s</option>
-                  <option value="60" selected>Every 60s</option>
-                  <option value="300">Every 5m</option>
-                </select>
-              </div>
-              <div class="toggle-item">
-                <div>
-                  <strong>Intraday Interval Granularity</strong>
-                  <p>Interval slicing used across command center and schedules.</p>
-                </div>
-                <select id="cfgOptGranularity" style="width:130px;height:34px;">
-                  <option value="15" selected>15-Minute</option>
-                  <option value="30">30-Minute</option>
-                </select>
-              </div>
-            </div>
-            <div style="margin-top:14px;">
-              <button type="button" class="primary" id="btnSaveAppSettings">Save Operational Settings</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Card 5: System Diagnostics & Maintenance -->
-        <div class="access-card" style="grid-column: 1 / -1;">
-          <div class="access-card-head">
-            <div>
-              <h2>System Diagnostics & Data Maintenance</h2>
-              <p>Inspect active session tokens, local storage allocation, and maintenance actions.</p>
-            </div>
-            <span class="access-pill">SYSTEM STATUS</span>
-          </div>
-          <div class="settings-card-body">
-            <div class="diag-grid">
-              <div class="diag-item"><span>Current Account</span><strong id="diagUser">—</strong></div>
-              <div class="diag-item"><span>Effective Branch</span><strong id="diagBranch">Admin</strong></div>
-              <div class="diag-item"><span>Database Routing</span><strong id="diagDatabase">Production (Supabase)</strong></div>
-              <div class="diag-item"><span>Local Storage Cache</span><strong id="diagStorage">0 KB</strong></div>
-              <div class="diag-item"><span>Sandbox Modified Rows</span><strong id="diagSandboxChanges">0</strong></div>
-              <div class="diag-item"><span>Manila Local Time</span><strong id="diagPhtTime">—</strong></div>
-            </div>
-            <div class="settings-actions-row" style="margin-top:16px;">
-              <button type="button" class="secondary" id="btnExportDiagJson">⤓ Export Diagnostics JSON</button>
-              <button type="button" class="secondary" id="btnResetSandboxData">Reset Sandbox Store to Fixtures</button>
-              <button type="button" class="secondary" id="btnClearAllCache">Clear Local Cache & Reload</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
     
     <section id="accessView" class="view">
       <div class="heading">
