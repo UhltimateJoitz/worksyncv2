@@ -860,6 +860,82 @@
           <div class="vsw-note">Data integrity note: the preview does not write to the roster, publish schedules, or alter database records. Before this becomes operational, each view must consume the authoritative published schedule and preserve Employee ID, main group, subgroup/channel, status, and site; unmatched branch/channel mappings must be flagged, not silently reassigned.</div>
         </section>
 </section>
+    <section id="accessView" class="view">
+      <div class="heading">
+        <div>
+          <h1>Access</h1>
+          <p>Cross-branch WFM access directory with TL/team selection and controlled View As entry points.</p>
+        </div>
+        <div class="pill">ALL BRANCHES · WFM</div>
+      </div>
+
+      <div class="access-wrap">
+        <div class="access-card">
+          <div class="access-card-head">
+            <div><h2>Monitoring Scope</h2><p>Filters cascade from branch → team leader → team → agent.</p></div>
+            <span class="access-pill linked">WFM SCOPE: ALL 3 BRANCHES</span>
+          </div>
+          <div class="access-toolbar" style="padding:14px 16px;">
+            <div class="field"><label>Branch / LOB</label><select id="accessBranch"><option value="ALL">All Branches</option><option value="CCAC">CCAC CCAC</option><option value="CMIP">CCAC CMIP</option><option value="CDI">CCAC CDI</option></select></div>
+            <div class="field"><label>Team Leader</label><select id="accessTL"><option value="ALL">All Team Leaders</option></select></div>
+            <div class="field"><label>Team / Group</label><select id="accessTeam"><option value="ALL">All Teams</option></select></div>
+            <div class="field"><label>Agent</label><select id="accessAgent"><option value="ALL">All Agents</option></select></div>
+            <div class="field"><label>Search</label><input id="accessSearch" placeholder="Search name or employee ID..."></div>
+            <button id="accessRefresh" class="secondary" type="button">↻ Refresh</button>
+          </div>
+        </div>
+
+        <div class="access-summary">
+          <div class="access-kpi"><span>Visible Employees</span><strong id="accessCountTotal">0</strong></div>
+          <div class="access-kpi"><span>TLs</span><strong id="accessCountTL">0</strong></div>
+          <div class="access-kpi"><span>Linked Accounts</span><strong id="accessCountLinked">0</strong></div>
+          <div class="access-kpi"><span>Branches</span><strong id="accessCountBranches">0</strong></div>
+        </div>
+
+        <div class="access-grid">
+          <section class="access-card">
+            <div class="access-card-head">
+              <div><h2>Access Directory</h2><p id="accessTableSummary">Loading workforce access records…</p></div>
+              <span class="access-pill" id="accessScopePill">ALL BRANCHES</span>
+            </div>
+            <div class="access-table-wrap">
+              <table class="access-table">
+                <thead><tr><th>Employee</th><th>Role</th><th>Branch</th><th>Team</th><th>Team Leader</th><th>Account</th><th>Monitor</th></tr></thead>
+                <tbody id="accessTableBody"><tr><td colspan="7"><div class="access-empty"><strong>Loading Access...</strong>Reading the master roster and linked profiles.</div></td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <aside class="access-card">
+            <div class="access-card-head"><div><h2>Monitoring</h2><p>WFM-only read-only monitoring context. Select a team or agent, then open the corresponding workspace in read-only WFM monitoring mode.</p></div><span class="access-pill">VIEW AS</span></div>
+            <div class="access-monitor" id="accessMonitorPanel">
+              <div class="access-empty"><strong>Select a TL or agent</strong>Use the directory's View Team / View As controls to establish a monitoring target.</div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- Alpha 9 Increment: WFM-controlled read-only target dashboard -->
+    <section id="accessEmulationView" class="view">
+      <div class="access-emulation-wrap">
+        <div class="access-emulation-head">
+          <div>
+            <div class="access-emulation-kicker">WFM MONITORING</div>
+            <h1 id="accessEmuTitle">Target Dashboard</h1>
+            <p id="accessEmuSubtitle">Read-only monitoring view.</p>
+          </div>
+          <div class="access-emulation-actions">
+            <span class="access-readonly-pill">READ ONLY · WFM</span>
+            <button id="accessEmuBack" class="access-back" type="button">← Back to Access</button>
+          </div>
+        </div>
+        <div id="accessEmuBody">
+          <div class="emu-empty"><strong>Loading dashboard…</strong></div>
+        </div>
+      </div>
+    </section>
+    
     <section id="requestsHubView" class="view">
       <div class="heading">
         <div><h1>Requests</h1><p id="lrHubSubtitle">Choose an action to continue.</p></div>
