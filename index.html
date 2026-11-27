@@ -247,6 +247,111 @@
       </div>
       <div class="sm-note"><strong>Flow:</strong> Ingester flags consecutive/conflicting breaks → open <strong>Break dispersion</strong> to inspect SL risk by interval → adjust allocation. Coverage Briefs export the same health view for leadership.</div>
     </section>
+
+    <section id="breakDispersionView" class="view">
+  <div class="heading">
+    <div><h1>Break dispersion</h1><p>Plan breaks so enough agents stay on the phone. Run the whole day once, then read the grid, the status quo, and the proposal.</p></div>
+    <div class="pill">SM · DISPERSION</div>
+  </div>
+  <div style="margin-bottom:12px"><button type="button" class="secondary" id="dispBackSm">← Schedule Management</button></div>
+
+  <div class="cov-toolbar" style="align-items:end">
+    <div class="field"><label>Date (PHT)</label><input type="date" id="dispDate"></div>
+    <div class="field"><label>Day from</label><input type="time" id="dispFrom" value="06:00"></div>
+    <div class="field"><label>Day to</label><input type="time" id="dispTo" value="22:00"></div>
+    <div class="field"><label>Current time <span class="muted" style="font-weight:400">(from PC clock)</span></label><input type="time" id="dispNow" step="60"></div>
+    <button type="button" class="secondary" id="dispNowPcBtn" title="Use this computer's clock">PC clock</button>
+    <button type="button" class="secondary" id="dispNowPhtBtn" title="Use the current time in Manila (PHT), which is the time zone the schedule is in">PHT now</button>
+    <div id="dispNowNote" class="muted" style="font-size:12px;flex-basis:100%"></div>
+    <div class="field"><label>Minimum on phone (optional)</label><input type="number" id="dispMinAvail" min="1" max="19" value="" placeholder="none" style="width:110px"></div>
+    <div class="field"><label>Voice agents</label><input type="number" id="dispVoiceTotal" min="1" max="200" value="19" style="width:90px"></div>
+    <div class="field"><label>Pulled for training</label><input type="number" id="dispManualOff" min="0" max="19" value="0" style="width:110px" title="Agents pulled for training or other, for the whole day"></div>
+    <button type="button" class="publish" id="runWholeDayBtn">Run whole day</button>
+    <button type="button" class="secondary" id="dispExportBtn" disabled>Export CSV</button>
+  </div>
+  <div class="sm-note" style="margin-top:10px"><strong>Legend:</strong> Scan first. Nothing is filtered or capped: every overlap, every back-to-back, and every slot with 2 or more agents off at once is listed below the grid. Minimum on phone is optional: without it, the engine still proposes a lower-clash staggered plan, while coverage is unrated. If set, the minimum is used for coverage-risk labels. <em>Pulled for training</em> removes that many agents from the phone for the whole day. Nothing is changed by running this.</div>
+  <div id="dispMsg" style="margin-top:10px"></div>
+
+  <div style="margin-top:18px">
+    <h3 style="margin:0 0 6px;font-size:16px">1 · Day grid (status quo)</h3>
+    <div class="cov-stat-row" id="dispStats" style="display:none">
+      <div class="cov-stat"><b id="dispStatGreen">0</b><span>Green intervals · set target</span></div>
+      <div class="cov-stat"><b id="dispStatAmber">0</b><span>Amber intervals · set target</span></div>
+      <div class="cov-stat"><b id="dispStatRed">0</b><span>Red intervals · set target</span></div>
+      <div class="cov-stat"><b id="dispStatTrain">0</b><span>Training / pull-out events</span></div>
+    </div>
+    <div id="dsMsg"></div>
+    <div id="dsSummary"></div>
+    <div class="cov-table-wrap" style="margin-top:8px">
+      <table class="cov-table">
+        <thead><tr><th>Time</th><th>CCAC</th></tr></thead>
+        <tbody id="dsGridBody"><tr><td colspan="2" class="muted">Set the day above, then press Run whole day.</td></tr></tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">Click any row to see who is off-phone in that slot.</div>
+    <div id="dsDrill"></div>
+  </div>
+
+  <div style="margin-top:18px"><div id="dsPairs"></div></div>
+
+  <div style="margin-top:18px">
+    <h3 style="margin:0 0 8px;font-size:16px">2 · Status quo against proposed</h3>
+    <div id="cmpBox"><div class="muted" style="font-size:13px">Run the whole day to compare.</div></div>
+  </div>
+
+  <div id="dispProposePanel" style="display:none;margin-top:18px">
+    <h3 style="margin:0 0 8px;font-size:16px">Proposed break dispersion</h3>
+    <p id="dispProposeSummary" style="margin:0 0 12px;font-size:12px;color:#53677c"></p>
+    <div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:0 0 10px">
+      <div class="field" style="min-width:240px;max-width:360px;flex:1"><label for="dispAgentSearch">Find an agent to refine</label><input id="dispAgentSearch" type="search" placeholder="Search name or employee ID"></div>
+      <button type="button" class="secondary" id="dispShowAllAgents">Show all agents</button>
+      <span class="muted" style="font-size:12px">Edit a single agent or the full table; recommendations remain the starting point.</span>
+    </div>
+    <div class="cov-table-wrap">
+      <table class="cov-table">
+        <thead><tr>
+          <th>Employee ID</th><th>Name</th><th>Shift</th><th>Break 1</th><th>Lunch 1</th><th>Break 2</th><th>Lunch 2</th><th>BOP</th>
+        </tr></thead>
+        <tbody id="dispProposeBody"></tbody>
+      </table>
+    </div>
+    <div id="dispEditValidation" style="margin-top:10px"></div>
+    <div class="lr-actions" style="margin-top:10px;justify-content:flex-start;gap:8px;flex-wrap:wrap">
+      <button type="button" class="secondary" id="dispValidateEdits">Validate edited plan</button>
+      <button type="button" class="secondary" id="dispResetEdits">Reset to recommendation</button>
+      <button type="button" class="secondary" id="dispProposeExport">Export formatted Excel</button>
+      <button type="button" id="dispExportEdited" disabled>Export validated bulk plan</button>
+      <button type="button" class="publish" id="dispApplyBtn" disabled>Apply to Schedule</button>
+      <span style="font-size:11px;color:#667a91">Edits stay in this preview. Use "Apply to Schedule" to write the validated plan to the live database.</span>
+    </div>
+  </div>
+
+  <details style="margin-top:18px;background:#fff;border:1px solid #e3ebf3;border-radius:12px;padding:12px 14px">
+    <summary style="cursor:pointer;font-weight:700;color:#1f3550">Full detail, row by row <span style="font-weight:400;color:#53677c">· click to open</span></summary>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 8px;font-size:12px;color:#53677c">
+      <span>Time order. Red and amber rows need attention.</span>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="dispShowAll" onchange="document.getElementById('dispTableWrap').classList.toggle('show-all',this.checked)"> Show all columns</label>
+    </div>
+    <div class="cov-table-wrap" id="dispTableWrap">
+      <table class="cov-table">
+        <thead><tr>
+          <th>Health</th><th>Time</th><th>Scheduled</th><th>Off-phone</th><th class="col-extra">Training</th><th>Available</th><th class="col-extra">Allocatable (×2)</th><th class="col-extra">SL outlook</th><th>Who is off</th>
+        </tr></thead>
+        <tbody id="dispBody"><tr><td colspan="9" class="muted">Run the whole day to fill this in.</td></tr></tbody>
+      </table>
+    </div>
+  </details>
+
+  <!-- Hidden controls kept so the existing logic still finds them -->
+  <div id="legacyDispControls" style="display:none">
+    <button type="button" id="dispRunBtn">Analyze day</button>
+    <button type="button" id="dispProposeBtn">Propose dispersion</button>
+    <input type="time" id="dsFrom" value="06:00"><input type="time" id="dsTo" value="22:00"><input type="time" id="dsInterval" value="13:00">
+    <input type="number" id="dsBorrow" value="0"><input type="checkbox" id="dsOnlyProblems">
+    <button type="button" id="dsRunBtn">Scan whole day</button>
+    <button type="button" id="dsDrillBtn">Drill down interval</button>
+  </div>
+</section>
     
     <section id="scheduleEngineView" class="view">
   <iframe id="scheduleEngineFrame" class="schedule-engine-frame" title="WorkSync WFM Schedule Ingestion" src="schedule-engine.html"></iframe>
