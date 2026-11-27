@@ -9040,6 +9040,7 @@ function activity(){const b=selectedBranch('vswBranch'),f=$('vswActivityFilter')
 function matrix(){const b=selectedBranch('vswWeekBranch'),people=[...new Map(scoped(b).map(r=>[r.id,r])).values()],g=$('vswWeekMatrix');g.style.gridTemplateColumns='minmax(170px,1.4fr) repeat(7,minmax(105px,1fr))';g.innerHTML='<div class="mh">Agent / Branch</div>'+weekDates.map(d=>'<div class="mh">'+esc(new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}))+'</div>').join('')+people.map(p=>'<div class="person">'+esc(p.name)+'<br><span>'+esc(p.id)+' · '+esc(p.branch)+'</span></div>'+weekDates.map(d=>{const r=rows.find(x=>x.id===p.id&&x.date===d);return '<div><div class="day" style="background:'+(r?(r.status==='WORKING'?'#dff4e8':r.status==='OFF'?'#e9edf1':'#e4efff'):'#f4f6f8')+'">'+esc(r?(r.status==='WORKING'?fmt(r.start)+'–'+fmt(r.end):r.status):'NO ROW')+'</div></div>'}).join('')).join('')||'<div class="vsw-empty">No published schedule rows in this scope.</div>'}
 function timeline(){const b=selectedBranch('vswTimelineBranch'),people=[...new Map(scoped(b).filter(x=>x.date===localDate()).map(r=>[r.id,r])).values()],hours=Array.from({length:24},(_,i)=>i),g=$('vswTimelineGrid');g.style.gridTemplateColumns='minmax(150px,1.4fr) repeat(24,minmax(30px,1fr))';g.innerHTML='<div class="th">Agent</div>'+hours.map(h=>'<div class="th">'+String(h).padStart(2,'0')+'</div>').join('')+people.map(p=>'<div class="name">'+esc(p.name)+'<br>'+esc(p.branch)+' · '+esc(p.id)+'</div>'+hours.map(h=>{const m=h*60,shift=timeMin(p.start),end=timeMin(p.end),act=(p.activities||[]).find(a=>{const a0=timeMin(a.start_time),a1=timeMin(a.end_time);return a0!=null&&a1!=null&&m<a1&&m+60>a0});let cls='';if(p.status==='WORKING'&&shift!=null&&end!=null&&m<end&&m+60>shift)cls='work';if(act){const k=kind(act.activity_type);cls=k.toLowerCase()}return '<div><div class="block '+cls+'" title="'+esc(act?.activity_type||p.status||'Not scheduled')+'"></div></div>'}).join('')).join('')||'<div class="vsw-empty">No published schedule rows for today. Use the multi-day matrix to inspect the published week.</div>'}
 function renderAll(){activity();matrix();timeline()}root.querySelectorAll('[data-vsw-tab]').forEach(btn=>btn.addEventListener('click',()=>{root.querySelectorAll('[data-vsw-tab]').forEach(x=>{x.classList.toggle('active',x===btn);x.setAttribute('aria-selected',String(x===btn));});root.querySelectorAll('[data-vsw-view]').forEach(v=>v.classList.toggle('active',v.dataset.vswView===btn.dataset.vswTab));}));['vswBranch','vswActivityFilter'].forEach(id=>$(id).addEventListener('change',activity));$('vswWeekBranch').addEventListener('change',matrix);$('vswTimelineBranch').addEventListener('change',timeline);const nav=$('verintWorkspaceNav');if(nav)nav.addEventListener('click',()=>load());load();})();</script>
+
 <script>
   /* WorkSync Settings hub navigation + role gates.
    Insert this whole block in a NEW <script> tag just before </body>, after all existing WorkSync scripts. */
@@ -9250,6 +9251,223 @@ function renderAll(){activity();matrix();timeline()}root.querySelectorAll('[data
 })();
 
 </script>
+<script>
+ /* WorkSync Settings hub navigation + role gates.
+   Insert this whole block in a NEW <script> tag just before </body>, after all existing WorkSync scripts. */
+(function initWorkSyncSettingsHub() {
+  const root = document.getElementById("settingsView");
+  if (!root) return;
 
+  const originalLoadSettingsView = loadSettingsView;
+  const originalShowView = showView;
+  let currentSettingsPanel = "menu";
+
+  // V2-only allowlist: full Settings access is granted by Supabase Auth user ID,
+  // without changing the shared profiles.role value used by WorkSync V1.
+  const SETTINGS_ADMIN_AUTH_USER_IDS = new Set([
+    "b73e346e-af30-47ef-9bcc-689d66f01e7e"
+  ]);
+
+  function settingsActualRole() {
+    return String(currentProfile?.role || "").trim().toLowerCase();
+  }
+
+  function settingsIsAdmin() {
+    // Use the real Supabase Auth identity, never the shared profile role or
+    // simulated/effective branch. This keeps the override local to WorkSync V2.
+    const authUserId = String(currentUser?.id || "").trim().toLowerCase();
+    return SETTINGS_ADMIN_AUTH_USER_IDS.has(authUserId);
+  }
+
+  function settingsCanOpen() {
+    return ["admin", "wfm"].includes(settingsActualRole());
+  }
+
+  function settingsApplyPermissions() {
+    const admin = settingsIsAdmin();
+    // Only the menu cards and diagnostic action buttons are toggled here.
+    // Panel visibility is controlled separately by settingsShowMenu/settingsOpenPanel.
+    root.querySelectorAll("[data-settings-admin-only]").forEach(el => {
+      el.hidden = !admin;
+    });
+    const wfmNote = root.querySelector("[data-settings-wfm-note]");
+    if (wfmNote) wfmNote.hidden = admin;
+  }
+
+  function settingsShowMenu() {
+    currentSettingsPanel = "menu";
+    const menu = document.getElementById("settingsMenu");
+    if (menu) menu.hidden = false;
+    root.querySelectorAll("[data-settings-panel-view]").forEach(panel => {
+      panel.hidden = true;
+    });
+    settingsApplyPermissions();
+  }
+
+  function settingsSyncRolePanel() {
+    const sim = sessionStorage.getItem("worksync.simulatedBranch") || "admin";
+    root.querySelectorAll(".role-btn").forEach(button => {
+      button.classList.toggle("active", button.dataset.branch === sim);
+    });
+    const badge = document.getElementById("simRoleBadge");
+    const roleLabel = document.getElementById("realAuthRoleDisplay");
+    if (badge) badge.textContent = sim.toUpperCase() + " PERSPECTIVE";
+    if (roleLabel) roleLabel.textContent = currentProfile?.role || "—";
+  }
+
+  function settingsRefreshReadOnlyDiagnostics() {
+    if (typeof WorkSyncDB !== "undefined" && WorkSyncDB) {
+      const db = document.getElementById("diagDatabase");
+      const changes = document.getElementById("diagSandboxChanges");
+      if (db) db.textContent = WorkSyncDB.getEnvironment() === "sandbox"
+        ? "Neon Sandbox / local adapter" : "Supabase Production";
+      if (changes) {
+        try { changes.textContent = WorkSyncDB.getSandboxStore().getMutationCount() + " customized tables"; }
+        catch (_) { changes.textContent = "Unavailable"; }
+      }
+    }
+    const user = document.getElementById("diagUser");
+    const branch = document.getElementById("diagBranch");
+    const storage = document.getElementById("diagStorage");
+    const time = document.getElementById("diagPhtTime");
+    if (user) user.textContent = currentUser?.email || "—";
+    if (branch) {
+      const roleForDisplay = settingsIsAdmin() && typeof effectiveBranch === "function" ? effectiveBranch() : settingsActualRole();
+      branch.textContent = roleForDisplay.toUpperCase() || "—";
+    }
+    if (storage) {
+      const bytes = new Blob([Object.values(localStorage).join("")]).size;
+      storage.textContent = (bytes / 1024).toFixed(1) + " KB";
+    }
+    if (time) time.textContent = new Date().toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" });
+  }
+
+  function settingsOpenPanel(name) {
+    if (!settingsCanOpen()) {
+      toast("Settings is available to Admin and WFM only.");
+      return;
+    }
+    if (["database", "roles"].includes(name) && !settingsIsAdmin()) {
+      toast("This Settings workspace is restricted to Admin.");
+      settingsShowMenu();
+      return;
+    }
+
+    const panel = root.querySelector(`[data-settings-panel-view="${name}"]`);
+    if (!panel) {
+      console.error("WorkSync Settings panel not found:", name);
+      toast("This Settings workspace is unavailable.");
+      return;
+    }
+
+    currentSettingsPanel = name;
+    const menu = document.getElementById("settingsMenu");
+    if (menu) menu.hidden = true;
+    root.querySelectorAll("[data-settings-panel-view]").forEach(p => {
+      p.hidden = p !== panel;
+    });
+    settingsApplyPermissions();
+
+    if (name === "database" && settingsIsAdmin()) {
+      // Load database values and test statuses only when Admin opens this workspace.
+      originalLoadSettingsView().catch(error => console.error("Settings database panel load failed", error));
+    } else if (name === "roles" && settingsIsAdmin()) {
+      settingsSyncRolePanel();
+    } else if (name === "diagnostics") {
+      settingsRefreshReadOnlyDiagnostics();
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // Menu card / Back button navigation.
+  root.addEventListener("click", event => {
+    const eventElement = event.target instanceof Element ? event.target : event.target?.parentElement;
+    const openButton = eventElement?.closest("[data-settings-open]");
+    if (openButton) {
+      event.preventDefault();
+      settingsOpenPanel(openButton.dataset.settingsOpen);
+      return;
+    }
+    const backButton = eventElement?.closest("[data-settings-back]");
+    if (backButton) {
+      event.preventDefault();
+      settingsShowMenu();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  });
+
+  // Block Admin-only controls before their existing target-level handlers can run.
+  const protectedSelectors = [
+    "#btnRunDbDiagnostics", "#btnEnvProd", "#btnEnvSandbox", "#btnTestSupabase",
+    "#btnTestNeon", "#btnSaveDbConfig", "#btnResetSupabase", ".role-btn",
+    "#btnResetRealRole", "#btnExportDiagJson", "#btnResetSandboxData",
+    "#btnClearAllCache", "#wsBannerSwitchToProd"
+  ].join(",");
+
+  document.addEventListener("click", event => {
+    if (settingsIsAdmin()) return;
+    const eventElement = event.target instanceof Element ? event.target : event.target?.parentElement;
+    const protectedButton = eventElement?.closest(protectedSelectors);
+    if (!protectedButton) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    toast("This action is restricted to Admin.");
+  }, true);
+
+  // Admin-only connection diagnostics button. The old inline handler pointed to a nested function.
+  document.getElementById("btnRunDbDiagnostics")?.addEventListener("click", async () => {
+    if (!settingsIsAdmin()) return;
+    const status = document.getElementById("connectionVerifyStatus");
+    const supaBadge = document.getElementById("supaVerifyBadge");
+    const neonBadge = document.getElementById("neonVerifyBadge");
+    if (status) status.textContent = "Pinging databases…";
+    try {
+      const [supa, neon] = await Promise.all([WorkSyncDB.testSupabase(), WorkSyncDB.testNeon()]);
+      const paint = (el, result) => {
+        if (!el) return;
+        el.textContent = result.ok
+          ? `Connected (${result.latency}ms)`
+          : `Failed: ${result.error || "Unknown error"}`;
+        el.style.background = result.ok ? "#22c55e" : "#ef4444";
+        el.style.color = "#fff";
+      };
+      paint(supaBadge, supa);
+      paint(neonBadge, neon);
+      if (status) status.textContent = "Diagnostics complete.";
+    } catch (error) {
+      if (status) status.textContent = `Diagnostics failed: ${error.message || error}`;
+    }
+  });
+
+  // Panel-aware replacement for the old all-in-one Settings loader.
+  loadSettingsView = async function (...args) {
+    if (!settingsCanOpen()) {
+      toast("Settings is available to Admin and WFM only.");
+      return;
+    }
+    if (settingsIsAdmin() && currentSettingsPanel === "database") {
+      return originalLoadSettingsView.apply(this, args);
+    }
+    if (currentSettingsPanel === "roles" && settingsIsAdmin()) settingsSyncRolePanel();
+    settingsRefreshReadOnlyDiagnostics();
+  };
+
+  // Route gate: WFM and Admin may open Settings; only Admin can open the two restricted panels.
+  showView = function (name, ...args) {
+    if (name === "settings" || name === "databaseSettings") {
+      if (!settingsCanOpen()) {
+        toast("Settings is available to Admin and WFM only.");
+        return;
+      }
+      settingsShowMenu();
+      name = "settings";
+    }
+    return originalShowView.call(this, name, ...args);
+  };
+
+  settingsApplyPermissions();
+})();
+ 
+</script>
 </body>
 </html>
