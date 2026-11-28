@@ -104,7 +104,7 @@
     <button class="admin-only" id="verintWorkspaceNav">▦ Command Center</button>
     <button class="roster-access" id="rosterNav">♙ Roster</button>
     <button class="admin-only" id="requestsNav">✎ Requests</button>
-    <button class="admin-only" id="accessNav">⌁ Access</button>
+    <button class="admin-only" id="accessNav">⌁ Access</button>    
     <button class="archive-only" id="archiveNav">▤ Attendance Archive</button>
     <button class="archive-only" id="scheduleChangesNav">⇄ Schedule Changes</button>
     <button class="admin-only settings-only" id="settingsNav">⚙ Settings</button>
@@ -3378,7 +3378,7 @@ async function accessOpenEmulation(target){
   }
 }
 async function loadAccess(force=false){
-  if(effectiveBranch()!=="wfm")return;
+  if(!["wfm","admin"].includes(effectiveBranch()))return;
   try{
     const {data:roster,error}=await sb.from("roster").select("employee_id,name,team_leader,lob,active,group_name,subgroup,site").eq("active",true).order("name");
     if(error)throw error;
@@ -3405,9 +3405,21 @@ $("accessAgent")?.addEventListener("change",e=>{accessState.scopeAgent=e.target.
 $("accessSearch")?.addEventListener("input",e=>{accessState.search=e.target.value;accessRender();});
 $("accessRefresh")?.addEventListener("click",async()=>{const b=$("accessRefresh");b.disabled=true;b.textContent="↻ Refreshing…";try{await loadAccess(true);}finally{b.disabled=false;b.textContent="↻ Refresh";}});
 $("requestsNav").onclick=()=>showView("requestsHub");
-$("accessNav").onclick=()=>{if(effectiveBranch()!=="wfm"){toast("Access is a WFM monitoring workspace.");return;}showView("access");};
+$("accessNav").onclick=()=>{
+  if(!["wfm","admin"].includes(effectiveBranch())){
+    toast("Access is available to Admin and WFM.");
+    return;
+  }
+  showView("access");
+};
 $("databaseSettingsNav")?.addEventListener("click",()=>{if(!["wfm","admin"].includes(effectiveBranch())){toast("Database Environment is restricted to WFM Admin.");return;}showView("databaseSettings");WorkSyncEnvironment.verify();});
-$("openAccessHome")?.addEventListener("click",()=>{if(effectiveBranch()!=="wfm"){toast("Access is a WFM monitoring workspace.");return;}showView("access");});
+$("openAccessHome")?.addEventListener("click",()=>{
+  if(!["wfm","admin"].includes(effectiveBranch())){
+    toast("Access is available to Admin and WFM.");
+    return;
+  }
+  showView("access");
+});
 $("accessEmuBack")?.addEventListener("click",()=>showView("access"));
 $("myScheduleNav").onclick=()=>showView("agentSchedule");$("agentRequestsNav").onclick=()=>showView("requestsHub");
 $("tlMyScheduleNav").onclick=()=>showView("agentSchedule");
