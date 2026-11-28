@@ -2836,13 +2836,23 @@ function chgSetSwapFields() {
 
   if (bWrap) bWrap.style.display = isEdit ? "none" : "";
 
-  ["A", "B"].forEach(side => {
-    const statusField = $(`chg${side}Status`)?.closest(".field");
-    const timesField = $(`chg${side}Start`)?.closest(".chg-times`);
+ ["A", "B"].forEach(function(side) {
+  var statusEl = document.getElementById("chg" + side + "Status");
+  var startEl = document.getElementById("chg" + side + "Start");
 
-    if (statusField) statusField.style.display = isEdit ? "" : "none";
-    if (timesField) timesField.style.display = isEdit ? "" : "none";
-  });
+  var statusField = statusEl ? statusEl.parentElement : null;
+  var timesField = startEl && startEl.parentElement
+    ? startEl.parentElement.parentElement
+    : null;
+
+  if (statusField) {
+    statusField.style.display = isEdit ? "" : "none";
+  }
+
+  if (timesField) {
+    timesField.style.display = isEdit ? "" : "none";
+  }
+});
 
   const dateA = $("chgADate");
   const dateB = $("chgBDate");
