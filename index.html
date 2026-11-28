@@ -555,7 +555,11 @@
       <div id="chgFormWrap">
         <div class="sm-note"><strong>Make a change (WFM).</strong> Enter the approval reference from the email, then preview before applying. The change updates the current published schedule and is logged.</div>
         <div class="chg-top">
-          <div class="field"><label>Type</label><select id="chgType"><option value="EDIT">Edit one shift</option><option value="SWAP">Swap two shifts</option></select></div>
+          <div class="field"><label>Type</label> <select id="chgType">
+  <option value="EDIT">Edit one shift</option>
+  <option value="SHIFT_SWAP">Same-day shift exchange</option>
+  <option value="OFFDAY_SWAP">Off-day exchange (two dates)</option>
+</select> </div>
           <div class="field" style="flex:2"><label>Approval ref (email subject, date, approver)</label><input id="chgRef" placeholder="e.g. Swap request · 20 Oct · approved by J. Par"></div>
           <div class="field" style="flex:2"><label>Reason</label><input id="chgReason" placeholder="Short reason"></div>
         </div>
@@ -2516,71 +2520,287 @@ function chgResolve(side){
     out.textContent = hits.length>1 ? "More than one match. Pick the exact entry from the list." : "No roster match. Pick a name from the list.";
   }
 }
-async function chgCurrent(eid,date){
-  const {data:vers}=await sb.from("schedule_versions").select("id").eq("status","published");
-  const ids=(vers||[]).map(v=>v.id);
-  if(!ids.length) return null;
-  const {data:rows}=await sb.from("schedules").select("schedule_status,shift_start,shift_end,schedule_version_id")
-    .eq("employee_id",eid).eq("schedule_date",date).in("schedule_version_id",ids).order("id",{ascending:false}).limit(1);
-  return (rows&&rows[0])||null;
+/* WorkSync V2 — Schedule Changes exchange modes
+   Replace the existing block from `async function chgCurrent(eid,date){`
+   through the closing brace of `async function chgApply(){`.
+   Keep the existing `loadChangeLog()` function immediately after this block.
+*/
+
+async function chgLoadPublishedRows(employeeIds, dates) {
+  const ids = [...new Set(employeeIds.map(x => String(x || "").trim()).filter(Boolean))];
+  const dayList = [...new Set(dates.map(x => String(x || "").slice(0, 10)).filter(Boolean))];
+  if (!ids.length || !dayList.length) throw new Error("Select both agents and all required dates.");
+
+  const dateFrom = [...dayList].sort()[0];
+  const dateTo = [...dayList].sort().at(-1);
+  const { data: versions, error: versionError } = await sb.from("schedule_versions")
+    .select("id,week_start,week_end,version_number,published_at,lob")
+    .eq("status", "published")
+    .eq("lob", "CCAC")
+    .lte("week_start", dateFrom)
+    .gte("week_end", dateTo)
+    .order("published_at", { ascending: false, nullsFirst: false })
+    .order("version_number", { ascending: false })
+    .limit(1);
+  if (versionError) throw versionError;
+  const version = versions?.[0];
+  if (!version) throw new Error("No single published CCAC schedule version covers the selected date(s).");
+
+  const { data: rows, error: rowsError } = await sb.from("schedules")
+    .select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id")
+    .eq("schedule_version_id", version.id)
+    .in("employee_id", ids)
+    .in("schedule_date", dayList);
+  if (rowsError) throw rowsError;
+
+  const rowMap = new Map((rows || []).map(r => [
+    `${String(r.employee_id).trim()}|${String(r.schedule_date).slice(0, 10)}`,
+    r
+  ]));
+  const missing = [];
+  ids.forEach(eid => dayList.forEach(date => {
+    if (!rowMap.has(`${eid}|${date}`)) missing.push(`${eid} on ${date}`);
+  }));
+  if (missing.length) throw new Error(`Published schedule row missing: ${missing.join("; ")}. Nothing can be previewed or applied.`);
+
+  const scheduleIds = rows.map(r => r.id);
+  let activities = [];
+  if (scheduleIds.length) {
+    const { data, error } = await sb.from("schedule_activities")
+      .select("schedule_id,activity_type,start_time,end_time")
+      .in("schedule_id", scheduleIds)
+      .order("start_time");
+    if (error) throw error;
+    activities = data || [];
+  }
+  return { version, rows: rows || [], rowMap, activities };
 }
-function chgReadSide(p){
-  const eid=($(`chg${p}Eid`)?.value||"").trim();
+
+async function chgCurrent(eid, date) {
+  // Keep Edit preview aligned with the existing apply_schedule_change RPC:
+  // inspect published versions newest-first and use the newest version that has this row.
+  const { data: versions, error: versionError } = await sb.from("schedule_versions")
+    .select("id,published_at")
+    .eq("status", "published")
+    .order("published_at", { ascending: false, nullsFirst: false });
+  if (versionError) throw versionError;
+  for (const version of (versions || [])) {
+    const { data: rows, error } = await sb.from("schedules")
+      .select("id,employee_id,schedule_date,schedule_status,shift_start,shift_end,schedule_version_id")
+      .eq("schedule_version_id", version.id)
+      .eq("employee_id", eid)
+      .eq("schedule_date", date)
+      .order("id", { ascending: false })
+      .limit(1);
+    if (error) throw error;
+    if (rows?.[0]) return rows[0];
+  }
+  return null;
+}
+
+function chgReadSide(p) {
+  const eid = ($(`chg${p}Eid`)?.value || "").trim();
   return {
-    employee_id:eid,
-    schedule_date:$(`chg${p}Date`)?.value||"",
-    schedule_status:$(`chg${p}Status`)?.value||"",
-    shift_start:$(`chg${p}Start`)?.value||null,
-    shift_end:$(`chg${p}End`)?.value||null
+    employee_id: eid,
+    schedule_date: $(`chg${p}Date`)?.value || "",
+    schedule_status: $(`chg${p}Status`)?.value || "",
+    shift_start: $(`chg${p}Start`)?.value || null,
+    shift_end: $(`chg${p}End`)?.value || null
   };
 }
-function chgValidate(){
-  const type=$("chgType").value;
-  const sides=[chgReadSide("A")].concat(type==="SWAP"?[chgReadSide("B")]:[]);
-  for(const x of sides){
-    if(!x.employee_id||!x.schedule_date) return "Pick each agent from the list and set a date.";
-    if(x.schedule_status==="WORKING" && (!x.shift_start||!x.shift_end)) return "WORKING needs a start and end time.";
+
+function chgValidate() {
+  const type = $("chgType")?.value || "EDIT";
+  const a = chgReadSide("A");
+  const b = chgReadSide("B");
+  if (!a.employee_id) return "Pick Agent A from the roster list.";
+  if (!a.schedule_date) return "Select the required date.";
+  if (type !== "EDIT" && !b.employee_id) return "Pick Agent B from the roster list.";
+  if (type !== "EDIT" && a.employee_id === b.employee_id) return "A schedule exchange requires two different agents.";
+  if (type === "EDIT" && a.schedule_status === "WORKING") {
+    if (!a.shift_start || !a.shift_end) return "WORKING needs a start and end time.";
+    if (a.shift_end <= a.shift_start) return "Shift end must be later than shift start.";
   }
-  if(!($("chgRef").value||"").trim()) return "Approval reference is required.";
-  if(!($("chgReason").value||"").trim()) return "Reason is required.";
-  if(type==="SWAP" && sides[0].employee_id===sides[1].employee_id) return "A swap needs two different agents.";
+  if (type === "SHIFT_SWAP" && a.schedule_date !== b.schedule_date) {
+    return "A same-day shift exchange requires the same date for both agents.";
+  }
+  if (type === "OFFDAY_SWAP") {
+    if (!b.schedule_date) return "Select the second date for the off-day exchange.";
+    if (a.schedule_date === b.schedule_date) return "An off-day exchange requires two different dates.";
+  }
+  if (!String($("chgRef")?.value || "").trim()) return "Approval reference is required.";
+  if (!String($("chgReason")?.value || "").trim()) return "Reason is required.";
   return "";
 }
-function chgSummaryLine(x,cur){
-  const now=x.schedule_status+(x.shift_start&&x.shift_end?" "+x.shift_start+"–"+x.shift_end:"");
-  const was=cur ? cur.schedule_status+(cur.shift_start&&cur.shift_end?" "+chgTime(cur.shift_start)+"–"+chgTime(cur.shift_end):"") : "no published row";
+
+function chgDisplayShift(row) {
+  if (!row) return "—";
+  const status = String(row.schedule_status || "—").toUpperCase();
+  if (status !== "WORKING") return status;
+  return `${status} ${chgTime(row.shift_start)}–${chgTime(row.shift_end)}`;
+}
+
+function chgPortableActivityCheck(activities) {
+  const allowed = new Set(["break 1", "lunch 1", "break 2", "lunch 2", "bop"]);
+  const unsupported = [...new Set((activities || [])
+    .map(a => String(a.activity_type || "").trim())
+    .filter(name => !allowed.has(name.toLowerCase())))];
+  if (unsupported.length) {
+    throw new Error(`Exchange blocked: these scheduled activities are not automatically transferable: ${unsupported.join(", ")}. Have WFM review them first.`);
+  }
+}
+
+async function chgBuildSwapPreview(type, a, b) {
+  const dateA = a.schedule_date;
+  const dateB = type === "SHIFT_SWAP" ? dateA : b.schedule_date;
+  const loaded = await chgLoadPublishedRows([a.employee_id, b.employee_id], [dateA, dateB]);
+  const get = (eid, date) => loaded.rowMap.get(`${eid}|${date}`);
+  const a1 = get(a.employee_id, dateA);
+  const b1 = get(b.employee_id, dateA);
+
+  if (type === "SHIFT_SWAP") {
+    if (String(a1.schedule_status).toUpperCase() !== "WORKING" || String(b1.schedule_status).toUpperCase() !== "WORKING") {
+      throw new Error("Same-day shift exchange requires both agents to be WORKING on the selected date.");
+    }
+    if (!a1.shift_start || !a1.shift_end || !b1.shift_start || !b1.shift_end) {
+      throw new Error("Both published WORKING rows must have valid shift start and end times.");
+    }
+    if (String(a1.shift_start).slice(0, 5) === String(b1.shift_start).slice(0, 5) &&
+        String(a1.shift_end).slice(0, 5) === String(b1.shift_end).slice(0, 5)) {
+      throw new Error("These agents already have identical shift times; there is nothing to exchange.");
+    }
+    const rowIds = new Set([a1.id, b1.id]);
+    const relevant = loaded.activities.filter(x => rowIds.has(x.schedule_id));
+    chgPortableActivityCheck(relevant);
+    const actsA = relevant.filter(x => x.schedule_id === a1.id).length;
+    const actsB = relevant.filter(x => x.schedule_id === b1.id).length;
+    const html = [
+      `<div><strong>${escapeHtml(a1.employee_id)}</strong> · ${escapeHtml(dateA)} — ${escapeHtml(chgDisplayShift(a1))} → <strong>${escapeHtml(chgDisplayShift({ ...a1, shift_start: b1.shift_start, shift_end: b1.shift_end }))}</strong> · ${actsA} activity record(s) move with the exchanged shift.</div>`,
+      `<div><strong>${escapeHtml(b1.employee_id)}</strong> · ${escapeHtml(dateA)} — ${escapeHtml(chgDisplayShift(b1))} → <strong>${escapeHtml(chgDisplayShift({ ...b1, shift_start: a1.shift_start, shift_end: a1.shift_end }))}</strong> · ${actsB} activity record(s) move with the exchanged shift.</div>`
+    ].join("");
+    return { mode: type, employeeA: a.employee_id, employeeB: b.employee_id, dateA, dateB, versionId: loaded.version.id, expectedRows: loaded.rows.map(r => ({ employee_id: r.employee_id, schedule_date: String(r.schedule_date).slice(0, 10), schedule_status: r.schedule_status, shift_start: r.shift_start, shift_end: r.shift_end })), activityCount: relevant.length, html };
+  }
+
+  const a2 = get(a.employee_id, dateB);
+  const b2 = get(b.employee_id, dateB);
+  const status = r => String(r.schedule_status || "").trim().toUpperCase();
+  const patternOne = status(a1) === "WORKING" && status(a2) === "OFF" &&
+                     status(b1) === "OFF" && status(b2) === "WORKING";
+  const patternTwo = status(a1) === "OFF" && status(a2) === "WORKING" &&
+                     status(b1) === "WORKING" && status(b2) === "OFF";
+  if (!patternOne && !patternTwo) {
+    throw new Error("Off-day exchange requires a reciprocal pattern across the two dates: one agent WORKING then OFF, and the other OFF then WORKING.");
+  }
+
+  const offRows = [a1, a2, b1, b2].filter(r => status(r) === "OFF");
+  const offIds = new Set(offRows.map(r => r.id));
+  const workingIds = new Set([a1, a2, b1, b2].filter(r => status(r) === "WORKING").map(r => r.id));
+  const relevant = loaded.activities.filter(x => [...offIds, ...workingIds].includes(x.schedule_id));
+  if (relevant.some(x => offIds.has(x.schedule_id))) {
+    throw new Error("Off-day exchange blocked: an OFF row already contains activity records. Review that schedule row first.");
+  }
+  chgPortableActivityCheck(relevant);
+  const html = [
+    `<div><strong>${escapeHtml(a1.employee_id)}</strong> · ${escapeHtml(dateA)} — ${escapeHtml(chgDisplayShift(a1))} → <strong>${escapeHtml(chgDisplayShift(b1))}</strong></div>`,
+    `<div><strong>${escapeHtml(b1.employee_id)}</strong> · ${escapeHtml(dateA)} — ${escapeHtml(chgDisplayShift(b1))} → <strong>${escapeHtml(chgDisplayShift(a1))}</strong></div>`,
+    `<div><strong>${escapeHtml(a2.employee_id)}</strong> · ${escapeHtml(dateB)} — ${escapeHtml(chgDisplayShift(a2))} → <strong>${escapeHtml(chgDisplayShift(b2))}</strong></div>`,
+    `<div><strong>${escapeHtml(b2.employee_id)}</strong> · ${escapeHtml(dateB)} — ${escapeHtml(chgDisplayShift(b2))} → <strong>${escapeHtml(chgDisplayShift(a2))}</strong></div>`,
+    `<div class="muted" style="margin-top:6px">${relevant.length} break/lunch/BOP record(s) will move with the working shifts. Both agents' WORKING/OFF patterns will exchange across the two dates.</div>`
+  ].join("");
+  return { mode: type, employeeA: a.employee_id, employeeB: b.employee_id, dateA, dateB, versionId: loaded.version.id, expectedRows: loaded.rows.map(r => ({ employee_id: r.employee_id, schedule_date: String(r.schedule_date).slice(0, 10), schedule_status: r.schedule_status, shift_start: r.shift_start, shift_end: r.shift_end })), activityCount: relevant.length, html };
+}
+
+function chgSummaryLine(x, cur) {
+  const now = x.schedule_status + (x.shift_start && x.shift_end ? " " + x.shift_start + "–" + x.shift_end : "");
+  const was = cur ? cur.schedule_status + (cur.shift_start && cur.shift_end ? " " + chgTime(cur.shift_start) + "–" + chgTime(cur.shift_end) : "") : "no published row";
   return `<div><strong>${escapeHtml(x.employee_id)}</strong> · ${escapeHtml(x.schedule_date)} — ${escapeHtml(was)} → <strong>${escapeHtml(now)}</strong></div>`;
 }
-async function chgPreview(){
-  const err=chgValidate();
-  if(err){ $("chgPreview").innerHTML='<div class="banner warn">'+escapeHtml(err)+'</div>'; return null; }
-  const type=$("chgType").value;
-  const sides=[chgReadSide("A")].concat(type==="SWAP"?[chgReadSide("B")]:[]);
-  const lines=[];
-  for(const x of sides){ lines.push(chgSummaryLine(x, await chgCurrent(x.employee_id,x.schedule_date))); }
-  $("chgPreview").innerHTML='<div class="chg-preview"><div style="font-weight:800;margin-bottom:6px">'+(type==="SWAP"?"Swap":"Edit")+' preview</div>'+lines.join("")+'<div class="muted" style="margin-top:8px;font-size:12px">Ref: '+escapeHtml($("chgRef").value.trim())+'</div></div>';
-  return sides;
+
+async function chgPreview() {
+  const err = chgValidate();
+  if (err) {
+    $("chgPreview").innerHTML = '<div class="banner warn">' + escapeHtml(err) + '</div>';
+    return null;
+  }
+  const type = $("chgType").value;
+  try {
+    if (type === "EDIT") {
+      const side = chgReadSide("A");
+      const current = await chgCurrent(side.employee_id, side.schedule_date);
+      if (!current) throw new Error(`No published schedule row for ${side.employee_id} on ${side.schedule_date}.`);
+      const html = `<div class="chg-preview"><div style="font-weight:800;margin-bottom:6px">Edit preview</div>${chgSummaryLine(side, current)}<div class="muted" style="margin-top:8px;font-size:12px">Ref: ${escapeHtml($("chgRef").value.trim())}</div></div>`;
+      $("chgPreview").innerHTML = html;
+      return { mode: "EDIT", sides: [side] };
+    }
+    const plan = await chgBuildSwapPreview(type, chgReadSide("A"), chgReadSide("B"));
+    $("chgPreview").innerHTML = `<div class="chg-preview"><div style="font-weight:800;margin-bottom:6px">${type === "SHIFT_SWAP" ? "Same-day shift exchange preview" : "Off-day exchange preview"}</div>${plan.html}<div class="muted" style="margin-top:8px;font-size:12px">Ref: ${escapeHtml($("chgRef").value.trim())}</div></div>`;
+    return plan;
+  } catch (error) {
+    console.error("Schedule change preview failed:", error);
+    $("chgPreview").innerHTML = '<div class="banner warn">Preview blocked: ' + escapeHtml(error.message || String(error)) + '</div>';
+    return null;
+  }
 }
-async function chgApply(){
-  const sides=await chgPreview();
-  if(!sides) return;
-  if(!confirm("Apply this change? It updates the published schedule and is logged.")) return;
-  const type=$("chgType").value;
-  const edits=sides.map(x=>({employee_id:x.employee_id,schedule_date:x.schedule_date,schedule_status:x.schedule_status,shift_start:x.shift_start,shift_end:x.shift_end}));
-  $("chgApplyBtn").disabled=true;
-  try{
-    const {data,error}=await sb.rpc("apply_schedule_change",{p_change_type:type,p_approval_ref:$("chgRef").value.trim(),p_reason:$("chgReason").value.trim(),p_edits:edits});
-    if(error) throw error;
-    const brk=data?.break_lunch_activities_on_changed_rows||0;
-    $("chgResult").innerHTML='<div class="banner ok"><strong>Saved.</strong> '+escapeHtml(String(data?.rows_changed||0))+' row(s) changed and logged.'+
-      (brk?' <strong>'+brk+' break/lunch activit'+(brk===1?'y':'ies')+' on these rows need checking</strong> (they do not move automatically).':'')+'</div>';
-    $("chgPreview").innerHTML="";
-    loadChangeLog();
-  }catch(err){
-    console.error("Schedule change failed:",err);
-    $("chgResult").innerHTML='<div class="banner err">Not saved: '+escapeHtml(err.message||String(err))+'</div>';
-  }finally{ $("chgApplyBtn").disabled=false; }
+
+async function chgApply() {
+  const plan = await chgPreview();
+  if (!plan) return;
+  const type = $("chgType").value;
+  const confirmation = type === "EDIT"
+    ? "Apply this approved schedule edit? The published schedule and change log will be updated."
+    : `Apply this ${type === "SHIFT_SWAP" ? "same-day shift exchange" : "two-date off-day exchange"}? The affected shift activities, published schedule rows, audit log, and notifications will be updated together.`;
+  if (!confirm(confirmation)) return;
+
+  const button = $("chgApplyBtn");
+  button.disabled = true;
+  try {
+    let data;
+    if (type === "EDIT") {
+      const side = plan.sides[0];
+      const result = await sb.rpc("apply_schedule_change", {
+        p_change_type: "EDIT",
+        p_approval_ref: $("chgRef").value.trim(),
+        p_reason: $("chgReason").value.trim(),
+        p_edits: [{
+          employee_id: side.employee_id,
+          schedule_date: side.schedule_date,
+          schedule_status: side.schedule_status,
+          shift_start: side.shift_start,
+          shift_end: side.shift_end
+        }]
+      });
+      if (result.error) throw result.error;
+      data = result.data;
+    } else {
+      const result = await sb.rpc("apply_schedule_swap", {
+        p_swap_type: type,
+        p_employee_a: plan.employeeA,
+        p_employee_b: plan.employeeB,
+        p_date_a: plan.dateA,
+        p_date_b: plan.dateB,
+        p_expected_version_id: plan.versionId,
+        p_expected_rows: plan.expectedRows,
+        p_approval_ref: $("chgRef").value.trim(),
+        p_reason: $("chgReason").value.trim()
+      });
+      if (result.error) throw result.error;
+      data = result.data;
+    }
+
+    $("chgResult").innerHTML = '<div class="banner ok"><strong>Saved.</strong> ' +
+      escapeHtml(String(data?.rows_changed || 0)) + ' schedule row(s) changed and logged.' +
+      (data?.activities_transferred ? ' ' + escapeHtml(String(data.activities_transferred)) + ' break/lunch/BOP record(s) moved with the shifts.' : '') +
+      '</div>';
+    $("chgPreview").innerHTML = "";
+    await loadChangeLog();
+  } catch (error) {
+    console.error("Schedule change failed:", error);
+    $("chgResult").innerHTML = '<div class="banner err">Not saved: ' + escapeHtml(error.message || String(error)) + '</div>';
+  } finally {
+    button.disabled = false;
+  }
 }
+
 async function loadChangeLog(){
   const body=$("chgLogBody"); if(!body) return;
   const from=($("chgFrom")?.value||"").slice(0,10), to=($("chgTo")?.value||"").slice(0,10);
@@ -2607,13 +2827,63 @@ async function loadChangeLog(){
     </tr>`;
   }).join("");
 }
-function chgSetSwapFields(){
-  $("chgBWrap").style.display = $("chgType").value==="SWAP" ? "" : "none";
+function chgSetSwapFields() {
+  const type = $("chgType")?.value || "EDIT";
+  const isEdit = type === "EDIT";
+  const isShiftSwap = type === "SHIFT_SWAP";
+  const isOffdaySwap = type === "OFFDAY_SWAP";
+  const bWrap = $("chgBWrap");
+
+  if (bWrap) bWrap.style.display = isEdit ? "none" : "";
+
+  ["A", "B"].forEach(side => {
+    const statusField = $(`chg${side}Status`)?.closest(".field");
+    const timesField = $(`chg${side}Start`)?.closest(".chg-times`);
+
+    if (statusField) statusField.style.display = isEdit ? "" : "none";
+    if (timesField) timesField.style.display = isEdit ? "" : "none";
+  });
+
+  const dateA = $("chgADate");
+  const dateB = $("chgBDate");
+  const labelA = dateA?.closest(".field")?.querySelector("label");
+  const labelB = dateB?.closest(".field")?.querySelector("label");
+
+  if (dateA && !dateA.dataset.swapSyncBound) {
+    dateA.addEventListener("change", () => {
+      if ($("chgType")?.value === "SHIFT_SWAP" && dateB) {
+        dateB.value = dateA.value;
+      }
+    });
+    dateA.dataset.swapSyncBound = "1";
+  }
+
+  if (dateB) {
+    dateB.disabled = isShiftSwap;
+    if (isShiftSwap && dateA) dateB.value = dateA.value;
+  }
+
+  if (labelA) {
+    labelA.textContent = isShiftSwap ? "Exchange date" : isOffdaySwap ? "Date 1" : "Date";
+  }
+  if (labelB) {
+    labelB.textContent = isShiftSwap ? "Same date" : "Date 2";
+  }
+
+  const note = $("chgFormWrap")?.querySelector(".sm-note");
+
+  if (note) {
+    if (isShiftSwap) {
+      note.innerHTML = '<strong>Same-day shift exchange (WFM).</strong> Choose two agents who are both WORKING on the same date. WorkSync exchanges their shift times and moves their Break 1, Lunch 1, Break 2, Lunch 2, and BOP records with the shifts. Special activities block the exchange for manual review.';
+    } else if (isOffdaySwap) {
+      note.innerHTML = '<strong>Off-day exchange (WFM).</strong> Choose two agents and two dates. Their published pattern must be reciprocal: one WORKING then OFF, the other OFF then WORKING. WorkSync exchanges both dates and moves compatible break/lunch/BOP records with the working shifts. Special activities block the exchange for manual review.';
+    } else {
+      note.innerHTML = '<strong>Make a change (WFM).</strong> Enter the approval reference from the email, then preview before applying. The change updates the current published schedule and is logged.';
+    }
+  }
 }
-document.getElementById("verintWorkspaceNav")?.addEventListener(
-  "click",
-  () => showView("verintWorkspace")
-);
+
+chgSetSwapFields();
   function showView(name) {
     const branch=effectiveBranch();
   // Administrative Roster is not a TL workspace. TLs use the read-only team snapshot.
