@@ -199,7 +199,93 @@
   </section>
 
   <main class="wrap">
-     
+
+<!-- Weekly schedule browser / day detail surface -->
+<section id="scheduleManageView" class="view">
+  <div class="heading">
+    <div>
+      <h1>View &amp; Manage Schedule</h1>
+      <p id="smBreadcrumb">Schedule Management › View &amp; Manage Schedule</p>
+    </div>
+    <div class="pill">WFM · SCHEDULE VIEW</div>
+  </div>
+
+  <div class="sm-toolbar">
+    <div class="field">
+      <label>Branch / LOB</label>
+      <select id="smLob">
+        <option value="CCAC">CCAC</option>
+        <option value="CMIP">CMIP</option>
+        <option value="CDI">CDI</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Team Leader</label>
+      <select id="smTl"><option value="">Loading…</option></select>
+    </div>
+    <button id="smPrevWeek" class="secondary sm-week-btn" type="button">‹</button>
+    <div class="sm-week-box">
+      <span>Workforce Week</span>
+      <strong id="smWeekLabel">—</strong>
+    </div>
+    <button id="smNextWeek" class="secondary sm-week-btn" type="button">›</button>
+    <button id="smTodayWeek" class="secondary" type="button">Current Week</button>
+    <div class="sm-search">
+      <input id="smSearch" placeholder="Search agent name or employee ID…">
+    </div>
+    <button id="smRefresh" class="secondary" type="button">↻</button>
+  </div>
+
+  <div class="sm-layout">
+    <section class="agent-card sm-week-card">
+      <div class="sm-section-head">
+        <div>
+          <h2 id="smTeamTitle">Team Schedule</h2>
+          <p id="smTeamMeta">—</p>
+        </div>
+        <span id="smVersionBadge" class="access-badge linked">LOADING</span>
+      </div>
+      <div class="tablewrap sm-week-table-wrap">
+        <table class="sm-week-table">
+          <thead>
+            <tr>
+              <th>Agent</th>
+              <th>Mon</th><th>Tue</th><th>Wed</th>
+              <th>Thu</th><th>Fri</th><th>Sat</th><th>Sun</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="smWeekBody"></tbody>
+        </table>
+      </div>
+      <div class="sm-legend">
+        <span><i class="sm-dot duty"></i>ON DUTY</span>
+        <span><i class="sm-dot ml"></i>ML</span>
+        <span><i class="sm-dot sl"></i>SL</span>
+        <span><i class="sm-dot off"></i>OFF</span>
+        <span><i class="sm-dot blank"></i>Not published</span>
+      </div>
+    </section>
+
+    <aside class="agent-card sm-day-card">
+      <div class="sm-day-head">
+        <div>
+          <div class="eyebrow">Selected Agent</div>
+          <h2 id="smAgentName">Select an agent</h2>
+          <p id="smAgentMeta">—</p>
+        </div>
+        <button id="smCloseDay" class="secondary" type="button">×</button>
+      </div>
+      <div class="sm-mini-week" id="smMiniWeek"></div>
+      <div id="smDayDetails" class="sm-day-details">
+        <div class="agent-empty">
+          <strong>Select an agent.</strong>
+          Choose “View” from the weekly schedule to inspect a specific day.
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
 <div id="smEditModal" class="sm-modal hidden" aria-hidden="true">
   <div class="sm-modal-backdrop"></div>
   <section class="sm-modal-card" role="dialog" aria-modal="true" aria-labelledby="smEditTitle">
