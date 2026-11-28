@@ -580,6 +580,41 @@
           </table>
         </div>
         <div class="roster-note"><strong>Important:</strong> This master roster is the authoritative Employee → Team Leader mapping across the three Concepcion Carrier branches. Changing Team Leader assignments is scoped to the selected branch record and does not alter login access. CIT Channel is a permanent Voice/Digital assignment until changed by an authorized user; new schedule publications snapshot that allocation so older published schedules are not silently reclassified. Roster membership is independent of login access, so an employee can be visible to their TL/OM even without a WorkSync account.</div>
+      <div class="panel" id="inactiveRosterPanel" style="margin-top:20px">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div>
+      <h2 style="margin:0 0 5px">Inactive Roster</h2>
+      <p style="margin:0;color:var(--muted);font-size:12px">
+        Employees who are inactive or have been marked as attrited.
+        Historical records are preserved.
+      </p>
+    </div>
+    <span class="access-badge" id="rosterInactiveCount">0 inactive</span>
+  </div>
+
+  <div class="tablewrap roster-table" style="margin-top:14px">
+    <table>
+      <thead>
+        <tr>
+          <th>Employee</th>
+          <th>Employee ID</th>
+          <th>Branch</th>
+          <th>Group</th>
+          <th>Subgroup</th>
+          <th>Team Leader</th>
+          <th>Channel</th>
+        </tr>
+      </thead>
+      <tbody id="rosterInactiveBody">
+        <tr>
+          <td colspan="7" style="text-align:center;color:var(--muted);padding:20px">
+            Inactive employees will appear here.
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
       </section>
     </section>
     
@@ -4362,6 +4397,7 @@ async function loadOMHome(targetDateOverride){
 
 let rosterAdminRows=[];
 let rosterTLs=[];
+let rosterAdminInactiveRows=[];
 let rosterAdminAllRows=[];
 
 function refreshRosterTLFilter(){
@@ -4487,22 +4523,56 @@ async function loadRosterAdmin(){
     return;
   }
   const activeRows=(allRoster||[]).filter(x=>x.active===true && allowedBranches.includes(branchKeyFromLabel(x.lob)));
-  const ids=activeRows.map(x=>x.employee_id).filter(Boolean);
+rosterAdminInactiveRows=(allRoster||[]).filter(x=>x.active===false && allowedBranches.includes(branchKeyFromLabel(x.lob)));
+const ids=activeRows.map(x=>x.employee_id).filter(Boolean);
   const {data:profiles,error:profileError}=ids.length ? await sb.from("profiles").select("employee_id").in("employee_id",ids) : {data:[],error:null};
   if(profileError) console.warn("Profile linkage lookup failed:",profileError);
   const linked=new Set((profiles||[]).map(x=>x.employee_id).filter(Boolean));
   rosterAdminAllRows=activeRows.map(x=>({...x,has_profile:linked.has(x.employee_id)}));
 
   refreshRosterTLFilter();
-  updateRosterKpis();renderRosterAdmin();
+ updateRosterKpis();
+renderRosterAdmin();
+renderInactiveRosterAdmin();
   const branchRows=rosterAdminAllRows.filter(x=>branchKeyFromLabel(x.lob)===branch);
   const inactiveCount=(allRoster||[]).filter(x=>x.active!==true && branchKeyFromLabel(x.lob)===branch).length;
   $("currentRosterSummary").textContent = branchRows.length ? `${branchRows.length} active ${branchLabel(branch)} employees are currently in the master roster.` : `No active ${branchLabel(branch)} roster records were returned.`;
   $("currentRosterBadge").textContent = branchRows.length ? "ACTIVE" : "EMPTY";
   $("currentRosterBadge").className = `access-badge ${branchRows.length ? "linked" : "none"}`;
   $("currentRosterMeta").textContent = branchRows.length
+    
     ? `Authoritative Employee → Team Leader mapping loaded from Supabase. ${branchRows.length} active employees · ${rosterTLs.length} Team Leaders in this branch · ${branchRows.filter(x=>!x.team_leader).length} need TL mapping · ${inactiveCount} inactive/historical records preserved.`
     : `The ${branchLabel(branch)} roster is currently empty. ${inactiveCount} inactive/historical records were found.`;
+}
+  function renderInactiveRosterAdmin(){
+  const branch=branchKeyFromLabel($("rosterBranchFilter")?.value)||"CCAC";
+  const rows=(rosterAdminInactiveRows||[]).filter(
+    r=>branchKeyFromLabel(r.lob)===branch
+  );
+
+  const body=$("rosterInactiveBody");
+  const count=$("rosterInactiveCount");
+
+  if(count) count.textContent=`${rows.length} inactive`;
+  if(!body) return;
+
+  body.innerHTML=rows.length ? rows.map(r=>`
+    <tr>
+      <td><strong>${escapeHtml(r.name||"—")}</strong></td>
+      <td>${escapeHtml(r.employee_id||"—")}</td>
+      <td>${escapeHtml(r.lob||"—")}</td>
+      <td>${escapeHtml(r.group_name||"—")}</td>
+      <td>${escapeHtml(r.subgroup||"—")}</td>
+      <td>${escapeHtml(r.team_leader||"Unassigned")}</td>
+      <td>${escapeHtml(r.channel_allocation||"—")}</td>
+    </tr>
+  `).join("") : `
+    <tr>
+      <td colspan="7" style="text-align:center;color:var(--muted);padding:20px">
+        No inactive employees found for this branch.
+      </td>
+    </tr>
+  `;
 }
 $("rosterSearch").oninput=renderRosterAdmin;
 $("rosterTLFilter").onchange=renderRosterAdmin;
